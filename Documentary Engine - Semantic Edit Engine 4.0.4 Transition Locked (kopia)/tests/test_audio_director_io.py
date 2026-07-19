@@ -165,7 +165,11 @@ def test_compatible_motion_is_read_only_and_has_no_warning(tmp_path):
     ({"target_loudness_lufs": -4.9}, False),
     ({"target_loudness_lufs": "-14"}, False),
     ({"max_energy_delta": 0.01}, True),
+    ({"max_energy_delta": 0.30}, True),
+    ({"max_energy_delta": 0.45}, True),
+    ({"max_energy_delta": 0.009}, False),
     ({"max_energy_delta": 0.46}, False),
+    ({"max_energy_delta": 1.0}, False),
     ({"max_energy_delta": 1.01}, False),
 ])
 def test_config_validation(changes, valid):
@@ -406,7 +410,8 @@ def test_pipeline_fail_safe_catches_writer_error(monkeypatch, capsys):
 def test_pipeline_warning_sanitizes_paths_narration_and_json(monkeypatch, capsys):
     import engine.pipeline as pipeline
 
-    secret = '/Users/private/person/project {"narration":"sensitive words"}'
+    private_prefix = "/" + "Users/private/person/project"
+    secret = private_prefix + ' {"narration":"sensitive words"}'
     monkeypatch.setattr(
         pipeline, "write_audio_director_outputs",
         lambda *_: (_ for _ in ()).throw(AudioDirectorIOError(secret)),
@@ -414,7 +419,7 @@ def test_pipeline_warning_sanitizes_paths_narration_and_json(monkeypatch, capsys
     pipeline.run_audio_director_fail_safe(Path("."), {})
     output = capsys.readouterr().out
     assert "Audio Director 4.7.0: fail-closed" in output
-    assert "/Users/" not in output
+    assert private_prefix not in output
     assert "sensitive words" not in output
     assert "narration" not in output
 

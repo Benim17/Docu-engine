@@ -2,6 +2,9 @@
 
 ## Completed
 
+- Audio Director 4.7.0: deterministic intent/tone, energy and abstract music,
+  ambience, ducking, transitions, intentional silence, diagnostics,
+  rollback-protected artifact publishing, config, and pipeline fail-safe
 - Story Director 4.6.0: deterministic document structure, scene dramaturgy,
   story graph, diagnostics, and metadata-only fallback planning
 - Caption Director 4.5.0: deterministic caption layout metadata, conservative
@@ -16,12 +19,11 @@
 
 ## Current
 
-- Story-analysis validation and future integration design
+- Cache and Storage Manager design
 
 ## Planned
 
-- Audio Director
-- Cache and storage manager
+- Cache and Storage Manager
 - Future ingestion and script-generation tools
 
 This roadmap is intentionally high-level. Planned work may be refined as the engine evolves.

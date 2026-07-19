@@ -1,4 +1,4 @@
-# Documentary Engine 4.6.0 visual architecture
+# Documentary Engine 4.7.0 architecture
 
 The pipeline layers have separate responsibilities:
 
@@ -6,6 +6,7 @@ The pipeline layers have separate responsibilities:
 - **Image Intelligence:** inspects every available candidate, produces a deterministic weighted ranking, and selects one immutable source image.
 - **Caption Director:** produces pure caption layout metadata without changing caption content or timing.
 - **Story Director:** describes document structure and scene dramaturgy as metadata without directing visual expression.
+- **Audio Director:** creates deterministic metadata for scene intent/tone, energy, abstract music, ambience, ducking, transitions, and intentional silence without producing or mixing audio.
 - **Visual Director:** describes how a completed semantic scene should eventually be experienced.
 - **Motion Planner:** selects the camera path between existing start and end positions.
 - **Pacing Director:** deterministically shapes how progress evolves along that path.
@@ -13,7 +14,9 @@ The pipeline layers have separate responsibilities:
 
 The resulting order is:
 
-`Semantic Engine → Image Intelligence → Caption Director → Story Director → Visual Director → Motion Planner → Pacing Director → Motion Engine`
+`Semantic Engine → Image Intelligence → Caption Director → Story Director → Audio Director → render_video()`
+
+Inside the existing render path, Visual Director, Motion Planner, Pacing Director, and Motion Engine retain their established order and responsibilities. Audio Director artifacts are metadata-only and are not passed to the renderer in 4.7.0.
 
 ## Image Intelligence 4.4.0
 
@@ -36,6 +39,12 @@ Story Director is authoritative for the new detailed story analysis in `output/s
 It reads only the minimal semantic plan, captions, and config metadata. It has no dependency on Visual Director, Motion Planner, Pacing Director, Motion Engine, rendering, or FFmpeg. It is deterministic and fail-closed. Version 4.6.0 is metadata-only: it does not alter narration, captions, scene order, timeline, images, motion, pacing, transitions, or visual output. Visual Director retains its existing `narrative_intent` and does not read Story Director data. Future integration requires a separate sprint.
 
 The Visual Director remains an identity/pass-through boundary for completed semantic and image-selection data. It returns a validated deep copy of scenes and keeps all visual metadata in separate `SceneVisualPlan` objects. It does not change `semantic_edit_plan.json`, scene order, the immutable selected image, or timing.
+
+## Audio Director 4.7.0
+
+Audio Director writes `output/audio_plan.json` and `output/audio_diagnostics.json`. It consumes the semantic plan as the sole authority for scene identity, order, and timing; compatible Story Director metadata may strengthen decisions. Captions and motion plan files are optional, read-only adapter inputs. Motion metadata has no decision-making authority in 4.7.0.
+
+The stage is deterministic, metadata-only, and fail-safe at the pipeline boundary. It does not import the renderer or FFmpeg, does not create audio, and does not modify narration, captions, semantic timing, images, visual planning, motion, pacing, or video output. See [AUDIO_DIRECTOR.md](AUDIO_DIRECTOR.md) for contracts, configuration, examples, and isolated use.
 
 ## Shot Library
 
@@ -63,7 +72,9 @@ The serialized motion plan records the applied visual intent, narrative intent, 
 
 Version 4.3.0 inserts a separate Pacing Director after the Motion Planner and before the Motion Engine:
 
-`Semantic Engine → Image Intelligence → Caption Director → Story Director → Visual Director → Motion Planner → Pacing Director → Motion Engine`
+`Semantic Engine → Image Intelligence → Caption Director → Story Director → Audio Director → render_video()`
+
+The renderer internally continues with `Visual Director → Motion Planner → Pacing Director → Motion Engine`; Audio Director does not alter that path.
 
 The Motion Planner continues to own where the camera moves. The Pacing Director owns only how motion progresses between those unchanged start and end positions. It attaches `hold_fraction`, `ease_in_fraction`, `peak_fraction`, `ease_out_fraction`, `settle_fraction`, `speed_profile`, and easing metadata. The Motion Engine consumes this metadata as a renderer.
 
@@ -73,10 +84,10 @@ Pacing is fail-closed: start and end times, zoom endpoints, pan endpoints, motio
 
 ## Current limitations
 
-- Classification is conservative, lexical, and English-language oriented.
+- Visual Director and Narrative Intent classification are conservative, lexical, and primarily English-language oriented.
 - Visual Director cannot infer meaning beyond supplied semantic text or inspect image pixels; pixel inspection belongs only to Image Intelligence.
 - Guidance is deterministic and rule-based; it does not inspect pixels or learn from rendered output.
-- Story analysis, caption layout, pacing, transitions, caption content/timing, audio, immutable image selection, and semantic timing remain independent systems.
+- Story analysis, caption layout, pacing, visual transitions, caption content/timing, audio metadata, immutable image selection, and semantic timing remain independent systems.
 
 ## Future integration
 
