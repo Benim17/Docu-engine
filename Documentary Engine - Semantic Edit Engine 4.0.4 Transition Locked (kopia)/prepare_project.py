@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import argparse
 import re
 import shutil
 import subprocess
 import sys
 import unicodedata
 from pathlib import Path
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 INPUT = ROOT / "input" / "build"
@@ -26,9 +28,11 @@ def slugify(text: str) -> str:
     return slug or "documentary"
 
 
-def media_folders() -> list[Path]:
+def media_folders(input_root: Path = INPUT) -> list[Path]:
     found = []
-    for folder in sorted((p for p in INPUT.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+    if not input_root.exists():
+        return found
+    for folder in sorted((p for p in input_root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
         images = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
         audio = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS]
         if images and audio:
@@ -48,12 +52,12 @@ def ffconcat_quote(path: Path) -> str:
     return str(path.resolve()).replace("'", "'\\''")
 
 
-def build_video(folder: Path, images: list[Path], audio: Path, target: Path) -> None:
+def build_video(folder: Path, images: list[Path], audio: Path, target: Path, work_dir: Path = ROOT / "work") -> None:
     duration = audio_duration(audio)
     if duration <= 0:
         raise RuntimeError(f"Ljudfilen har ogiltig längd: {audio.name}")
     scene_duration = duration / len(images)
-    concat = ROOT / "work" / "source_images.ffconcat"
+    concat = work_dir / "source_images.ffconcat"
     concat.parent.mkdir(parents=True, exist_ok=True)
     lines = ["ffconcat version 1.0"]
     for image in images:
@@ -78,35 +82,100 @@ def build_video(folder: Path, images: list[Path], audio: Path, target: Path) -> 
     subprocess.run(command, check=True)
 
 
-def main() -> None:
-    if not INPUT.exists():
-        raise FileNotFoundError(f"Input-mappen saknas: {INPUT}")
-    folders = media_folders()
+def resolve_project(project: str | None, input_root: Path = INPUT) -> tuple[Path, bool]:
+    if project:
+        supplied = Path(project).expanduser()
+        candidates = [supplied] if supplied.is_absolute() else [Path.cwd() / supplied, input_root / supplied]
+        folder = next((candidate.resolve() for candidate in candidates if candidate.is_dir()), None)
+        if folder is None:
+            raise FileNotFoundError(f"Projektmappen saknas eller är inte en katalog: {project}")
+        return folder, False
+    folders = media_folders(input_root)
     if not folders:
-        print("Ingen projektmapp med både bilder och ljud hittades. Behåller configens input_video.")
-        return
-    # Senast ändrade giltiga projektmapp väljs automatiskt.
-    folder = max(folders, key=lambda p: p.stat().st_mtime)
+        raise FileNotFoundError("Ingen projektmapp med både bilder och ljud hittades.")
+    return max(folders, key=lambda p: p.stat().st_mtime).resolve(), True
+
+
+def inspect_project(folder: Path) -> tuple[list[Path], list[Path]]:
     images = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS], key=natural_key)
     audios = sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS], key=natural_key)
+    if not images:
+        raise ValueError(f"Projektet saknar bilder: {folder}")
+    if not audios:
+        raise ValueError(f"Projektet saknar ljud: {folder}")
+    return images, audios
+
+
+def validate_inputs(folder: Path, images: list[Path], audio: Path) -> Path | None:
+    manifest = folder / "image_manifest.json"
+    if manifest.is_file():
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        entries = payload.get("images")
+        if payload.get("schema_version") != "1.0" or not isinstance(entries, list):
+            raise ValueError(f"Bildmanifestet har ogiltigt schema: {manifest}")
+        manifest_files = [str(item.get("file", "")) for item in entries if isinstance(item, dict)]
+        expected_files = [image.name for image in images]
+        if len(manifest_files) != len(set(manifest_files)) or manifest_files != expected_files:
+            raise ValueError("Bildmanifestet måste innehålla varje projektbild exakt en gång i naturlig ordning.")
+    for image in images:
+        with Image.open(image) as opened:
+            opened.verify()
+    if audio_duration(audio) <= 0:
+        raise ValueError(f"Voiceovern har ogiltig längd: {audio}")
+    return manifest if manifest.is_file() else None
+
+
+def build_run_config(folder: Path, audio: Path, source_video: Path, run_dir: Path) -> dict:
+    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    cfg["input_video"] = str(source_video.resolve())
+    cfg["project_dir"] = str(folder.resolve())
+    cfg["project_audio"] = str(audio.resolve())
+    cfg["style"] = str((ROOT / str(cfg["style"])).resolve())
+    cfg["output_video"] = "output/documentary.mp4"
+    cfg["captions_json"] = "output/captions.json"
+    cfg["captions_srt"] = "output/captions.srt"
+    cfg["reuse_existing_captions"] = False
+    cfg.setdefault("caption_director", {}).setdefault("plan_json", "output/caption_director_plan.json")
+    cfg.setdefault("story_director", {}).setdefault("plan_json", "output/story_director_plan.json")
+    audio_director = cfg.setdefault("audio_director", {})
+    audio_director.setdefault("enabled", True)
+    audio_director.setdefault("plan_json", "output/audio_plan.json")
+    audio_director.setdefault("diagnostics_json", "output/audio_diagnostics.json")
+    audio_director.setdefault("target_loudness_lufs", -14.0)
+    audio_director.setdefault("max_energy_delta", 0.30)
+    audio_director.setdefault("allow_aggressive_transitions", True)
+    semantic = cfg.setdefault("semantic_edit_engine", {})
+    semantic.update({"enabled": True, "manifest": "image_manifest.json", "plan_json": "output/semantic_edit_plan.json", "image_intelligence_json": "output/image_intelligence_plan.json", "visual_lead_seconds": 0.0})
+    motion = cfg.setdefault("motion_engine", {})
+    motion.update({"reuse_analysis": False, "analysis_json": "output/motion_analysis.json", "plan_json": "output/motion_plan.json"})
+    return cfg
+
+
+def prepare(project: str | None, run_dir: Path, *, preflight: bool = False) -> dict:
+    if not INPUT.exists():
+        raise FileNotFoundError(f"Input-mappen saknas: {INPUT}")
+    folder, automatic = resolve_project(project)
+    images, audios = inspect_project(folder)
+    if automatic:
+        print(f"Varning: inget --project angavs; väljer automatiskt senast ändrade giltiga projekt: {folder.name}")
     if len(audios) > 1:
         print(f"Varning: flera ljudfiler hittades. Använder {audios[0].name}.")
     audio = audios[0]
+    manifest = validate_inputs(folder, images, audio)
     slug = slugify(folder.name)
-    source_video = INPUT / f"GENERATED_{slug}.mp4"
-    output_video = ROOT / "output" / "documentary.mp4"
+    run_dir = run_dir.expanduser().resolve()
+    for child in ("work", "output", "logs"):
+        (run_dir / child).mkdir(parents=True, exist_ok=True)
+    source_video = run_dir / "work" / f"GENERATED_{slug}.mp4"
 
     newest_source = max([audio.stat().st_mtime, *(p.stat().st_mtime for p in images)])
-    if not source_video.exists() or source_video.stat().st_mtime < newest_source:
-        build_video(folder, images, audio, source_video)
-    else:
-        print(f"Återanvänder aktuell grundvideo: {source_video.name}")
+    if not preflight:
+        if not source_video.exists() or source_video.stat().st_mtime < newest_source:
+            build_video(folder, images, audio, source_video, run_dir / "work")
+        else:
+            print(f"Återanvänder aktuell grundvideo: {source_video.name}")
 
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-    cfg["input_video"] = str(source_video.relative_to(ROOT))
-    cfg["project_dir"] = str(folder.relative_to(ROOT))
-    cfg["project_audio"] = str(audio.relative_to(ROOT))
-    cfg["output_video"] = str(output_video.relative_to(ROOT))
+    cfg = build_run_config(folder, audio, source_video, run_dir)
     cfg["captions_json"] = "output/captions.json"
     cfg["captions_srt"] = "output/captions.srt"
     cfg["reuse_existing_captions"] = False
@@ -146,15 +215,38 @@ def main() -> None:
     motion["reuse_analysis"] = False
     motion["analysis_json"] = "output/motion_analysis.json"
     motion["plan_json"] = "output/motion_plan.json"
-    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    config_path = run_dir / "config.json"
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Projekt valt: {folder.name}")
-    print(f"Grundvideo: {source_video.relative_to(ROOT)}")
-    print(f"Slutvideo: {output_video.relative_to(ROOT)}")
+    print(f"Projektmapp: {folder}")
+    print(f"Bilder ({len(images)}): " + ", ".join(path.name for path in images))
+    print(f"Voiceover: {audio} ({audio_duration(audio):.3f} s)")
+    print(f"Manifest: {manifest if manifest is not None else 'saknas (bakåtkompatibel semantisk fallback)'}")
+    print(f"Config: {config_path}")
+    print(f"Work: {run_dir / 'work'}")
+    print(f"Output: {run_dir / 'output'}")
+    print(f"Renderkommando: {sys.executable} -m engine.pipeline --config {config_path} --run-dir {run_dir}")
+    if preflight:
+        print("Preflight godkänd; ingen media byggdes eller renderades.")
+    return {"folder": folder, "images": images, "audio": audio, "config": config_path, "run_dir": run_dir}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Välj dokumentärprojekt och skapa en isolerad run-konfiguration.")
+    parser.add_argument("--project", help="Projektnamn under input/build eller explicit projektsökväg.")
+    parser.add_argument("--run-dir", type=Path, help="Separat katalog för config, work, output och logs.")
+    parser.add_argument("--preflight", action="store_true", help="Validera inputs och skriv config utan att bygga media.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    prepare(args.project, args.run_dir if args.run_dir is not None else ROOT, preflight=args.preflight)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except Exception as exc:
         print(f"\nFEL VID FÖRBEREDELSE: {exc}", file=sys.stderr)
         raise

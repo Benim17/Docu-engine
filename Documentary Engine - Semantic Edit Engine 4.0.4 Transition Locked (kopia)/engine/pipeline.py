@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import math
 import re
 import random
@@ -23,9 +24,10 @@ from engine.audio_director import AudioContractError, AudioDirectorIOError, writ
 from engine.transition import build_transition_boundaries, smooth_alpha, validate_transition_contract
 from engine.visual_director import VisualDirector
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "config.json"
-WORK_DIR = ROOT / "work"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+ROOT = REPOSITORY_ROOT
+CONFIG_PATH = REPOSITORY_ROOT / "config.json"
+WORK_DIR = REPOSITORY_ROOT / "work"
 
 
 @dataclass(frozen=True)
@@ -842,10 +844,38 @@ def run_audio_director_fail_safe(root: Path, cfg: dict[str, Any]) -> tuple[Path,
         return None
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Rendera med explicit config och isolerad run-katalog.")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Run-konfiguration; default är repositoryts config.json.")
+    parser.add_argument("--run-dir", type=Path, help="Root för relativa work- och output-paths; default är configens katalog.")
+    return parser.parse_args(argv)
+
+
+def configure_runtime(config_path: Path, run_dir: Path | None) -> tuple[Path, Path]:
+    global ROOT, WORK_DIR
+    resolved_config = config_path.expanduser().resolve()
+    if not resolved_config.is_file():
+        raise FileNotFoundError(f"Configfilen saknas: {resolved_config}")
+    runtime_root = run_dir.expanduser().resolve() if run_dir is not None else resolved_config.parent
+    if run_dir is not None and resolved_config.parent != runtime_root:
+        raise ValueError("--config måste ligga direkt i --run-dir för en isolerad körning.")
+    ROOT = runtime_root
+    WORK_DIR = runtime_root / "work"
+    for child in (WORK_DIR, runtime_root / "output", runtime_root / "logs"):
+        child.mkdir(parents=True, exist_ok=True)
+    return resolved_config, runtime_root
+
+
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        # Preserve the callable legacy entry point used by existing integrations.
+        config_path = CONFIG_PATH
+    else:
+        args = parse_args(argv)
+        config_path, _ = configure_runtime(args.config, args.run_dir)
     require("ffmpeg")
     require("ffprobe")
-    cfg = load_json(CONFIG_PATH)
+    cfg = load_json(config_path)
     video = ROOT / str(cfg["input_video"])
     captions_json = ROOT / str(cfg["captions_json"])
     captions_srt = ROOT / str(cfg["captions_srt"])
@@ -880,7 +910,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except Exception as exc:
         print(f"\nFEL: {exc}", file=sys.stderr)
         raise

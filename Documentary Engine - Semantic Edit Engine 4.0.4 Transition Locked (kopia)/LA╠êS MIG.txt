@@ -5,6 +5,23 @@ KÖRNING
 2. Dubbelklicka på Rendera allt – English TikTok Captions.command.
 3. Färdig video skapas som output/documentary.mp4.
 
+EXPLICIT OCH ISOLERAD KÖRNING
+För reproducerbar validering väljs projekt och run-katalog explicit:
+
+  python prepare_project.py --project korea --run-dir validation/korea/run_1
+  python -m engine.pipeline --config validation/korea/run_1/config.json --run-dir validation/korea/run_1
+
+Ett annat projekt använder en annan run-katalog, exempelvis:
+
+  python prepare_project.py --project sample_project --run-dir validation/ba_nurse/run_1
+  python -m engine.pipeline --config validation/ba_nurse/run_1/config.json --run-dir validation/ba_nurse/run_1
+
+Varje run får egen config.json samt egna work/, output/ och logs/. Inga planer,
+captions, mellanresultat eller videor delas mellan körningar. Använd --preflight
+med prepare_project.py för att validera projektet och skriva config utan att bygga media.
+Om --project utelämnas behålls det äldre automatiska valet av senast ändrade
+giltiga projektmapp, och det valda projektet skrivs ut som en tydlig varning.
+
 FÖRBÄTTRINGAR I 4.0.4
 - Ny Caption Quality Guard upptäcker Whisper-upprepningar som "truth truth".
 - Automatisk omtranskribering görs med alternativa säkra inställningar.

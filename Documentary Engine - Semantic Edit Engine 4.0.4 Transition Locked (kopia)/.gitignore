@@ -11,6 +11,7 @@ __pycache__/
 # Generated output
 output/
 work/
+validation/
 *.log
 
 # Archives
