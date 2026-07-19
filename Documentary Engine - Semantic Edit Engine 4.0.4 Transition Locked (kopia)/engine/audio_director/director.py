@@ -236,6 +236,23 @@ class AudioDirector:
 
     version = PLANNER_VERSION
 
+    def __init__(
+        self,
+        *,
+        target_loudness_lufs: float = -14.0,
+        max_energy_delta: float = MAX_NORMAL_ENERGY_DELTA,
+        allow_aggressive_transitions: bool = True,
+    ) -> None:
+        if isinstance(target_loudness_lufs, bool) or not -40.0 <= float(target_loudness_lufs) <= -5.0:
+            raise AudioContractError("target_loudness_lufs must be between -40.0 and -5.0.")
+        if isinstance(max_energy_delta, bool) or not 0.01 <= float(max_energy_delta) <= MAX_SUPPORTED_CONTRAST_DELTA:
+            raise AudioContractError("max_energy_delta must be between 0.01 and 0.45.")
+        if not isinstance(allow_aggressive_transitions, bool):
+            raise AudioContractError("allow_aggressive_transitions must be boolean.")
+        self.target_loudness_lufs = float(target_loudness_lufs)
+        self.max_energy_delta = float(max_energy_delta)
+        self.allow_aggressive_transitions = allow_aggressive_transitions
+
     def analyze_intent_and_tone(
         self,
         semantic_plan: Mapping[str, Any],
@@ -314,7 +331,7 @@ class AudioDirector:
             default_music_style=self._default_music_style(styles),
             energy_curve=curve,
             scene_count=len(scenes),
-            target_loudness_lufs=-14.0,
+            target_loudness_lufs=self.target_loudness_lufs,
         )
         diagnostics = ProjectAudioDiagnostics(
             confidence=confidence,
@@ -354,6 +371,7 @@ class AudioDirector:
         snapshot = deepcopy(inputs)
         result = plan_sound_layers(
             self.plan_energy_and_music(semantic_plan, story_plan), semantic_plan,
+            allow_aggressive_transitions=self.allow_aggressive_transitions,
         )
         if inputs != snapshot:
             raise AudioContractError("Audio Director mutated sound-layer input metadata.")
@@ -398,9 +416,8 @@ class AudioDirector:
             and scene.confidence >= SUPPORTED_CONTRAST_CONFIDENCE
         )
 
-    @classmethod
     def _smooth_energy(
-        cls,
+        self,
         scenes: Sequence[SceneAudioAnalysis],
         raw: Sequence[float],
     ) -> tuple[tuple[float, ...], tuple[str, ...], tuple[bool, ...]]:
@@ -414,11 +431,11 @@ class AudioDirector:
         for index in range(1, len(raw)):
             previous, candidate = final[-1], raw[index]
             delta = candidate - previous
-            allowed = MAX_NORMAL_ENERGY_DELTA
-            contrast = cls._has_supported_contrast(scenes[index]) and delta > allowed
+            allowed = self.max_energy_delta
+            contrast = self._has_supported_contrast(scenes[index]) and delta > allowed
             if contrast:
                 allowed = MAX_SUPPORTED_CONTRAST_DELTA
-            bounded = min(previous + allowed, max(previous - MAX_NORMAL_ENERGY_DELTA, candidate))
+            bounded = min(previous + allowed, max(previous - self.max_energy_delta, candidate))
             bounded = _clamp(bounded)
             final.append(bounded)
             if bounded < candidate:
@@ -427,7 +444,7 @@ class AudioDirector:
                 adjustments.append("limited_down")
             else:
                 adjustments.append("unchanged")
-            preserved.append(contrast and bounded - previous > MAX_NORMAL_ENERGY_DELTA)
+            preserved.append(contrast and bounded - previous > self.max_energy_delta)
         return tuple(final), tuple(adjustments), tuple(preserved)
 
     @staticmethod

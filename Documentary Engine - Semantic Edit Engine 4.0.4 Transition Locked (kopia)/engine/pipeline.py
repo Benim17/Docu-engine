@@ -19,6 +19,7 @@ from engine.motion.analyzer import SceneAnalysis
 from engine.pacing import PacingDirector
 from engine.semantic import build_semantic_edit
 from engine.story_director import write_story_director_plan
+from engine.audio_director import AudioContractError, AudioDirectorIOError, write_audio_director_outputs
 from engine.transition import build_transition_boundaries, smooth_alpha, validate_transition_contract
 from engine.visual_director import VisualDirector
 
@@ -819,6 +820,28 @@ def run_story_director_fail_safe(root: Path, cfg: dict[str, Any]) -> Path | None
         return None
 
 
+def run_audio_director_fail_safe(root: Path, cfg: dict[str, Any]) -> tuple[Path, Path] | None:
+    """Publish optional audio metadata without ever blocking rendering."""
+    try:
+        result = write_audio_director_outputs(root, cfg)
+        if result is None:
+            return None
+        print(
+            "Audio Director 4.7.0: ljudplaner sparade i "
+            f"{result.plan_path} och {result.diagnostics_path}"
+        )
+        return result.plan_path, result.diagnostics_path
+    except Exception as exc:
+        if isinstance(exc, AudioDirectorIOError):
+            category = "artifact input or publishing failure"
+        elif isinstance(exc, AudioContractError):
+            category = "invalid semantic or audio metadata"
+        else:
+            category = "unexpected planning failure"
+        print(f"Audio Director 4.7.0: fail-closed — {category}; renderingen fortsätter.")
+        return None
+
+
 def main() -> None:
     require("ffmpeg")
     require("ffprobe")
@@ -849,6 +872,9 @@ def main() -> None:
     if bool(cfg.get("story_director", {}).get("enabled", True)):
         # Story metadata is never consumed by rendering in 4.6.0.
         run_story_director_fail_safe(ROOT, cfg)
+    if bool(cfg.get("audio_director", {}).get("enabled", True)):
+        # Audio metadata is not consumed by rendering in 4.7.0.
+        run_audio_director_fail_safe(ROOT, cfg)
     render_video(cfg, video, captions_json, output)
 
 

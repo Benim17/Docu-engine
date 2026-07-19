@@ -392,7 +392,7 @@ def test_extreme_downward_release_is_limited_for_audio_continuity():
     analyses = AudioDirector().analyze_intent_and_tone(
         semantic(semantic_scene(0), semantic_scene(1, narrative_intent="reveal"))
     )
-    final, adjustments, preserved = AudioDirector._smooth_energy(analyses, (0.9, 0.3))
+    final, adjustments, preserved = AudioDirector()._smooth_energy(analyses, (0.9, 0.3))
     assert final == (0.9, 0.6)
     assert adjustments == ("unchanged", "limited_down")
     assert preserved == (False, False)

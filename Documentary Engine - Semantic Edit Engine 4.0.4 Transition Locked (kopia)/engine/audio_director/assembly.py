@@ -132,7 +132,7 @@ def assemble_audio_artifacts(sound: ProjectSoundAnalysis) -> AssembledAudioArtif
         default_music_style=final_styles,
         energy_curve=curve,
         scene_count=count,
-        target_loudness_lufs=-14.0,
+        target_loudness_lufs=sound.energy_plan.project_summary.target_loudness_lufs,
     )
     plan = AudioPlan(summary, scenes, status=status)
     diagnostics = AudioDiagnostics(project, diagnostics_scenes)

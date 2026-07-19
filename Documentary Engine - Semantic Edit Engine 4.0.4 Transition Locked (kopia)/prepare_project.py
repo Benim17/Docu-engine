@@ -126,6 +126,13 @@ def main() -> None:
     story_director = cfg.setdefault("story_director", {})
     story_director.setdefault("enabled", True)
     story_director.setdefault("plan_json", "output/story_director_plan.json")
+    audio_director = cfg.setdefault("audio_director", {})
+    audio_director.setdefault("enabled", True)
+    audio_director.setdefault("plan_json", "output/audio_plan.json")
+    audio_director.setdefault("diagnostics_json", "output/audio_diagnostics.json")
+    audio_director.setdefault("target_loudness_lufs", -14.0)
+    audio_director.setdefault("max_energy_delta", 0.30)
+    audio_director.setdefault("allow_aggressive_transitions", True)
     semantic = cfg.setdefault("semantic_edit_engine", {})
     semantic["enabled"] = True
     semantic["manifest"] = "image_manifest.json"

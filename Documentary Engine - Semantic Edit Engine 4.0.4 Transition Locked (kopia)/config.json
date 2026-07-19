@@ -30,6 +30,14 @@
     "enabled": true,
     "plan_json": "output/story_director_plan.json"
   },
+  "audio_director": {
+    "enabled": true,
+    "plan_json": "output/audio_plan.json",
+    "diagnostics_json": "output/audio_diagnostics.json",
+    "target_loudness_lufs": -14.0,
+    "max_energy_delta": 0.3,
+    "allow_aggressive_transitions": true
+  },
   "video_codec": "libx264",
   "crf": 19,
   "preset": "medium",

@@ -66,6 +66,8 @@ class ProjectSoundAnalysis:
 def plan_sound_layers(
     energy_plan: ProjectEnergyMusicAnalysis,
     semantic_plan: Mapping[str, Any],
+    *,
+    allow_aggressive_transitions: bool = True,
 ) -> ProjectSoundAnalysis:
     """Plan metadata only, in order: ambience, silence, ducking, transitions, diagnostics."""
     semantic_scenes = semantic_plan.get("scenes", [])
@@ -102,12 +104,15 @@ def plan_sound_layers(
             "warnings": _canonical_strings((*ambience_warnings, *ducking_warnings)),
         })
 
-    pairs, transition_warnings = _transition_pairs(base)
+    pairs, transition_warnings = _transition_pairs(base, allow_aggressive_transitions)
     scenes = []
     for index, values in enumerate(base):
         warnings = list(values["warnings"])
         warnings.extend(transition_warnings[index])
-        unsupported_transitions += sum("downgraded" in value for value in transition_warnings[index])
+        unsupported_transitions += sum(
+            "downgraded" in value or "disabled_by_config" in value
+            for value in transition_warnings[index]
+        )
         transition_in, transition_out = pairs[index]
         final_values = dict(values)
         final_values["warnings"] = _canonical_strings(warnings)
@@ -261,7 +266,10 @@ def _ducking(
     return DuckingPlan(True, music_db, ambience_db, 120, 500, "Metadata ducking protects narration readability."), ()
 
 
-def _transition_pairs(base: Sequence[Mapping[str, Any]]) -> tuple[tuple[tuple[AudioTransition, AudioTransition], ...], tuple[tuple[str, ...], ...]]:
+def _transition_pairs(
+    base: Sequence[Mapping[str, Any]],
+    allow_aggressive_transitions: bool = True,
+) -> tuple[tuple[tuple[AudioTransition, AudioTransition], ...], tuple[tuple[str, ...], ...]]:
     if not base:
         return (), ()
     boundaries = []
@@ -281,13 +289,19 @@ def _transition_pairs(base: Sequence[Mapping[str, Any]]) -> tuple[tuple[tuple[Au
                 and target.scene.confidence >= 0.75
             )
         )
+        supported_impact = target.scene.audio_intent == "climax" and target.supported_contrast_preserved
+        supported_riser = (
+            target.scene.audio_intent == "climax"
+            and target.scene.story_role == "climax"
+            and target.scene.confidence >= 0.75
+        )
         if right["silence"].intentional_silence:
             transition = AudioTransition("silence", 300, "Intentional pause defines the scene boundary.")
-        elif target.scene.audio_intent == "climax" and target.supported_contrast_preserved:
+        elif allow_aggressive_transitions and supported_impact:
             transition = AudioTransition("impact", 0, "Structurally supported climax contrast.")
-        elif supported_hard_cut:
+        elif allow_aggressive_transitions and supported_hard_cut:
             transition = AudioTransition("hard_cut", 0, "Strong structural contrast supports a hard cut.")
-        elif target.scene.audio_intent == "climax" and target.scene.story_role == "climax" and target.scene.confidence >= 0.75:
+        elif allow_aggressive_transitions and supported_riser:
             transition = AudioTransition("riser", 800, "Structurally supported climax build.")
         elif left["ambience"].enabled and right["ambience"].enabled and left["ambience"].type == right["ambience"].type:
             transition = AudioTransition("ambient_bridge", 800, "Compatible ambience bridges both scenes.")
@@ -297,6 +311,8 @@ def _transition_pairs(base: Sequence[Mapping[str, Any]]) -> tuple[tuple[tuple[Au
                 boundary_warnings[index + 1].append("ambient_bridge_not_supported")
             if target.scene.audio_intent in {"climax", "tension"} and target.scene.story_role is None:
                 boundary_warnings[index + 1].append("aggressive_transition_downgraded")
+        if not allow_aggressive_transitions and (supported_impact or supported_hard_cut or supported_riser):
+            boundary_warnings[index + 1].append("aggressive_transition_disabled_by_config")
         boundaries.append(transition)
     pairs = []
     for index in range(len(base)):
