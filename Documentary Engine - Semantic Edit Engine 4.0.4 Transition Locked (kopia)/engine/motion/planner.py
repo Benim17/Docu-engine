@@ -3,6 +3,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Sequence
 import random
 from .analyzer import SceneAnalysis
+from engine.pacing import pacing_progress
 
 @dataclass(frozen=True)
 class MotionPlan:
@@ -11,6 +12,14 @@ class MotionPlan:
     start_x: float; start_y: float; end_x: float; end_y: float
     preset: str; confidence: float; focus_x: float; focus_y: float
     hold_fraction: float = 0.0
+    ease_in_fraction: float = 0.20
+    peak_fraction: float = 0.40
+    ease_out_fraction: float = 0.30
+    settle_fraction: float = 0.10
+    pacing_profile: str = "fallback_balanced"
+    speed_profile: str = "balanced_rise_fall"
+    easing_profile: str = "integrated_smoothstep"
+    pacing_reason: str = "Motion Engine fallback pacing."
     visual_intent: str = "medium"
     narrative_intent: str = "development"
     guidance_reason: str = "Motion Engine fallback."
@@ -116,6 +125,9 @@ def build_motion_plan(
         plans.append(MotionPlan(
             s.start,s.end,z0,z1,clamp(x0),clamp(y0),clamp(x1),clamp(y1),
             preset,s.confidence,fx,fy,hold,
+            0.20, 0.40, 0.30-max(0.0, hold-0.10), max(0.0, 0.10-hold),
+            "fallback_balanced", "balanced_rise_fall", "integrated_smoothstep",
+            "Motion Engine fallback pacing.",
             str(guide.visual_intent) if guide is not None else "medium",
             str(guide.narrative_intent) if guide is not None else "development",
             str(guide.reason) if guide is not None else "Motion Engine fallback.",
@@ -130,7 +142,6 @@ def motion_state(plans:list[MotionPlan],t:float,hint:int, transition_delay:float
     # to snap/correct itself immediately after the transition.
     delay = max(0.0, min(max(0.0, p.end-p.start-0.05), transition_delay if p.start > 0 else 0.0))
     raw=(t-p.start-delay)/max(0.001,p.end-p.start-delay)
-    hold=max(0.0,min(0.25,p.hold_fraction))
-    u=0.0 if raw <= hold else _ease((raw-hold)/max(0.001,1.0-hold))
+    u=pacing_progress(raw, p)
     lerp=lambda a,b:a+(b-a)*u
     return lerp(p.start_zoom,p.end_zoom),lerp(p.start_x,p.end_x),lerp(p.start_y,p.end_y),hint

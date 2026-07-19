@@ -15,6 +15,7 @@ from typing import Any
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 from engine.motion import analyze_video, build_motion_plan, motion_state as intelligent_motion_state
 from engine.motion.analyzer import SceneAnalysis
+from engine.pacing import PacingDirector
 from engine.semantic import build_semantic_edit
 from engine.transition import build_transition_boundaries, smooth_alpha, validate_transition_contract
 from engine.visual_director import VisualDirector
@@ -687,12 +688,24 @@ def render_video(cfg: dict[str, Any], video: Path, captions_path: Path, output: 
         if semantic_scenes:
             visual_guidance = VisualDirector().build_motion_guidance(semantic_scenes)
         motion_plans = build_motion_plan(scenes, motion, visual_guidance)
+        motion_plans = PacingDirector().apply(motion_plans)
         plan_path = ROOT / str(motion.get("plan_json", "output/motion_plan_v302.json"))
         plan_path.parent.mkdir(parents=True, exist_ok=True)
-        plan_path.write_text(json.dumps({"schema_version":"4.2","visual_director_version":"4.2.0","plans":[p.to_dict() for p in motion_plans]}, indent=2), encoding="utf-8")
-        print(f"Motion Engine / Visual Director 4.2.0: intent-guided camera + cinematic cross-dissolve ({len(scenes)} scener, {len(motion_plans)} planer)")
+        diagnostics = [{
+            "scene_index": i, "visual_intent": p.visual_intent,
+            "narrative_intent": p.narrative_intent, "motion_preset": p.preset,
+            "pacing_profile": p.pacing_profile, "hold_fraction": p.hold_fraction,
+            "easing_profile": p.easing_profile,
+            "reasoning": {"motion": p.guidance_reason, "pacing": p.pacing_reason},
+        } for i, p in enumerate(motion_plans)]
+        plan_path.write_text(json.dumps({
+            "schema_version":"4.3", "visual_director_version":"4.2.0",
+            "pacing_director_version":"4.3.0", "plans":[p.to_dict() for p in motion_plans],
+            "diagnostics": diagnostics,
+        }, indent=2), encoding="utf-8")
+        print(f"Documentary Engine 4.3.0: Visual Director → Motion Planner → Pacing Director → Motion Engine ({len(scenes)} scener)")
         for i, plan in enumerate(motion_plans[:8], 1):
-            print(f"  {i:02d}. {plan.start:5.1f}-{plan.end:5.1f}s  {plan.preset:20s} fokus=({plan.focus_x:.2f},{plan.focus_y:.2f}) conf={plan.confidence:.2f}")
+            print(f"  {i:02d}. {plan.start:5.1f}-{plan.end:5.1f}s  {plan.preset:20s} pacing={plan.pacing_profile} hold={plan.hold_fraction:.2f}")
     elif motion_enabled:
         motion_keyframes = build_motion_keyframes(info.duration, motion)
         print(f"Motion Engine 3.0: legacy 2.5.1 ({len(motion_keyframes)} keyframes)")
