@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -7,6 +8,7 @@ from engine.audio_director import (
     AudioDirector,
     serialize_energy_music_analysis,
     serialize_intent_tone_analysis,
+    serialize_sound_analysis,
 )
 
 
@@ -502,3 +504,344 @@ def test_incompatible_optional_story_metadata_keeps_music_conservative():
     assert result.scene.audio_intent != "climax"
     assert result.music.style == "documentary"
     assert any(value.startswith("story_director_version_incompatible:") for value in result.warnings)
+
+
+def test_no_environment_signal_disables_ambience_without_generic_fallback():
+    scene = AudioDirector().plan_sound_layers(semantic(semantic_scene())).scenes[0]
+    assert scene.ambience.enabled is False
+    assert scene.ambience.type == "none"
+    assert scene.ambience.intensity == 0.0
+
+
+@pytest.mark.parametrize(("kind", "description"), [
+    ("urban", "A city street with traffic."),
+    ("ocean", "The ocean coast and waves."),
+    ("forest", "A forest of trees and woodland."),
+    ("rain", "Rain, rainfall and raindrops."),
+    ("transport", "A train enters the station beside a vehicle."),
+])
+def test_explicit_supported_environment_enables_ambience(kind, description):
+    source = semantic(semantic_scene(environment_type=kind, scene_description=description))
+    result = AudioDirector().plan_sound_layers(source).scenes[0]
+    assert result.ambience.enabled is True
+    assert result.ambience.type == kind
+    assert 0.0 < result.ambience.intensity < result.energy_music.energy
+    result.ambience.validate()
+
+
+def test_single_environment_keyword_is_insufficient_but_three_aligned_signals_work():
+    single = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(scene_description="rain"))
+    ).scenes[0]
+    multiple = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(scene_description="rain rainfall raindrops"))
+    ).scenes[0]
+    assert single.ambience.type == "none"
+    assert "ambience_evidence_insufficient" in single.warnings
+    assert multiple.ambience.type == "rain"
+
+
+def test_battlefield_requires_explicit_and_multiple_strong_signals():
+    weak = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(environment_type="battlefield", scene_description="battlefield"))
+    ).scenes[0]
+    strong = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(
+            environment_type="battlefield",
+            scene_description="Battlefield combat and artillery at the front line.",
+        ))
+    ).scenes[0]
+    assert weak.ambience.type == "none"
+    assert "aggressive_ambience_downgraded" in weak.warnings
+    assert strong.ambience.type == "battlefield"
+
+
+def test_narration_reduces_ambience_intensity():
+    silent_source = semantic(semantic_scene(
+        environment_type="urban", scene_description="city street traffic",
+    ))
+    narrated_source = deepcopy(silent_source)
+    narrated_source["scenes"][0]["voiceover_text"] = "Narration explains the city street and traffic."
+    silent = AudioDirector().plan_sound_layers(silent_source).scenes[0]
+    narrated = AudioDirector().plan_sound_layers(narrated_source).scenes[0]
+    assert narrated.ambience.intensity < silent.ambience.intensity
+
+
+def test_ducking_uses_conservative_defaults_and_final_enabled_layers():
+    narrated = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(text="Short narration."))
+    ).scenes[0]
+    assert narrated.ducking.ducking_enabled is True
+    assert narrated.ducking.music_reduction_db == -12.0
+    assert narrated.ducking.ambience_reduction_db == 0.0
+    assert (narrated.ducking.attack_ms, narrated.ducking.release_ms) == (120, 500)
+    narrated.ducking.validate()
+
+
+def test_dense_support_narration_uses_stronger_music_ducking():
+    text = "A detailed narrated explanation provides facts and context " * 8
+    scene = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(text=text, narrative_intent="context"))
+    ).scenes[0]
+    assert scene.narration_density >= 0.65
+    assert scene.ducking.music_reduction_db == -14.0
+
+
+def test_missing_narration_disables_ducking_with_diagnostics():
+    scene = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(scene_description="city street traffic", environment_type="urban"))
+    ).scenes[0]
+    assert scene.ducking.ducking_enabled is False
+    assert scene.ducking.music_reduction_db == 0.0
+    assert scene.ducking.ambience_reduction_db == 0.0
+    assert "narration_missing_ducking_disabled" in scene.warnings
+
+
+def test_transition_pairs_are_authoritative_and_consistent():
+    result = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(0), semantic_scene(1), semantic_scene(2))
+    )
+    assert result.scenes[0].transition_in.type == "fade_in"
+    assert result.scenes[-1].transition_out.type == "fade_out"
+    for left, right in zip(result.scenes, result.scenes[1:]):
+        assert left.transition_out == right.transition_in
+        assert left.transition_out.type == "crossfade"
+
+
+def test_single_scene_has_fade_in_and_fade_out():
+    scene = AudioDirector().plan_sound_layers(semantic(semantic_scene())).scenes[0]
+    assert scene.transition_in.type == "fade_in"
+    assert scene.transition_out.type == "fade_out"
+
+
+def test_supported_impact_and_riser_require_structural_climax():
+    source = semantic(
+        semantic_scene(0, "Calm quiet steady.", narrative_intent="reflection"),
+        semantic_scene(1, "A decisive confrontation."),
+    )
+    story = story_for(source)
+    story["scenes"][1].update(
+        story_role="climax", story_phase="climax", tension=1.0,
+        emotional_intensity=1.0, revelation_strength=1.0,
+    )
+    impact = AudioDirector().plan_sound_layers(source, story)
+    assert impact.scenes[0].transition_out.type == "impact"
+    assert impact.scenes[0].transition_out == impact.scenes[1].transition_in
+
+    rising_source = semantic(semantic_scene(0), semantic_scene(1, "A decisive confrontation."))
+    rising_story = story_for(rising_source)
+    rising_story["scenes"][0].update(
+        story_role="contrast", story_phase="complication", tension=0.8,
+        emotional_intensity=0.7,
+    )
+    rising_story["scenes"][1].update(
+        story_role="climax", story_phase="climax", tension=0.9,
+        emotional_intensity=0.8, revelation_strength=0.8,
+    )
+    riser = AudioDirector().plan_sound_layers(rising_source, rising_story)
+    assert riser.scenes[0].transition_out.type == "riser"
+
+
+def test_unsupported_aggressive_transition_is_downgraded():
+    result = AudioDirector().plan_sound_layers(
+        semantic(semantic_scene(0), semantic_scene(1, narrative_intent="escalation"))
+    )
+    assert result.scenes[0].transition_out.type == "crossfade"
+    assert "aggressive_transition_downgraded" in result.scenes[1].warnings
+    assert result.diagnostics.unsupported_aggressive_transition_count == 1
+
+
+def test_supported_hard_cut_requires_strong_structural_contrast():
+    source = semantic(semantic_scene(0), semantic_scene(1))
+    story = story_for(source)
+    story["scenes"][1].update(story_role="contrast", story_phase="complication", tension=0.9)
+    result = AudioDirector().plan_sound_layers(source, story)
+    assert result.scenes[0].transition_out.type == "hard_cut"
+
+
+def test_ambient_bridge_requires_matching_enabled_ambience():
+    source = semantic(
+        semantic_scene(0, environment_type="urban", scene_description="city street traffic"),
+        semantic_scene(1, environment_type="urban", scene_description="city street traffic"),
+    )
+    bridge = AudioDirector().plan_sound_layers(source)
+    assert bridge.scenes[0].transition_out.type == "ambient_bridge"
+    source["scenes"][1]["environment_type"] = "ocean"
+    source["scenes"][1]["scene_description"] = "ocean coast waves"
+    no_bridge = AudioDirector().plan_sound_layers(source)
+    assert no_bridge.scenes[0].transition_out.type == "crossfade"
+    assert "ambient_bridge_not_supported" in no_bridge.scenes[1].warnings
+
+
+def test_reflection_or_text_pause_alone_does_not_create_silence():
+    source = semantic(semantic_scene(
+        text="A long reflective pause.", narrative_intent="reflection", intentional_pause=True,
+    ))
+    scene = AudioDirector().plan_sound_layers(source).scenes[0]
+    assert scene.silence.intentional_silence is False
+
+
+@pytest.mark.parametrize("role", ["epilogue", "revelation"])
+def test_explicit_structurally_supported_pause_suppresses_audio(role):
+    source = semantic(semantic_scene(
+        text="Narration before a deliberate pause.", intentional_pause=True,
+        environment_type="urban", scene_description="city street traffic",
+    ))
+    story = story_for(
+        source, story_role=role,
+        story_phase="closing" if role == "epilogue" else "turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    scene = AudioDirector().plan_sound_layers(source, story).scenes[0]
+    assert scene.silence.intentional_silence is True
+    assert 0 <= scene.silence.pre_scene_silence_ms <= 300
+    assert 0 <= scene.silence.post_scene_silence_ms <= 400
+    assert scene.music.enabled is False and scene.music.style == "none"
+    assert scene.ambience.enabled is False and scene.ambience.type == "none"
+    assert scene.ducking.ducking_enabled is False
+    scene.silence.validate()
+
+
+def test_silence_boundary_uses_consistent_silence_transition_pair():
+    source = semantic(semantic_scene(0), semantic_scene(1, intentional_pause=True))
+    story = story_for(source)
+    story["scenes"][1].update(
+        story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    result = AudioDirector().plan_sound_layers(source, story)
+    assert result.scenes[0].transition_out.type == "silence"
+    assert result.scenes[0].transition_out == result.scenes[1].transition_in
+
+
+def test_empty_sound_project_and_debug_serialization_are_deterministic():
+    first = AudioDirector().plan_sound_layers(semantic())
+    second = AudioDirector().plan_sound_layers(semantic())
+    assert first.scenes == ()
+    assert serialize_sound_analysis(first).encode() == serialize_sound_analysis(second).encode()
+
+
+def test_sound_planning_does_not_mutate_upstream_inputs():
+    source = semantic(semantic_scene(
+        text="Narration.", environment_type="urban", scene_description="city street traffic",
+    ))
+    story = story_for(source)
+    before = deepcopy((source, story))
+    AudioDirector().plan_sound_layers(source, story)
+    assert (source, story) == before
+
+
+def _urban_scene(index, **changes):
+    return semantic_scene(
+        index, environment_type="urban", scene_description="city street traffic", **changes,
+    )
+
+
+def test_transition_priority_silence_over_compatible_ambience():
+    source = semantic(_urban_scene(0), _urban_scene(1, intentional_pause=True))
+    story = story_for(source)
+    story["scenes"][1].update(
+        story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    result = AudioDirector().plan_sound_layers(source, story)
+    assert "explicit_environment:urban" in result.scenes[1].ambience.source_basis
+    assert "ambience_suppressed_by_intentional_silence" in result.scenes[1].warnings
+    assert result.scenes[0].transition_out.type == "silence"
+
+
+def test_transition_priority_impact_over_compatible_ambience_and_external_edges():
+    source = semantic(
+        _urban_scene(0, text="Calm quiet steady.", narrative_intent="reflection"),
+        _urban_scene(1, text="A decisive confrontation."),
+    )
+    story = story_for(source)
+    story["scenes"][1].update(
+        story_role="climax", story_phase="climax", tension=1.0,
+        emotional_intensity=1.0, revelation_strength=1.0,
+    )
+    result = AudioDirector().plan_sound_layers(source, story)
+    assert result.scenes[0].ambience.type == result.scenes[1].ambience.type == "urban"
+    assert result.scenes[0].transition_in.type == "fade_in"
+    assert result.scenes[0].transition_out.type == "impact"
+    assert result.scenes[1].transition_in.type == "impact"
+    assert result.scenes[1].transition_out.type == "fade_out"
+
+
+def test_transition_priority_riser_over_compatible_ambience():
+    source = semantic(_urban_scene(0), _urban_scene(1, text="A decisive confrontation."))
+    story = story_for(source)
+    story["scenes"][0].update(
+        story_role="contrast", story_phase="complication", tension=0.8,
+        emotional_intensity=0.7,
+    )
+    story["scenes"][1].update(
+        story_role="climax", story_phase="climax", tension=0.9,
+        emotional_intensity=0.8, revelation_strength=0.8,
+    )
+    result = AudioDirector().plan_sound_layers(source, story)
+    assert result.scenes[0].transition_out.type == "riser"
+
+
+def test_transition_priority_compatible_ambience_over_unsupported_aggression():
+    source = semantic(_urban_scene(0), _urban_scene(1, narrative_intent="escalation"))
+    result = AudioDirector().plan_sound_layers(source)
+    assert result.scenes[0].transition_out.type == "ambient_bridge"
+
+
+def test_transition_priority_silence_over_supported_requested_hard_cut():
+    source = semantic(
+        semantic_scene(0),
+        semantic_scene(1, intentional_pause=True, audio_transition_intent="hard_cut"),
+    )
+    story = story_for(source)
+    story["scenes"][1].update(
+        story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.9,
+    )
+    result = AudioDirector().plan_sound_layers(source, story)
+    assert result.scenes[0].transition_out.type == "silence"
+
+
+def test_ambience_intensity_never_exceeds_very_low_or_zero_energy():
+    from engine.audio_director.sound_planning import _ambience
+
+    source_scene = _urban_scene(0)
+    base = AudioDirector().plan_energy_and_music(semantic(source_scene)).scenes[0]
+    low_plan = replace(base, energy=0.03)
+    low, _, _ = _ambience(low_plan, source_scene, False)
+    assert low.enabled is True
+    assert 0.0 < low.intensity <= 0.03
+    zero, warnings, _ = _ambience(replace(base, energy=0.0), source_scene, False)
+    assert zero.enabled is False
+    assert zero.type == "none" and zero.intensity == 0.0
+    assert "ambience_disabled_at_zero_energy" in warnings
+
+
+def test_silence_suppression_creates_new_models_without_changing_step_3_result():
+    source = semantic(_urban_scene(0, intentional_pause=True))
+    story = story_for(
+        source, story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    director = AudioDirector()
+    before = director.plan_energy_and_music(source, story)
+    final = director.plan_sound_layers(source, story)
+    after = director.plan_energy_and_music(source, story)
+    assert before == after
+    assert before.scenes[0].music.enabled is True
+    assert final.scenes[0].music.enabled is False
+    assert "Intentional silence" in final.scenes[0].music.rationale
+    assert "Intentional silence" in final.scenes[0].ambience.fallback_reason
+
+
+def test_disabled_ducking_contract_uses_stable_zero_timing_and_reductions():
+    source = semantic(semantic_scene(intentional_pause=True))
+    story = story_for(
+        source, story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    ducking = AudioDirector().plan_sound_layers(source, story).scenes[0].ducking
+    assert ducking.ducking_enabled is False
+    assert (ducking.music_reduction_db, ducking.ambience_reduction_db) == (0.0, 0.0)
+    assert (ducking.attack_ms, ducking.release_ms) == (0, 0)

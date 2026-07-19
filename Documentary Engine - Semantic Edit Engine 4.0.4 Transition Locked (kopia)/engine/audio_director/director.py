@@ -342,6 +342,23 @@ class AudioDirector:
             raise AudioContractError("Audio Director mutated energy/music input metadata.")
         return ProjectEnergyMusicAnalysis(summary, scenes, diagnostics)
 
+    def plan_sound_layers(
+        self,
+        semantic_plan: Mapping[str, Any],
+        story_plan: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Plan Step 4 ambience, silence, ducking and transition metadata."""
+        from .sound_planning import plan_sound_layers
+
+        inputs = (semantic_plan, story_plan)
+        snapshot = deepcopy(inputs)
+        result = plan_sound_layers(
+            self.plan_energy_and_music(semantic_plan, story_plan), semantic_plan,
+        )
+        if inputs != snapshot:
+            raise AudioContractError("Audio Director mutated sound-layer input metadata.")
+        return result
+
     @staticmethod
     def _raw_energy(scene: SceneAudioAnalysis) -> float:
         # Fixed order: base -> intent -> tone -> bounded structural values -> clamp/round.
