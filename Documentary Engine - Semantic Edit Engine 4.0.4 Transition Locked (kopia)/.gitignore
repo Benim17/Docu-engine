@@ -1,0 +1,21 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Generated output
+output/
+work/
+*.log
+
+# Archives
+*.zip
+
+# IDE
+.vscode/
+.idea/

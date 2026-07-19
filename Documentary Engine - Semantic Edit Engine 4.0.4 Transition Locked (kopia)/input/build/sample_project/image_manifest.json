@@ -1,0 +1,142 @@
+{
+  "schema_version": "1.0",
+  "images": [
+    {
+      "file": "nurse 1.jpg",
+      "description": "A neonatal nurse standing inside a dark neonatal intensive care unit beside infant incubators and medical monitors.",
+      "tags": [
+        "nurse",
+        "neonatal unit",
+        "hospital care",
+        "babies",
+        "medical ward",
+        "Lucy Letby",
+        "shifts"
+      ],
+      "priority": 1.0,
+      "preferred_phase": 0.0
+    },
+    {
+      "file": "nurse 2.jpg",
+      "description": "A dark exterior of an old English hospital at night, suggesting the Countess of Chester Hospital and the beginning of an investigation.",
+      "tags": [
+        "hospital",
+        "Countess of Chester",
+        "England",
+        "infant deaths",
+        "police investigation",
+        "night"
+      ],
+      "priority": 0.4,
+      "preferred_phase": 0.14
+    },
+    {
+      "file": "nurse 3.jpg",
+      "description": "A hand reviewing a marked hospital shift chart and incident records on a clipboard.",
+      "tags": [
+        "shift chart",
+        "hospital review",
+        "records",
+        "name appearing",
+        "incidents",
+        "statistics",
+        "evidence"
+      ],
+      "priority": 0.8,
+      "preferred_phase": 0.27
+    },
+    {
+      "file": "nurse 4.jpg",
+      "description": "A British courtroom during a criminal trial, with judge, jury and legal proceedings.",
+      "tags": [
+        "courtroom",
+        "jury",
+        "prosecutors",
+        "trial",
+        "convicted",
+        "murder charges",
+        "legal case"
+      ],
+      "priority": 0.5,
+      "preferred_phase": 0.4
+    },
+    {
+      "file": "nurse 5.jpg",
+      "description": "A judge's gavel in court with the words 15 WHOLE-LIFE SENTENCES.",
+      "tags": [
+        "15 whole-life sentences",
+        "prison terms",
+        "sentence",
+        "conviction",
+        "judge",
+        "harshest punishment"
+      ],
+      "ocr": [
+        "15 WHOLE-LIFE SENTENCES"
+      ],
+      "priority": 1.5,
+      "preferred_phase": 0.5
+    },
+    {
+      "file": "nurse 6.jpg",
+      "description": "Investigators examining hospital documents, charts and statistical evidence at a desk.",
+      "tags": [
+        "evidence review",
+        "statisticians",
+        "shift chart",
+        "documents",
+        "challenged evidence",
+        "investigation",
+        "data"
+      ],
+      "priority": 0.7,
+      "preferred_phase": 0.62
+    },
+    {
+      "file": "nurse 7.jpg",
+      "description": "A panel of medical and neonatal experts reviewing files, with the words NO MEDICAL EVIDENCE.",
+      "tags": [
+        "pediatric experts",
+        "neonatal specialists",
+        "panel of 14",
+        "no medical evidence",
+        "hospital care failures",
+        "international experts"
+      ],
+      "ocr": [
+        "NO MEDICAL EVIDENCE"
+      ],
+      "priority": 1.4,
+      "preferred_phase": 0.74
+    },
+    {
+      "file": "nurse 8.jpg",
+      "description": "A British court building with tied legal case files and appeal documents outside.",
+      "tags": [
+        "appeals",
+        "legal team",
+        "case sent back to court",
+        "rejected appeals",
+        "court documents",
+        "legal challenge"
+      ],
+      "priority": 0.8,
+      "preferred_phase": 0.87
+    },
+    {
+      "file": "nurse 9.jpg",
+      "description": "The statue of Lady Justice beneath storm clouds, symbolizing doubt, truth and a possible miscarriage of justice.",
+      "tags": [
+        "Lady Justice",
+        "miscarriage of justice",
+        "killer or victim",
+        "truth",
+        "disputed case",
+        "final question",
+        "British legal history"
+      ],
+      "priority": 1.1,
+      "preferred_phase": 1.0
+    }
+  ]
+}

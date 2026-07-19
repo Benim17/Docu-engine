@@ -1,0 +1,28 @@
+DOCUMENTARY ENGINE – SEMANTIC EDIT ENGINE 4.0.4
+
+KÖRNING
+1. Lägg en projektmapp med voiceover.wav och bilder i input/build/.
+2. Dubbelklicka på Rendera allt – English TikTok Captions.command.
+3. Färdig video skapas som output/documentary.mp4.
+
+FÖRBÄTTRINGAR I 4.0.4
+- Ny Caption Quality Guard upptäcker Whisper-upprepningar som "truth truth".
+- Automatisk omtranskribering görs med alternativa säkra inställningar.
+- Segmentminne är avstängt som standard för att motverka repetitionsloopar.
+- Renderingen stoppas hellre med ett tydligt fel än att exportera falska captions.
+- Motion Engine och de mjuka övergångarna är oförändrade.
+- Bildövergångar får endast börja vid starten av en ny mening.
+- Ingen förskjutning in i eller före en mening.
+- Caption Core kontrollerar att varje transkriberat ord ingår i captions.
+- Original-voiceovern används direkt vid transkribering.
+- Exakta semantiska scenstarter styr Motion Engine och övergångarna.
+- Längre cosine-crossfade och tätare scenanalys minskar hack.
+- Semantiska begrepp skapas nu automatiskt från varje projekts image_manifest.json.
+- Ämnesspecifika ordlistor för testvideon har tagits bort; motorn är generell för nya dokumentärer.
+- Manifestet valideras före rendering och saknade bildfiler ger ett tydligt fel.
+- Bilder utan beskrivning eller taggar flaggas innan de matchas kronologiskt.
+
+INPUT-LÄGEN
+- input/build: nya dokumentärer från bilder + voiceover.
+- input/enhance: färdiga MP4-filer (kommande Enhance Engine).
+- input/remix: video + nytt material (kommande Remix Engine).
