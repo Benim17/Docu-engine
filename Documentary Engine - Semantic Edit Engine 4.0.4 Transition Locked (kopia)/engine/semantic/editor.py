@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+from engine.visual_director import VisualDirector
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 STOP = {
@@ -253,6 +254,7 @@ def build_semantic_edit(cfg: dict[str, Any], captions_path: Path, video: Path, r
         print("Semantic Edit Engine: varning – bilder utan beskrivning/taggar matchas främst kronologiskt: " + ", ".join(undescribed))
     beats = build_beats(captions, duration, sem)
     scenes = assign_images(beats, images, profiles, sem)
+    scenes = VisualDirector().direct(scenes)
     plan_path = root / str(sem.get("plan_json", "output/semantic_edit_plan.json"))
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps({"schema_version":"4.0.3","project":project_dir.name,"duration":round(duration,3),"scenes":scenes}, ensure_ascii=False, indent=2), encoding="utf-8")
