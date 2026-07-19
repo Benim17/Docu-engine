@@ -22,6 +22,15 @@ med prepare_project.py för att validera projektet och skriva config utan att by
 Om --project utelämnas behålls det äldre automatiska valet av senast ändrade
 giltiga projektmapp, och det valda projektet skrivs ut som en tydlig varning.
 
+LOKALA REGRESSIONSPROJEKT
+Lokala regressionsprojekt kan ligga som separata mappar i input/build/.
+Korea används som ett lokalt regressionsprojekt och versionshanteras inte.
+Ett regressionsprojekt kan innehålla stora eller upphovsrättsskyddade bilder
+och ljudfiler som inte ska lagras i Git. Projektets image_manifest.json ska
+ligga tillsammans med projektets bilder och voiceover.
+Genererad validation-output ska sparas i det separata lokala releasearkivet,
+inte i Git-repositoryt.
+
 FÖRBÄTTRINGAR I 4.0.4
 - Ny Caption Quality Guard upptäcker Whisper-upprepningar som "truth truth".
 - Automatisk omtranskribering görs med alternativa säkra inställningar.

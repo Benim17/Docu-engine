@@ -14,6 +14,9 @@ work/
 validation/
 *.log
 
+# Local regression projects
+input/build/korea/
+
 # Archives
 *.zip
 
