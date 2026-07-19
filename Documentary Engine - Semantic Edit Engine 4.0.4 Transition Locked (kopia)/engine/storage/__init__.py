@@ -20,6 +20,18 @@ from .models import (
     deserialize_artifact_descriptor,
     serialize_artifact_descriptor,
 )
+from .cache_keys import (
+    CACHE_KEY_CONTRACT_VERSION,
+    CacheKey,
+    CacheKeyContractError,
+    CacheKeyMaterial,
+    ConfigFingerprint,
+    GroupCacheKeyMaterial,
+    InputFingerprint,
+    RuntimeFingerprint,
+    derive_cache_key,
+    serialize_cache_key_material,
+)
 
 __all__ = [
     "ARTIFACT_CONTRACT_VERSION",
@@ -40,4 +52,14 @@ __all__ = [
     "RuntimeLocation",
     "deserialize_artifact_descriptor",
     "serialize_artifact_descriptor",
+    "CACHE_KEY_CONTRACT_VERSION",
+    "CacheKey",
+    "CacheKeyContractError",
+    "CacheKeyMaterial",
+    "ConfigFingerprint",
+    "GroupCacheKeyMaterial",
+    "InputFingerprint",
+    "RuntimeFingerprint",
+    "derive_cache_key",
+    "serialize_cache_key_material",
 ]
