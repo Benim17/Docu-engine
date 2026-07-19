@@ -114,6 +114,7 @@ def main() -> None:
     semantic["enabled"] = True
     semantic["manifest"] = "image_manifest.json"
     semantic["plan_json"] = "output/semantic_edit_plan.json"
+    semantic["image_intelligence_json"] = "output/image_intelligence_plan.json"
     semantic.setdefault("min_beat_duration", 4.5)
     semantic.setdefault("preferred_beat_duration", 7.5)
     semantic.setdefault("max_beat_duration", 11.5)

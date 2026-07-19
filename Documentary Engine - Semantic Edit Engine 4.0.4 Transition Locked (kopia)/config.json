@@ -54,6 +54,7 @@
     "enabled": true,
     "manifest": "image_manifest.json",
     "plan_json": "output/semantic_edit_plan.json",
+    "image_intelligence_json": "output/image_intelligence_plan.json",
     "min_beat_duration": 4.5,
     "preferred_beat_duration": 7.5,
     "max_beat_duration": 12.5,

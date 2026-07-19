@@ -2,6 +2,8 @@
 
 ## Completed
 
+- Image Intelligence 4.4.0: deterministic candidate inspection, quality ranking,
+  immutable image selection, and scene-level diagnostics
 - Visual Director 4.1.0 foundation
 - Shot Library 4.1.1
 - Narrative Intent Engine 4.1.2
@@ -10,11 +12,10 @@
 
 ## Current
 
-- Render validation and cinematic quality review
+- Image Intelligence validation and quality-weight calibration
 
 ## Planned
 
-- Image-ranking intelligence
 - Caption improvements
 - Audio Director
 - Cache and storage manager

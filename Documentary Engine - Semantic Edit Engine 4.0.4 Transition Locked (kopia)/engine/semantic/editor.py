@@ -4,12 +4,12 @@ import json
 import math
 import re
 import subprocess
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
+from engine.image_intelligence import ImageIntelligence
 from engine.visual_director import VisualDirector
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -47,39 +47,6 @@ def _tokens(text: str) -> list[str]:
         if token.endswith("s") and len(token) > 4:
             out.append(token[:-1])
     return out
-
-
-def _expanded(tokens: list[str], concept_groups: dict[str, set[str]] | None = None) -> Counter[str]:
-    """Expand tokens with project-derived concepts from the image manifest."""
-    result: Counter[str] = Counter(tokens)
-    present = set(tokens)
-    for concept, members in (concept_groups or {}).items():
-        if present & members:
-            result[concept] += 1.6
-            for member in members:
-                result[member] += 0.14
-    return result
-
-
-def _concept_groups(profiles: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
-    """Create reusable semantic groups from tags/descriptions in this project."""
-    groups: dict[str, set[str]] = {}
-    for profile in profiles.values():
-        phrases: list[str] = []
-        description = str(profile.get("description", "")).strip()
-        if description:
-            phrases.append(description)
-        phrases.extend(str(x) for x in profile.get("tags", []) if str(x).strip())
-        phrases.extend(str(x) for x in profile.get("ocr", []) if str(x).strip())
-        for phrase in phrases:
-            tokens = set(_tokens(phrase))
-            if not tokens:
-                continue
-            # Multiword tags become a concept whose members support synonyms and variants
-            # already supplied by the user/AI in the manifest.
-            key = "_".join(sorted(tokens)[:5])
-            groups.setdefault(key, set()).update(tokens)
-    return groups
 
 
 def build_beats(captions: list[dict[str, Any]], duration: float, cfg: dict[str, Any]) -> list[Beat]:
@@ -157,50 +124,36 @@ def load_profiles(project_dir: Path, images: list[Path], manifest_path: Path | N
     return profiles
 
 
-def score_image(beat: Beat, profile: dict[str, Any], image_index: int, beat_index: int, image_count: int, beat_count: int, usage: Counter[str], previous: str | None, concept_groups: dict[str, set[str]], repeat_penalty_weight: float = 3.5, immediate_repeat_penalty: float = 25.0) -> tuple[float, list[str]]:
-    bt = _expanded(_tokens(beat.text), concept_groups)
-    it = _expanded(_tokens(str(profile.get("semantic_text", ""))), concept_groups)
-    shared = set(bt) & set(it)
-    semantic = sum(min(float(bt[x]), 3.0) * min(float(it[x]), 3.0) for x in shared)
-    reasons = sorted(shared, key=lambda x: bt[x] * it[x], reverse=True)[:6]
-    # A mild chronology prior preserves a narrative arc, but semantic relevance dominates it.
-    expected = beat_index / max(1, beat_count - 1)
-    actual = image_index / max(1, image_count - 1)
-    chronology = 1.7 * (1.0 - min(1.0, abs(expected - actual)))
-    repeat_penalty = usage[str(profile.get("file"))] * repeat_penalty_weight
-    immediate_penalty = immediate_repeat_penalty if previous == str(profile.get("file")) else 0.0
-    priority = float(profile.get("priority", 0.0))
-    phase_bonus = 0.0
-    if "preferred_phase" in profile:
-        distance = abs(expected - float(profile["preferred_phase"]))
-        phase_bonus = 12.0 * max(0.0, 1.0 - distance / 0.24)
-    return semantic + chronology + priority + phase_bonus - repeat_penalty - immediate_penalty, reasons
-
-
-def assign_images(beats: list[Beat], images: list[Path], profiles: dict[str, dict[str, Any]], cfg: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def assign_images(beats: list[Beat], images: list[Path], profiles: dict[str, dict[str, Any]], cfg: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cfg = cfg or {}
-    usage: Counter[str] = Counter()
-    concept_groups = _concept_groups(profiles)
+    usage: dict[str, int] = {}
+    semantic_usage: dict[str, int] = {}
     repeat_weight = float(cfg.get("repeat_penalty", 3.5))
     immediate_weight = float(cfg.get("immediate_repeat_penalty", 25.0))
     previous: str | None = None
+    semantic_previous: str | None = None
     scenes: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    intelligence = ImageIntelligence()
+    candidates = [(image, profiles[image.name]) for image in images]
     for bi, beat in enumerate(beats):
-        candidates = []
-        for ii, image in enumerate(images):
-            profile = profiles[image.name]
-            score, reasons = score_image(beat, profile, ii, bi, len(images), len(beats), usage, previous, concept_groups, repeat_weight, immediate_weight)
-            candidates.append((score, reasons, image, profile))
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        score, reasons, image, profile = candidates[0]
-        usage[image.name] += 1
-        previous = image.name
+        decision = intelligence.rank_scene(
+            bi, len(beats), beat.text, candidates, usage, previous,
+            repeat_weight, immediate_weight, semantic_usage, semantic_previous,
+        )
+        selected = decision.candidate_ranking[0]
+        usage[selected.image] = usage.get(selected.image, 0) + 1
+        previous = selected.image
+        semantic_usage[decision.semantic_reference_image] = semantic_usage.get(decision.semantic_reference_image, 0) + 1
+        semantic_previous = decision.semantic_reference_image
+        semantic_profile = profiles[decision.semantic_reference_image]
         scenes.append({
             "start": round(beat.start, 3), "end": round(beat.end, 3), "duration": round(beat.end-beat.start, 3),
-            "image": image.name, "voiceover_text": beat.text, "image_description": profile.get("description", ""),
-            "match_terms": reasons, "semantic_score": round(score, 3),
+            "image": selected.image, "voiceover_text": beat.text, "image_description": semantic_profile.get("description", ""),
+            "match_terms": list(decision.semantic_match_terms), "semantic_score": decision.semantic_score,
         })
-    return scenes
+        diagnostics.append(decision.to_dict())
+    return scenes, diagnostics
 
 
 def ffconcat_quote(path: Path) -> str:
@@ -253,12 +206,20 @@ def build_semantic_edit(cfg: dict[str, Any], captions_path: Path, video: Path, r
     if undescribed:
         print("Semantic Edit Engine: varning – bilder utan beskrivning/taggar matchas främst kronologiskt: " + ", ".join(undescribed))
     beats = build_beats(captions, duration, sem)
-    scenes = assign_images(beats, images, profiles, sem)
+    scenes, image_decisions = assign_images(beats, images, profiles, sem)
+    diagnostics_path = root / str(sem.get("image_intelligence_json", "output/image_intelligence_plan.json"))
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_path.write_text(json.dumps({
+        "schema_version": "4.4.0",
+        "image_intelligence_version": ImageIntelligence.version,
+        "project": project_dir.name,
+        "scenes": image_decisions,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     scenes = VisualDirector().direct(scenes)
     plan_path = root / str(sem.get("plan_json", "output/semantic_edit_plan.json"))
     plan_path.parent.mkdir(parents=True, exist_ok=True)
-    plan_path.write_text(json.dumps({"schema_version":"4.0.3","project":project_dir.name,"duration":round(duration,3),"scenes":scenes}, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nSemantic Edit Engine 4.0.3: {len(beats)} berättelseblock matchade mot {len(images)} bilder")
+    plan_path.write_text(json.dumps({"schema_version":"4.4.0","project":project_dir.name,"duration":round(duration,3),"scenes":scenes}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nImage Intelligence 4.4.0: {len(beats)} berättelseblock rankade mot {len(images)} bilder")
     for i, s in enumerate(scenes, 1):
         print(f"  {i:02d}. {s['start']:5.1f}-{s['end']:5.1f}s  {s['image']:<16}  match={','.join(s['match_terms'][:4]) or 'chronology'}")
     build_video(project_dir, audio, scenes, video, root / "work")

@@ -1,14 +1,25 @@
-# Visual Director and Pacing Director 4.3.0
+# Documentary Engine 4.4.0 visual architecture
 
-The three planning layers have separate responsibilities:
+The pipeline layers have separate responsibilities:
 
-- **Semantic Engine:** decides what a scene contains, including its image, narration context, and exact timeline.
+- **Semantic Engine:** decides scene order, narration context, exact timeline, and the candidate images available to each scene.
+- **Image Intelligence:** inspects every available candidate, produces a deterministic weighted ranking, and selects one immutable source image.
 - **Visual Director:** describes how a completed semantic scene should eventually be experienced.
 - **Motion Planner:** selects the camera path between existing start and end positions.
 - **Pacing Director:** deterministically shapes how progress evolves along that path.
 - **Motion Engine:** renders the completed camera instructions against the authoritative semantic timeline.
 
-The Visual Director remains an identity/pass-through boundary for semantic data. It returns a validated deep copy of semantic scenes and keeps all visual metadata in separate `SceneVisualPlan` objects. It does not change `semantic_edit_plan.json`, scene order, image selection, or timing.
+The resulting order is:
+
+`Semantic Engine → Image Intelligence → Visual Director → Motion Planner → Pacing Director → Motion Engine`
+
+## Image Intelligence 4.4.0
+
+Image Intelligence is the only image-evaluation boundary. For every semantic scene it scores composition, technical quality, documentary suitability, caption compatibility, motion compatibility, and semantic compatibility. Scores are weighted and rounded deterministically; equal final scores are resolved by case-normalized filename and then the original filename. It writes a complete ranking, score breakdown, and fixed-format selection reasoning to `output/image_intelligence_plan.json`.
+
+The module does not generate media or import, inspect, or depend on Visual Director, Motion Planner, Pacing Director, Motion Engine, captions, transitions, or render state. Once selected, the image is immutable downstream input. Downstream modules may be replaced without changing Image Intelligence.
+
+The Visual Director remains an identity/pass-through boundary for completed semantic and image-selection data. It returns a validated deep copy of scenes and keeps all visual metadata in separate `SceneVisualPlan` objects. It does not change `semantic_edit_plan.json`, scene order, the immutable selected image, or timing.
 
 ## Shot Library
 
@@ -36,7 +47,7 @@ The serialized motion plan records the applied visual intent, narrative intent, 
 
 Version 4.3.0 inserts a separate Pacing Director after the Motion Planner and before the Motion Engine:
 
-`Semantic Engine → Visual Director → Motion Planner → Pacing Director → Motion Engine`
+`Semantic Engine → Image Intelligence → Visual Director → Motion Planner → Pacing Director → Motion Engine`
 
 The Motion Planner continues to own where the camera moves. The Pacing Director owns only how motion progresses between those unchanged start and end positions. It attaches `hold_fraction`, `ease_in_fraction`, `peak_fraction`, `ease_out_fraction`, `settle_fraction`, `speed_profile`, and easing metadata. The Motion Engine consumes this metadata as a renderer.
 
@@ -47,10 +58,10 @@ Pacing is fail-closed: start and end times, zoom endpoints, pan endpoints, motio
 ## Current limitations
 
 - Classification is conservative, lexical, and English-language oriented.
-- It cannot infer meaning beyond supplied semantic text or inspect image pixels.
+- Visual Director cannot infer meaning beyond supplied semantic text or inspect image pixels; pixel inspection belongs only to Image Intelligence.
 - Guidance is deterministic and rule-based; it does not inspect pixels or learn from rendered output.
-- Transitions, captions, audio, image selection, and semantic timing remain independent systems.
+- Pacing, transitions, captions, audio, immutable image selection, and semantic timing remain independent systems.
 
 ## Future integration
 
-Future versions may combine shot and narrative classifications with scene importance and image ranking. More camera behaviors and pacing profiles may be added behind the same separate, fail-closed contracts.
+Future versions may calibrate Image Intelligence weights without coupling it to downstream planning. More camera behaviors and pacing profiles may be added behind the same separate, fail-closed contracts.
