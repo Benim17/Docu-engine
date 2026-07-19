@@ -2,6 +2,8 @@
 
 ## Completed
 
+- Story Director 4.6.0: deterministic document structure, scene dramaturgy,
+  story graph, diagnostics, and metadata-only fallback planning
 - Caption Director 4.5.0: deterministic caption layout metadata, conservative
   highlighting, subject avoidance, and fail-closed planning
 - Image Intelligence 4.4.0: deterministic candidate inspection, quality ranking,
@@ -14,7 +16,7 @@
 
 ## Current
 
-- Caption layout validation and readability review
+- Story-analysis validation and future integration design
 
 ## Planned
 

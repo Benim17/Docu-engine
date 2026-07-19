@@ -18,6 +18,7 @@ from engine.caption_director import write_caption_director_plan
 from engine.motion.analyzer import SceneAnalysis
 from engine.pacing import PacingDirector
 from engine.semantic import build_semantic_edit
+from engine.story_director import write_story_director_plan
 from engine.transition import build_transition_boundaries, smooth_alpha, validate_transition_contract
 from engine.visual_director import VisualDirector
 
@@ -807,6 +808,17 @@ def render_video(cfg: dict[str, Any], video: Path, captions_path: Path, output: 
     print(f"\nKLART: {output}")
 
 
+def run_story_director_fail_safe(root: Path, cfg: dict[str, Any]) -> Path | None:
+    """Create optional story metadata without ever blocking the render path."""
+    try:
+        story_plan = write_story_director_plan(root, cfg)
+        print(f"Story Director 4.6.0: berättelseplan sparad i {story_plan}")
+        return story_plan
+    except Exception as exc:
+        print(f"Story Director 4.6.0: fail-closed, renderingen fortsätter ({exc})")
+        return None
+
+
 def main() -> None:
     require("ffmpeg")
     require("ffprobe")
@@ -834,6 +846,9 @@ def main() -> None:
             # Layout metadata is optional to the renderer. Even an I/O failure at
             # this boundary must preserve the existing caption render unchanged.
             print(f"Caption Director 4.5.0: fail-closed, befintlig captionlayout behålls ({exc})")
+    if bool(cfg.get("story_director", {}).get("enabled", True)):
+        # Story metadata is never consumed by rendering in 4.6.0.
+        run_story_director_fail_safe(ROOT, cfg)
     render_video(cfg, video, captions_json, output)
 
 

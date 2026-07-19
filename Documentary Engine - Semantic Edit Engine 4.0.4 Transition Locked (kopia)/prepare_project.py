@@ -123,6 +123,9 @@ def main() -> None:
     caption_director.setdefault("max_highlight_words", 2)
     caption_director.setdefault("highlight_color", "#FFD54A")
     caption_director.setdefault("allow_scene_reposition", True)
+    story_director = cfg.setdefault("story_director", {})
+    story_director.setdefault("enabled", True)
+    story_director.setdefault("plan_json", "output/story_director_plan.json")
     semantic = cfg.setdefault("semantic_edit_engine", {})
     semantic["enabled"] = True
     semantic["manifest"] = "image_manifest.json"

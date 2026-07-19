@@ -26,6 +26,10 @@
     "highlight_color": "#FFD54A",
     "allow_scene_reposition": true
   },
+  "story_director": {
+    "enabled": true,
+    "plan_json": "output/story_director_plan.json"
+  },
   "video_codec": "libx264",
   "crf": 19,
   "preset": "medium",
