@@ -10,7 +10,6 @@ from typing import Any
 
 from PIL import Image
 from engine.image_intelligence import ImageIntelligence
-from engine.visual_director import VisualDirector
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 STOP = {
@@ -215,7 +214,6 @@ def build_semantic_edit(cfg: dict[str, Any], captions_path: Path, video: Path, r
         "project": project_dir.name,
         "scenes": image_decisions,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    scenes = VisualDirector().direct(scenes)
     plan_path = root / str(sem.get("plan_json", "output/semantic_edit_plan.json"))
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps({"schema_version":"4.4.0","project":project_dir.name,"duration":round(duration,3),"scenes":scenes}, ensure_ascii=False, indent=2), encoding="utf-8")

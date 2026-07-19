@@ -14,6 +14,7 @@ from typing import Any
 
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 from engine.motion import analyze_video, build_motion_plan, motion_state as intelligent_motion_state
+from engine.caption_director import write_caption_director_plan
 from engine.motion.analyzer import SceneAnalysis
 from engine.pacing import PacingDirector
 from engine.semantic import build_semantic_edit
@@ -818,6 +819,21 @@ def main() -> None:
         raise FileNotFoundError(f"Videon saknas: {video}")
     build_caption_core(cfg, video, captions_json, captions_srt)
     video = build_semantic_edit(cfg, captions_json, video, ROOT)
+    if bool(cfg.get("caption_director", {}).get("enabled", True)):
+        try:
+            # Motion analysis is an approved read-only metadata input to Caption
+            # Director. Produce it before layout planning, without creating a
+            # motion plan or exposing any downstream implementation to the module.
+            motion_cfg = cfg.get("motion_engine", {})
+            if bool(motion_cfg.get("enabled", True)):
+                analysis_path = ROOT / str(motion_cfg.get("analysis_json", "output/motion_analysis.json"))
+                analyze_video(video, motion_cfg, analysis_path)
+            caption_plan = write_caption_director_plan(ROOT, cfg)
+            print(f"Caption Director 4.5.0: layoutplan sparad i {caption_plan}")
+        except Exception as exc:
+            # Layout metadata is optional to the renderer. Even an I/O failure at
+            # this boundary must preserve the existing caption render unchanged.
+            print(f"Caption Director 4.5.0: fail-closed, befintlig captionlayout behålls ({exc})")
     render_video(cfg, video, captions_json, output)
 
 

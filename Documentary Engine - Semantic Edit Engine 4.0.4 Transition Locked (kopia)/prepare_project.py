@@ -110,6 +110,19 @@ def main() -> None:
     cfg["captions_json"] = "output/captions.json"
     cfg["captions_srt"] = "output/captions.srt"
     cfg["reuse_existing_captions"] = False
+    caption_director = cfg.setdefault("caption_director", {})
+    caption_director.setdefault("enabled", True)
+    caption_director.setdefault("plan_json", "output/caption_director_plan.json")
+    caption_director.setdefault("default_position", "bottom")
+    caption_director.setdefault("bottom_vertical_anchor", 0.72)
+    caption_director.setdefault("top_vertical_anchor", 0.18)
+    caption_director.setdefault("safe_margin", 0.08)
+    caption_director.setdefault("max_width", 0.82)
+    caption_director.setdefault("max_lines", 2)
+    caption_director.setdefault("max_characters_per_line", 24)
+    caption_director.setdefault("max_highlight_words", 2)
+    caption_director.setdefault("highlight_color", "#FFD54A")
+    caption_director.setdefault("allow_scene_reposition", True)
     semantic = cfg.setdefault("semantic_edit_engine", {})
     semantic["enabled"] = True
     semantic["manifest"] = "image_manifest.json"

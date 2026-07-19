@@ -2,6 +2,8 @@
 
 ## Completed
 
+- Caption Director 4.5.0: deterministic caption layout metadata, conservative
+  highlighting, subject avoidance, and fail-closed planning
 - Image Intelligence 4.4.0: deterministic candidate inspection, quality ranking,
   immutable image selection, and scene-level diagnostics
 - Visual Director 4.1.0 foundation
@@ -12,11 +14,10 @@
 
 ## Current
 
-- Image Intelligence validation and quality-weight calibration
+- Caption layout validation and readability review
 
 ## Planned
 
-- Caption improvements
 - Audio Director
 - Cache and storage manager
 - Future ingestion and script-generation tools

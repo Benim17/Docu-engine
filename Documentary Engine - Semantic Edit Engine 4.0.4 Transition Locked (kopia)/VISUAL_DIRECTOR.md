@@ -1,9 +1,10 @@
-# Documentary Engine 4.4.0 visual architecture
+# Documentary Engine 4.5.0 visual architecture
 
 The pipeline layers have separate responsibilities:
 
 - **Semantic Engine:** decides scene order, narration context, exact timeline, and the candidate images available to each scene.
 - **Image Intelligence:** inspects every available candidate, produces a deterministic weighted ranking, and selects one immutable source image.
+- **Caption Director:** produces pure caption layout metadata without changing caption content or timing.
 - **Visual Director:** describes how a completed semantic scene should eventually be experienced.
 - **Motion Planner:** selects the camera path between existing start and end positions.
 - **Pacing Director:** deterministically shapes how progress evolves along that path.
@@ -11,13 +12,21 @@ The pipeline layers have separate responsibilities:
 
 The resulting order is:
 
-`Semantic Engine → Image Intelligence → Visual Director → Motion Planner → Pacing Director → Motion Engine`
+`Semantic Engine → Image Intelligence → Caption Director → Visual Director → Motion Planner → Pacing Director → Motion Engine`
 
 ## Image Intelligence 4.4.0
 
 Image Intelligence is the only image-evaluation boundary. For every semantic scene it scores composition, technical quality, documentary suitability, caption compatibility, motion compatibility, and semantic compatibility. Scores are weighted and rounded deterministically; equal final scores are resolved by case-normalized filename and then the original filename. It writes a complete ranking, score breakdown, and fixed-format selection reasoning to `output/image_intelligence_plan.json`.
 
 The module does not generate media or import, inspect, or depend on Visual Director, Motion Planner, Pacing Director, Motion Engine, captions, transitions, or render state. Once selected, the image is immutable downstream input. Downstream modules may be replaced without changing Image Intelligence.
+
+## Caption Director 4.5.0
+
+Caption Director is the single authority for caption layout decisions. It may decide position, normalized vertical anchor, safe margin, maximum width, maximum lines, deterministic word wrapping, conservative highlight words, config-driven highlight color, and readability metadata. Face avoidance has highest priority, followed by detected-subject avoidance, safe margins, reading comfort, placement stability, and conservative highlighting.
+
+It reads only `semantic_edit_plan.json`, `captions.json`, `image_intelligence_plan.json`, `motion_analysis.json`, and `config.json`. It does not import or inspect Visual Director, Motion Planner, Pacing Director, Motion Engine, rendering code, FFmpeg, semantic implementation, or Image Intelligence implementation. Its complete scene-by-scene diagnostics are written to `output/caption_director_plan.json`.
+
+The plan is metadata-only in 4.5.0. Existing caption text, word timestamps, caption start/end times, narration, semantic timeline, selected images, transitions, motion, pacing, and rendered content remain untouched. Invalid or missing optional metadata produces a deterministic fallback plan using the existing configured placement; it never blocks rendering.
 
 The Visual Director remains an identity/pass-through boundary for completed semantic and image-selection data. It returns a validated deep copy of scenes and keeps all visual metadata in separate `SceneVisualPlan` objects. It does not change `semantic_edit_plan.json`, scene order, the immutable selected image, or timing.
 
@@ -47,7 +56,7 @@ The serialized motion plan records the applied visual intent, narrative intent, 
 
 Version 4.3.0 inserts a separate Pacing Director after the Motion Planner and before the Motion Engine:
 
-`Semantic Engine → Image Intelligence → Visual Director → Motion Planner → Pacing Director → Motion Engine`
+`Semantic Engine → Image Intelligence → Caption Director → Visual Director → Motion Planner → Pacing Director → Motion Engine`
 
 The Motion Planner continues to own where the camera moves. The Pacing Director owns only how motion progresses between those unchanged start and end positions. It attaches `hold_fraction`, `ease_in_fraction`, `peak_fraction`, `ease_out_fraction`, `settle_fraction`, `speed_profile`, and easing metadata. The Motion Engine consumes this metadata as a renderer.
 
@@ -60,7 +69,7 @@ Pacing is fail-closed: start and end times, zoom endpoints, pan endpoints, motio
 - Classification is conservative, lexical, and English-language oriented.
 - Visual Director cannot infer meaning beyond supplied semantic text or inspect image pixels; pixel inspection belongs only to Image Intelligence.
 - Guidance is deterministic and rule-based; it does not inspect pixels or learn from rendered output.
-- Pacing, transitions, captions, audio, immutable image selection, and semantic timing remain independent systems.
+- Caption layout, pacing, transitions, caption content/timing, audio, immutable image selection, and semantic timing remain independent systems.
 
 ## Future integration
 
