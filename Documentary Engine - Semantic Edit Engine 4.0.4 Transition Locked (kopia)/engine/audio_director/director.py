@@ -6,7 +6,10 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
-from .models import AUDIO_INTENTS, EMOTIONAL_TONES, PLANNER_VERSION, AudioContractError
+from .models import (
+    AUDIO_INTENTS, EMOTIONAL_TONES, PLANNER_VERSION, AudioContractError,
+    MusicPlan, ProjectAudioDiagnostics, ProjectAudioSummary,
+)
 
 
 KNOWN_STORY_ROLES = frozenset({
@@ -77,6 +80,30 @@ CONFLICTING_TONES = frozenset({
     frozenset({"uplifting", "somber"}),
     frozenset({"triumphant", "somber"}),
 })
+
+# Step 3 energy model. Intent is deliberately the largest categorical factor;
+# tone modifies it, while compatible Story Director values provide bounded
+# continuous support. These constants are internal 4.7.0 defaults until config
+# integration is introduced in a later step.
+NEUTRAL_BASE_ENERGY = 0.40
+MAX_NORMAL_ENERGY_DELTA = 0.30
+MAX_SUPPORTED_CONTRAST_DELTA = 0.45
+SUPPORTED_CONTRAST_CONFIDENCE = 0.75
+INTENT_ENERGY_ADJUSTMENTS = {
+    "neutral": 0.00, "support": 0.00, "establish": -0.04,
+    "reflection": -0.12, "release": -0.08, "transition": -0.02,
+    "build": 0.12, "tension": 0.22, "resolution": 0.02, "climax": 0.38,
+}
+TONE_ENERGY_ADJUSTMENTS = {
+    "neutral": 0.00, "calm": -0.08, "reflective": -0.07,
+    "mysterious": 0.04, "somber": -0.05, "hopeful": 0.03,
+    "uplifting": 0.08, "tense": 0.10, "dramatic": 0.10,
+    "triumphant": 0.12,
+}
+TONE_TIE_BREAK_ORDER = (
+    "neutral", "calm", "reflective", "mysterious", "tense", "somber",
+    "hopeful", "dramatic", "uplifting", "triumphant",
+)
 
 
 def _canonical_strings(values: Sequence[str]) -> tuple[str, ...]:
@@ -164,6 +191,11 @@ class SceneAudioAnalysis:
     fallback_used: bool
     fallback_reason: str | None
     rationale: str
+    story_role: str | None = None
+    story_phase: str | None = None
+    story_tension: float | None = None
+    story_emotional_intensity: float | None = None
+    story_revelation_strength: float | None = None
 
     def __post_init__(self) -> None:
         if self.audio_intent not in AUDIO_INTENTS or self.emotional_tone not in EMOTIONAL_TONES:
@@ -178,6 +210,25 @@ class SceneAudioAnalysis:
         ):
             if values != _canonical_strings(values):
                 raise AudioContractError(f"Internal {name} must be canonically sorted and unique.")
+
+
+@dataclass(frozen=True)
+class SceneEnergyMusicAnalysis:
+    scene: SceneAudioAnalysis
+    raw_energy: float
+    energy: float
+    energy_adjustment: str
+    supported_contrast_preserved: bool
+    music: MusicPlan
+    warnings: tuple[str, ...]
+    rationale: str
+
+
+@dataclass(frozen=True)
+class ProjectEnergyMusicAnalysis:
+    project_summary: ProjectAudioSummary
+    scenes: tuple[SceneEnergyMusicAnalysis, ...]
+    diagnostics: ProjectAudioDiagnostics
 
 
 class AudioDirector:
@@ -205,6 +256,198 @@ class AudioDirector:
         if inputs != snapshot:
             raise AudioContractError("Audio Director mutated intent/tone input metadata.")
         return analyses
+
+    def plan_energy_and_music(
+        self,
+        semantic_plan: Mapping[str, Any],
+        story_plan: Mapping[str, Any] | None = None,
+    ) -> ProjectEnergyMusicAnalysis:
+        """Plan Step 3 energy and abstract music metadata without media work."""
+        inputs = (semantic_plan, story_plan)
+        snapshot = deepcopy(inputs)
+        analyses = self.analyze_intent_and_tone(semantic_plan, story_plan)
+        raw = tuple(self._raw_energy(scene) for scene in analyses)
+        final, adjustments, preserved = self._smooth_energy(analyses, raw)
+        planned = []
+        for index, (scene, raw_energy, energy) in enumerate(zip(analyses, raw, final)):
+            music, music_warning = self._music_plan(scene, energy)
+            warnings = list(scene.warnings)
+            if adjustments[index] != "unchanged":
+                warnings.append("normal_energy_delta_limited")
+            if preserved[index]:
+                warnings.append("supported_climax_contrast_preserved")
+            if music_warning:
+                warnings.append(music_warning)
+            planned.append(SceneEnergyMusicAnalysis(
+                scene=scene,
+                raw_energy=raw_energy,
+                energy=energy,
+                energy_adjustment=adjustments[index],
+                supported_contrast_preserved=preserved[index],
+                music=music,
+                warnings=_canonical_strings(warnings),
+                rationale=(
+                    f"Energy {raw_energy:.4f}->{energy:.4f} ({adjustments[index]}); "
+                    f"music {music.style} at {music.intensity:.4f}."
+                ),
+            ))
+
+        scenes = tuple(planned)
+        curve = tuple(item.energy for item in scenes)
+        dominant = self._dominant_tone(analyses)
+        styles = tuple(item.music.style for item in scenes)
+        style_changes = sum(left != right for left, right in zip(styles, styles[1:]))
+        fallback_count = sum(scene.fallback_used for scene in analyses)
+        project_warnings = []
+        if any(item.energy_adjustment != "unchanged" for item in scenes):
+            project_warnings.append("energy_curve_contains_limited_deltas")
+        if any(item.supported_contrast_preserved for item in scenes):
+            project_warnings.append("energy_curve_contains_supported_climax_contrast")
+        if analyses and fallback_count * 2 > len(analyses):
+            project_warnings.append("fallback_dominant_energy_planning")
+        confidence = _clamp(
+            sum(scene.confidence for scene in analyses) / len(analyses)
+            if analyses else 0.0
+        )
+        summary = ProjectAudioSummary(
+            dominant_tone=dominant,
+            default_music_style=self._default_music_style(styles),
+            energy_curve=curve,
+            scene_count=len(scenes),
+            target_loudness_lufs=-14.0,
+        )
+        diagnostics = ProjectAudioDiagnostics(
+            confidence=confidence,
+            warnings=_canonical_strings(project_warnings),
+            fallback_count=fallback_count,
+            missing_inputs=("story_director_plan",) if analyses and all(scene.story_role is None for scene in analyses) else (),
+            resolved_conflicts=_canonical_strings(
+                conflict for scene in analyses for conflict in scene.resolved_conflicts
+            ),
+            flat_energy_curve=(not curve or max(curve) - min(curve) <= 0.05),
+            extreme_energy_count=sum(value <= 0.10 or value >= 0.90 for value in curve),
+            music_style_change_count=style_changes,
+            unsupported_aggressive_transition_count=0,
+            ambience_scene_count=0,
+            scene_without_usable_input_count=sum(
+                not scene.accepted_signals for scene in analyses
+            ),
+            fallback_dominant=bool(analyses and fallback_count * 2 > len(analyses)),
+        )
+        summary.validate()
+        diagnostics.validate(len(scenes))
+        for item in scenes:
+            item.music.validate()
+        if inputs != snapshot:
+            raise AudioContractError("Audio Director mutated energy/music input metadata.")
+        return ProjectEnergyMusicAnalysis(summary, scenes, diagnostics)
+
+    @staticmethod
+    def _raw_energy(scene: SceneAudioAnalysis) -> float:
+        # Fixed order: base -> intent -> tone -> bounded structural values -> clamp/round.
+        value = NEUTRAL_BASE_ENERGY
+        value += INTENT_ENERGY_ADJUSTMENTS[scene.audio_intent]
+        value += TONE_ENERGY_ADJUSTMENTS[scene.emotional_tone]
+        if scene.story_tension is not None:
+            value += (scene.story_tension - 0.5) * 0.18
+        if scene.story_emotional_intensity is not None:
+            value += (scene.story_emotional_intensity - 0.5) * 0.12
+        if scene.story_revelation_strength is not None:
+            value += scene.story_revelation_strength * 0.06
+        return _clamp(value)
+
+    @staticmethod
+    def _has_supported_contrast(scene: SceneAudioAnalysis) -> bool:
+        return bool(
+            scene.audio_intent == "climax"
+            and scene.story_role == "climax"
+            and scene.story_phase == "climax"
+            and (scene.story_tension or 0.0) >= 0.70
+            and scene.confidence >= SUPPORTED_CONTRAST_CONFIDENCE
+        )
+
+    @classmethod
+    def _smooth_energy(
+        cls,
+        scenes: Sequence[SceneAudioAnalysis],
+        raw: Sequence[float],
+    ) -> tuple[tuple[float, ...], tuple[str, ...], tuple[bool, ...]]:
+        # One forward pass preserves causal explainability: each scene is
+        # bounded only against the already-final preceding semantic scene.
+        if not raw:
+            return (), (), ()
+        final = [raw[0]]
+        adjustments = ["unchanged"]
+        preserved = [False]
+        for index in range(1, len(raw)):
+            previous, candidate = final[-1], raw[index]
+            delta = candidate - previous
+            allowed = MAX_NORMAL_ENERGY_DELTA
+            contrast = cls._has_supported_contrast(scenes[index]) and delta > allowed
+            if contrast:
+                allowed = MAX_SUPPORTED_CONTRAST_DELTA
+            bounded = min(previous + allowed, max(previous - MAX_NORMAL_ENERGY_DELTA, candidate))
+            bounded = _clamp(bounded)
+            final.append(bounded)
+            if bounded < candidate:
+                adjustments.append("limited_up")
+            elif bounded > candidate:
+                adjustments.append("limited_down")
+            else:
+                adjustments.append("unchanged")
+            preserved.append(contrast and bounded - previous > MAX_NORMAL_ENERGY_DELTA)
+        return tuple(final), tuple(adjustments), tuple(preserved)
+
+    @staticmethod
+    def _music_plan(scene: SceneAudioAnalysis, energy: float) -> tuple[MusicPlan, str | None]:
+        supported_tension = (
+            scene.story_role in {"complication", "contrast", "counterargument", "climax"}
+            and (scene.story_tension or 0.0) >= 0.65
+        )
+        supported_climax = AudioDirector._has_supported_contrast(scene)
+        warning = None
+        if scene.emotional_tone in {"calm", "reflective"} or scene.audio_intent == "reflection":
+            style = "ambient" if energy >= 0.25 else "minimal"
+        elif scene.emotional_tone == "somber":
+            style = "emotional_piano"
+        elif scene.audio_intent == "tension" and supported_tension:
+            style = "suspense"
+        elif scene.audio_intent == "climax" and supported_climax:
+            style = "orchestral" if scene.emotional_tone == "triumphant" else "cinematic"
+        else:
+            style = "documentary"
+            if scene.audio_intent in {"tension", "climax"} or scene.emotional_tone in {"dramatic", "triumphant"}:
+                warning = "aggressive_music_style_downgraded"
+        intensity = energy * 0.72
+        if scene.audio_intent in {"support", "neutral", "establish"}:
+            intensity -= 0.08
+        if supported_climax:
+            intensity += 0.08
+        intensity = _clamp(intensity)
+        rationale = f"Style {style} from intent {scene.audio_intent}, tone {scene.emotional_tone}, energy {energy:.4f}."
+        return MusicPlan(True, style, intensity, rationale), warning
+
+    @staticmethod
+    def _dominant_tone(scenes: Sequence[SceneAudioAnalysis]) -> str:
+        if not scenes:
+            return "neutral"
+        order = {tone: index for index, tone in enumerate(TONE_TIE_BREAK_ORDER)}
+        totals = {
+            tone: (
+                round(sum(scene.confidence for scene in scenes if scene.emotional_tone == tone), 4),
+                sum(scene.emotional_tone == tone for scene in scenes),
+            )
+            for tone in TONE_TIE_BREAK_ORDER
+        }
+        return min(TONE_TIE_BREAK_ORDER, key=lambda tone: (-totals[tone][0], -totals[tone][1], order[tone]))
+
+    @staticmethod
+    def _default_music_style(styles: Sequence[str]) -> str:
+        if not styles:
+            return "documentary"
+        order = ("documentary", "ambient", "minimal", "emotional_piano", "cinematic", "suspense", "orchestral")
+        counts = {style: styles.count(style) for style in order}
+        return min(order, key=lambda style: (-counts[style], order.index(style)))
 
     @staticmethod
     def _semantic_scenes(semantic_plan: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -404,6 +647,11 @@ class AudioDirector:
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
             rationale=rationale,
+            story_role=story.story_role if story is not None else None,
+            story_phase=story.story_phase if story is not None else None,
+            story_tension=story.tension if story is not None else None,
+            story_emotional_intensity=story.emotional_intensity if story is not None else None,
+            story_revelation_strength=story.revelation_strength if story is not None else None,
         )
 
     @staticmethod
@@ -487,7 +735,13 @@ class AudioDirector:
                 add("dramatic", 0.82)
             if role in {"complication", "contrast", "counterargument"} and tension >= 0.65:
                 add("tense", 0.72)
-            if role in {"context", "setup"} and tension <= 0.35 and emotion <= 0.35:
+            if (
+                role in {"context", "setup"}
+                and story.tension is not None
+                and story.emotional_intensity is not None
+                and tension <= 0.35
+                and emotion <= 0.35
+            ):
                 add("calm", 0.62)
             if role == "revelation" or (story.revelation_strength or 0.0) >= 0.65:
                 add("mysterious", 0.58)
@@ -533,5 +787,16 @@ def serialize_intent_tone_analysis(analyses: Sequence[SceneAudioAnalysis]) -> st
         "planner_version": PLANNER_VERSION,
         "scene_count": len(analyses),
         "scenes": [asdict(analysis) for analysis in analyses],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+
+def serialize_energy_music_analysis(analysis: ProjectEnergyMusicAnalysis) -> str:
+    """Stable Step 3 debug serialization; not a 4.7.0 output artifact."""
+    payload = {
+        "planner_version": PLANNER_VERSION,
+        "project_summary": asdict(analysis.project_summary),
+        "scenes": [asdict(scene) for scene in analysis.scenes],
+        "diagnostics": asdict(analysis.diagnostics),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
