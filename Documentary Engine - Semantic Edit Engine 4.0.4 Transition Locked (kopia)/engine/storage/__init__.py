@@ -32,6 +32,27 @@ from .cache_keys import (
     derive_cache_key,
     serialize_cache_key_material,
 )
+from .safety import (
+    GitIndexSnapshot,
+    GitTrackingStatus,
+    PathSafetyStatus,
+    SafetyAssessment,
+    SafetyError,
+    SymlinkStatus,
+    assess_path_safety,
+    inspect_git_index,
+)
+from .inventory import (
+    ArtifactGroupInventory,
+    ArtifactGroupStatus,
+    DiscoveredFileType,
+    InventoryError,
+    InventoryRecord,
+    InventoryReport,
+    InventoryRequest,
+    ObservationStatus,
+    inspect_inventory,
+)
 
 __all__ = [
     "ARTIFACT_CONTRACT_VERSION",
@@ -62,4 +83,21 @@ __all__ = [
     "RuntimeFingerprint",
     "derive_cache_key",
     "serialize_cache_key_material",
+    "GitIndexSnapshot",
+    "GitTrackingStatus",
+    "PathSafetyStatus",
+    "SafetyAssessment",
+    "SafetyError",
+    "SymlinkStatus",
+    "assess_path_safety",
+    "inspect_git_index",
+    "ArtifactGroupInventory",
+    "ArtifactGroupStatus",
+    "DiscoveredFileType",
+    "InventoryError",
+    "InventoryRecord",
+    "InventoryReport",
+    "InventoryRequest",
+    "ObservationStatus",
+    "inspect_inventory",
 ]
