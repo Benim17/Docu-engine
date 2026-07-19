@@ -7,9 +7,8 @@ from dataclasses import dataclass
 class SceneVisualPlan:
     """Future-facing visual intent for one semantic scene.
 
-    Version 4.1.0 deliberately exposes neutral values only. These values are
-    kept separate from semantic scene dictionaries and are not consumed by
-    motion, transitions, captions, or rendering.
+    These values are kept separate from semantic scene dictionaries and are
+    not consumed by motion, transitions, captions, or rendering.
     """
 
     scene_index: int
@@ -18,3 +17,6 @@ class SceneVisualPlan:
     pace: str = "neutral"
     importance: float = 0.0
     cinematic_intent: str = "identity"
+    visual_intent: str = "medium"
+    confidence: float = 0.50
+    reason: str = "Default fallback."

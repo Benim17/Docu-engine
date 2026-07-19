@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
 from .models import SceneVisualPlan
+from .shot_library import classify_scene
 
 
 class VisualDirectorContractError(RuntimeError):
@@ -11,18 +12,27 @@ class VisualDirectorContractError(RuntimeError):
 
 
 class VisualDirector:
-    """Documentary Engine 4.1.0 identity-only orchestration boundary."""
+    """Documentary Engine 4.1.1 identity-only orchestration boundary."""
 
-    version = "4.1.0"
+    version = "4.1.1"
 
     def build_visual_plan(
         self,
         semantic_scenes: Sequence[Mapping[str, Any]],
         context: Mapping[str, Any] | None = None,
     ) -> list[SceneVisualPlan]:
-        """Return neutral visual intent without reading or mutating scene data."""
+        """Classify separate visual intent without mutating semantic scene data."""
         del context
-        return [SceneVisualPlan(scene_index=index) for index, _ in enumerate(semantic_scenes)]
+        plans = []
+        for index, scene in enumerate(semantic_scenes):
+            classification = classify_scene(scene)
+            plans.append(SceneVisualPlan(
+                scene_index=index,
+                visual_intent=classification.visual_intent,
+                confidence=classification.confidence,
+                reason=classification.reason,
+            ))
+        return plans
 
     def direct(
         self,
