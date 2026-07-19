@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
 from .models import SceneVisualPlan
+from .narrative_intent import classify_narrative_intent
 from .shot_library import classify_scene
 
 
@@ -12,9 +13,9 @@ class VisualDirectorContractError(RuntimeError):
 
 
 class VisualDirector:
-    """Documentary Engine 4.1.1 identity-only orchestration boundary."""
+    """Documentary Engine 4.1.2 identity-only orchestration boundary."""
 
-    version = "4.1.1"
+    version = "4.1.2"
 
     def build_visual_plan(
         self,
@@ -24,13 +25,18 @@ class VisualDirector:
         """Classify separate visual intent without mutating semantic scene data."""
         del context
         plans = []
+        total_scene_count = len(semantic_scenes)
         for index, scene in enumerate(semantic_scenes):
             classification = classify_scene(scene)
+            narrative = classify_narrative_intent(scene, index, total_scene_count)
             plans.append(SceneVisualPlan(
                 scene_index=index,
                 visual_intent=classification.visual_intent,
                 confidence=classification.confidence,
                 reason=classification.reason,
+                narrative_intent=narrative.narrative_intent,
+                narrative_confidence=narrative.narrative_confidence,
+                narrative_reason=narrative.narrative_reason,
             ))
         return plans
 

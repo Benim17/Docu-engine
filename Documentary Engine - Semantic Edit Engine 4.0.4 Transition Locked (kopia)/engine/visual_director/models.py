@@ -20,3 +20,6 @@ class SceneVisualPlan:
     visual_intent: str = "medium"
     confidence: float = 0.50
     reason: str = "Default fallback."
+    narrative_intent: str = "development"
+    narrative_confidence: float = 0.50
+    narrative_reason: str = "Default fallback."
