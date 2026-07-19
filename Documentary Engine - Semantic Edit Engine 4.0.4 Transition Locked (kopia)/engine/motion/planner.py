@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import Any
+from typing import Any, Sequence
 import random
 from .analyzer import SceneAnalysis
 
@@ -11,12 +11,21 @@ class MotionPlan:
     start_x: float; start_y: float; end_x: float; end_y: float
     preset: str; confidence: float; focus_x: float; focus_y: float
     hold_fraction: float = 0.0
+    visual_intent: str = "medium"
+    narrative_intent: str = "development"
+    guidance_reason: str = "Motion Engine fallback."
     def to_dict(self): return asdict(self)
 
 def _ease(x: float)->float:
     x=max(0.0,min(1.0,x)); return x*x*x*(x*(x*6-15)+10)
 
-def build_motion_plan(scenes:list[SceneAnalysis], cfg:dict[str,Any])->list[MotionPlan]:
+def build_motion_plan(
+    scenes: list[SceneAnalysis],
+    cfg: dict[str, Any],
+    visual_guidance: Sequence[Any] | None = None,
+) -> list[MotionPlan]:
+    if visual_guidance is not None and len(visual_guidance) != len(scenes):
+        raise ValueError("Visual-to-Motion contract violation: scene and guidance counts differ.")
     rng=random.Random(int(cfg.get('seed',300)))
     min_zoom=max(1.0,float(cfg.get('min_zoom',1.015)))
     max_zoom=max(min_zoom,float(cfg.get('max_zoom',1.105)))
@@ -30,8 +39,13 @@ def build_motion_plan(scenes:list[SceneAnalysis], cfg:dict[str,Any])->list[Motio
         safe_y_max=max(safe_y_min+0.01,min(1.0,float(cfg.get('safe_focus_y_max',0.76))))
         fx=max(safe_x_min,min(safe_x_max,s.focus_x)); fy=max(safe_y_min,min(safe_y_max,s.focus_y))
         tx=(fx-0.5)*2*pan_strength; ty=(fy-0.5)*2*pan_strength
-        # Faces receive a gentle push-in. Wide/no-face scenes reveal toward the detected focal point.
-        if s.face_count>0:
+        guide = visual_guidance[i] if visual_guidance is not None else None
+        # 4.2 guidance selects behavior; subject analysis still owns the safe focal point.
+        if guide is not None:
+            if int(guide.scene_index) != i:
+                raise ValueError("Visual-to-Motion contract violation: guidance order drifted.")
+            preset = str(guide.preferred_preset)
+        elif s.face_count>0:
             preset='subject_push_in' if s.subject_scale < 0.20 else 'portrait_hold'
         elif s.confidence < 0.34:
             preset='safe_push_in'
@@ -39,10 +53,12 @@ def build_motion_plan(scenes:list[SceneAnalysis], cfg:dict[str,Any])->list[Motio
             preset='focus_reveal'
         else:
             preset=rng.choice(['documentary_float','slow_pull_out','safe_push_in'])
-        if preset==last and preset not in {'subject_push_in','portrait_hold'}:
+        if guide is None and preset==last and preset not in {'subject_push_in','portrait_hold'}:
             preset='slow_pull_out' if preset!='slow_pull_out' else 'documentary_float'
         last=preset
         strength=min(1.0,max(0.35,dur/5.0))*max(0.45,s.confidence)
+        if guide is not None:
+            strength *= max(0.35, min(1.0, float(guide.intensity)))
         if preset=='subject_push_in':
             z0=min_zoom; z1=min(max_zoom,min_zoom+(max_zoom-min_zoom)*(0.72+0.20*strength)); x0,y0=tx*0.35,ty*0.35; x1,y1=tx,ty
         elif preset=='portrait_hold':
@@ -95,7 +111,15 @@ def build_motion_plan(scenes:list[SceneAnalysis], cfg:dict[str,Any])->list[Motio
 
         clamp=lambda v:max(-1.0,min(1.0,v))
         hold = max(0.0, min(0.25, float(cfg.get("cut_settle_fraction", 0.07)))) if i > 0 else 0.0
-        plans.append(MotionPlan(s.start,s.end,z0,z1,clamp(x0),clamp(y0),clamp(x1),clamp(y1),preset,s.confidence,fx,fy,hold))
+        if guide is not None:
+            hold = max(hold, max(0.0, min(0.25, float(guide.hold_fraction))))
+        plans.append(MotionPlan(
+            s.start,s.end,z0,z1,clamp(x0),clamp(y0),clamp(x1),clamp(y1),
+            preset,s.confidence,fx,fy,hold,
+            str(guide.visual_intent) if guide is not None else "medium",
+            str(guide.narrative_intent) if guide is not None else "development",
+            str(guide.reason) if guide is not None else "Motion Engine fallback.",
+        ))
     return plans
 
 def motion_state(plans:list[MotionPlan],t:float,hint:int, transition_delay:float=0.0):

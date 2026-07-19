@@ -4,15 +4,15 @@
 
 - Visual Director 4.1.0 foundation
 - Shot Library 4.1.1
+- Narrative Intent Engine 4.1.2
+- Visual-to-Motion integration 4.2.0
 
 ## Current
 
-- Narrative Intent Engine 4.1.2
+- Pacing and visual rhythm
 
 ## Planned
 
-- Visual-to-Motion integration 4.2
-- Pacing and visual rhythm
 - Image-ranking intelligence
 - Caption improvements
 - Audio Director

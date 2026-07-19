@@ -17,6 +17,7 @@ from engine.motion import analyze_video, build_motion_plan, motion_state as inte
 from engine.motion.analyzer import SceneAnalysis
 from engine.semantic import build_semantic_edit
 from engine.transition import build_transition_boundaries, smooth_alpha, validate_transition_contract
+from engine.visual_director import VisualDirector
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config.json"
@@ -682,11 +683,14 @@ def render_video(cfg: dict[str, Any], video: Path, captions_path: Path, output: 
             if mapped:
                 scenes = mapped
                 analysis_path.write_text(json.dumps({"schema_version":"3.2","video":video.name,"timeline_source":"semantic_edit_plan","scenes":[x.to_dict() for x in scenes]}, indent=2), encoding="utf-8")
-        motion_plans = build_motion_plan(scenes, motion)
+        visual_guidance = None
+        if semantic_scenes:
+            visual_guidance = VisualDirector().build_motion_guidance(semantic_scenes)
+        motion_plans = build_motion_plan(scenes, motion, visual_guidance)
         plan_path = ROOT / str(motion.get("plan_json", "output/motion_plan_v302.json"))
         plan_path.parent.mkdir(parents=True, exist_ok=True)
-        plan_path.write_text(json.dumps({"schema_version":"3.1","plans":[p.to_dict() for p in motion_plans]}, indent=2), encoding="utf-8")
-        print(f"Motion Engine 3.0.6 / Smooth Transition Standard 1.0: transition-locked camera + cinematic cross-dissolve ({len(scenes)} scener, {len(motion_plans)} planer)")
+        plan_path.write_text(json.dumps({"schema_version":"4.2","visual_director_version":"4.2.0","plans":[p.to_dict() for p in motion_plans]}, indent=2), encoding="utf-8")
+        print(f"Motion Engine / Visual Director 4.2.0: intent-guided camera + cinematic cross-dissolve ({len(scenes)} scener, {len(motion_plans)} planer)")
         for i, plan in enumerate(motion_plans[:8], 1):
             print(f"  {i:02d}. {plan.start:5.1f}-{plan.end:5.1f}s  {plan.preset:20s} fokus=({plan.focus_x:.2f},{plan.focus_y:.2f}) conf={plan.confidence:.2f}")
     elif motion_enabled:

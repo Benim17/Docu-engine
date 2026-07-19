@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
 from .models import SceneVisualPlan
+from .motion_guidance import MotionGuidance, build_motion_guidance
 from .narrative_intent import classify_narrative_intent
 from .shot_library import classify_scene
 
@@ -13,9 +14,9 @@ class VisualDirectorContractError(RuntimeError):
 
 
 class VisualDirector:
-    """Documentary Engine 4.1.2 identity-only orchestration boundary."""
+    """Documentary Engine 4.2.0 identity-only orchestration boundary."""
 
-    version = "4.1.2"
+    version = "4.2.0"
 
     def build_visual_plan(
         self,
@@ -39,6 +40,14 @@ class VisualDirector:
                 narrative_reason=narrative.narrative_reason,
             ))
         return plans
+
+    def build_motion_guidance(
+        self,
+        semantic_scenes: Sequence[Mapping[str, Any]],
+        context: Mapping[str, Any] | None = None,
+    ) -> list[MotionGuidance]:
+        """Translate separate visual plans into deterministic Motion Engine hints."""
+        return build_motion_guidance(self.build_visual_plan(semantic_scenes, context))
 
     def direct(
         self,
