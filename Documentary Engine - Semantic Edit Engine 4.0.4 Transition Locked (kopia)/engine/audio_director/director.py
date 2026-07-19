@@ -359,6 +359,21 @@ class AudioDirector:
             raise AudioContractError("Audio Director mutated sound-layer input metadata.")
         return result
 
+    def build_audio_artifacts(
+        self,
+        semantic_plan: Mapping[str, Any],
+        story_plan: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Build validated Step 5 public artifacts entirely in memory."""
+        from .assembly import assemble_audio_artifacts
+
+        inputs = (semantic_plan, story_plan)
+        snapshot = deepcopy(inputs)
+        result = assemble_audio_artifacts(self.plan_sound_layers(semantic_plan, story_plan))
+        if inputs != snapshot:
+            raise AudioContractError("Audio Director mutated final assembly input metadata.")
+        return result
+
     @staticmethod
     def _raw_energy(scene: SceneAudioAnalysis) -> float:
         # Fixed order: base -> intent -> tone -> bounded structural values -> clamp/round.

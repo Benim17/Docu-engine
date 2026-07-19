@@ -57,6 +57,8 @@ class SoundProjectDiagnostics:
 
 @dataclass(frozen=True)
 class ProjectSoundAnalysis:
+    energy_plan: ProjectEnergyMusicAnalysis
+    semantic_scene_ids: tuple[str, ...]
     scenes: tuple[SceneSoundAnalysis, ...]
     diagnostics: SoundProjectDiagnostics
 
@@ -133,6 +135,8 @@ def plan_sound_layers(
     if any(not scene.narration_present for scene in scenes):
         project_warnings.append("narration_missing_for_some_scenes")
     return ProjectSoundAnalysis(
+        energy_plan,
+        tuple(str(scene.get("scene_id") or f"scene_{index + 1:03d}") for index, scene in enumerate(semantic_scenes)),
         tuple(scenes),
         SoundProjectDiagnostics(
             ambience_scene_count=sum(scene.ambience.enabled for scene in scenes),

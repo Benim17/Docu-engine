@@ -4,8 +4,12 @@ from dataclasses import replace
 import pytest
 
 from engine.audio_director import (
+    AudioDiagnostics,
     AudioContractError,
     AudioDirector,
+    AudioPlan,
+    assemble_audio_artifacts,
+    serialize_audio_artifact,
     serialize_energy_music_analysis,
     serialize_intent_tone_analysis,
     serialize_sound_analysis,
@@ -845,3 +849,215 @@ def test_disabled_ducking_contract_uses_stable_zero_timing_and_reductions():
     assert ducking.ducking_enabled is False
     assert (ducking.music_reduction_db, ducking.ambience_reduction_db) == (0.0, 0.0)
     assert (ducking.attack_ms, ducking.release_ms) == (0, 0)
+
+
+def test_final_assembly_builds_valid_public_plan_and_diagnostics():
+    source = semantic(_urban_scene(
+        0, text="A narrated city scene.", narrative_intent="context",
+    ))
+    artifacts = AudioDirector().build_audio_artifacts(source)
+    assert isinstance(artifacts.plan, AudioPlan)
+    assert isinstance(artifacts.diagnostics, AudioDiagnostics)
+    artifacts.plan.validate()
+    artifacts.diagnostics.validate()
+    assert artifacts.plan.status == "planned"
+    assert artifacts.plan.scenes[0].ambience.type == "urban"
+
+
+def test_final_multiple_scene_order_timing_curve_and_boundaries_match():
+    source = semantic(
+        semantic_scene(0, scene_id="alpha", start=1.0, end=4.0, duration=3.0, narrative_intent="context"),
+        semantic_scene(1, scene_id="beta", start=4.0, end=9.5, duration=5.5, narrative_intent="development"),
+    )
+    artifacts = AudioDirector().build_audio_artifacts(source)
+    assert [(scene.scene_id, scene.start, scene.end, scene.duration) for scene in artifacts.plan.scenes] == [
+        ("alpha", 1.0, 4.0, 3.0), ("beta", 4.0, 9.5, 5.5),
+    ]
+    assert artifacts.plan.project_summary.energy_curve == tuple(scene.energy for scene in artifacts.plan.scenes)
+    assert artifacts.plan.scenes[0].transition_out == artifacts.plan.scenes[1].transition_in
+    assert len(artifacts.plan.scenes) == len(artifacts.diagnostics.scenes) == 2
+    assert not any(signal.startswith("scene_id:") for item in artifacts.diagnostics.scenes for signal in item.source_signals)
+
+
+def test_final_empty_project_is_planned_with_explicit_zero_confidence():
+    artifacts = AudioDirector().build_audio_artifacts(semantic())
+    assert artifacts.plan.status == "planned"
+    assert artifacts.plan.scenes == ()
+    assert artifacts.plan.project_summary.energy_curve == ()
+    assert artifacts.diagnostics.project.confidence == 0.0
+    assert artifacts.diagnostics.project.flat_energy_curve is True
+    assert artifacts.diagnostics.project.fallback_dominant is False
+
+
+def test_final_silence_suppression_and_ducking_use_final_state():
+    source = semantic(_urban_scene(0, text="Narration.", intentional_pause=True))
+    story = story_for(
+        source, story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    scene = AudioDirector().build_audio_artifacts(source, story).plan.scenes[0]
+    assert scene.silence.intentional_silence is True
+    assert scene.music.enabled is False and scene.music.style == "none"
+    assert scene.ambience.enabled is False and scene.ambience.type == "none"
+    assert scene.ducking.ducking_enabled is False
+
+
+def _status_source(fallback_flags):
+    scenes = []
+    for index, fallback in enumerate(fallback_flags):
+        scenes.append(semantic_scene(
+            index,
+            text="Useful narration.",
+            narrative_intent=None if fallback else "context",
+        ))
+    return semantic(*scenes)
+
+
+@pytest.mark.parametrize(("flags", "expected"), [
+    ((False, False), "planned"),
+    ((True, False), "planned"),
+    ((True, True, False), "fallback"),
+    ((True,), "fallback"),
+])
+def test_final_status_uses_strict_more_than_half_fallback_threshold(flags, expected):
+    artifacts = AudioDirector().build_audio_artifacts(_status_source(flags))
+    assert artifacts.plan.status == expected
+    assert artifacts.diagnostics.project.fallback_count == sum(flags)
+    assert artifacts.diagnostics.project.fallback_dominant is (expected == "fallback")
+
+
+def test_missing_story_with_useful_semantic_intent_remains_planned():
+    source = semantic(semantic_scene(text="Useful narration.", narrative_intent="context"))
+    artifacts = AudioDirector().build_audio_artifacts(source)
+    assert artifacts.plan.status == "planned"
+    assert artifacts.diagnostics.project.scene_without_usable_input_count == 0
+    assert "story_director_plan" in artifacts.diagnostics.project.missing_inputs
+
+
+def test_final_diagnostics_use_only_final_music_and_ambience_state():
+    source = semantic(
+        _urban_scene(0, text="Calm quiet steady."),
+        _urban_scene(1, text="Narration.", intentional_pause=True),
+    )
+    story = story_for(source)
+    story["scenes"][1].update(
+        story_role="revelation", story_phase="turning_point",
+        revelation_strength=0.9, emotional_intensity=0.8,
+    )
+    artifacts = AudioDirector().build_audio_artifacts(source, story)
+    assert [scene.music.style for scene in artifacts.plan.scenes] == ["minimal", "none"]
+    assert artifacts.diagnostics.project.music_style_change_count == 1
+    assert artifacts.diagnostics.project.ambience_scene_count == 1
+
+
+def test_final_flat_nonflat_extreme_and_style_metrics_have_fixed_definitions():
+    source = semantic(semantic_scene(0, narrative_intent="context"), semantic_scene(1, narrative_intent="context"))
+    flat = AudioDirector().build_audio_artifacts(source)
+    assert flat.diagnostics.project.flat_energy_curve is True
+    sound = AudioDirector().plan_sound_layers(source)
+    low = replace(sound.scenes[0].energy_music, energy=0.1)
+    high = replace(sound.scenes[1].energy_music, energy=0.9)
+    altered_scenes = (
+        replace(sound.scenes[0], energy_music=low),
+        replace(sound.scenes[1], energy_music=high),
+    )
+    altered_energy = replace(sound.energy_plan, scenes=(low, high))
+    altered_energy = replace(
+        altered_energy,
+        project_summary=replace(altered_energy.project_summary, energy_curve=(0.1, 0.9)),
+    )
+    altered = replace(sound, energy_plan=altered_energy, scenes=altered_scenes)
+    final = assemble_audio_artifacts(altered)
+    assert final.diagnostics.project.flat_energy_curve is False
+    assert final.diagnostics.project.extreme_energy_count == 2
+
+
+def test_project_confidence_is_mean_with_fallback_and_optional_rejection_penalties():
+    source = _status_source((True, True, False))
+    plain = AudioDirector().build_audio_artifacts(source)
+    mean = sum(item.confidence for item in plain.diagnostics.scenes) / 3
+    assert plain.diagnostics.project.confidence == round(max(0.0, mean - 0.10), 4)
+
+    story = story_for(source)
+    story["story_director_version"] = "9.0.0"
+    rejected = AudioDirector().build_audio_artifacts(source, story)
+    rejected_mean = sum(item.confidence for item in rejected.diagnostics.scenes) / 3
+    assert rejected.diagnostics.project.confidence == round(max(0.0, rejected_mean - 0.15), 4)
+
+
+def test_final_project_warnings_are_deduplicated_and_sorted():
+    artifacts = AudioDirector().build_audio_artifacts(_status_source((True, True, True)))
+    warnings = artifacts.diagnostics.project.warnings
+    assert warnings == tuple(sorted(set(warnings), key=lambda value: (value.casefold(), value)))
+    assert warnings.count("story_director_plan_missing") == 1
+
+
+def test_final_artifacts_are_byte_stable_and_input_order_independent():
+    scene = _urban_scene(0, text="Useful narration.", narrative_intent="context")
+    reordered = {key: scene[key] for key in reversed(tuple(scene))}
+    first = AudioDirector().build_audio_artifacts(semantic(scene))
+    second = AudioDirector().build_audio_artifacts(semantic(reordered))
+    assert serialize_audio_artifact(first.plan).encode() == serialize_audio_artifact(second.plan).encode()
+    assert serialize_audio_artifact(first.diagnostics).encode() == serialize_audio_artifact(second.diagnostics).encode()
+    payload = serialize_audio_artifact(first.plan)
+    assert "timestamp" not in payload and "machine" not in payload and "path" not in payload
+
+
+def test_final_assembly_does_not_mutate_inputs_and_repeated_runs_match():
+    source = semantic(semantic_scene(text="Useful narration.", narrative_intent="context"))
+    story = story_for(source)
+    before = deepcopy((source, story))
+    first = AudioDirector().build_audio_artifacts(source, story)
+    second = AudioDirector().build_audio_artifacts(source, story)
+    assert first == second
+    assert (source, story) == before
+
+
+def test_final_assembly_rejects_mismatched_internal_scene_count_and_order():
+    sound = AudioDirector().plan_sound_layers(semantic(semantic_scene()))
+    with pytest.raises(AudioContractError):
+        assemble_audio_artifacts(replace(sound, scenes=()))
+    duplicate = replace(sound, scenes=(sound.scenes[0], sound.scenes[0]))
+    with pytest.raises(AudioContractError):
+        assemble_audio_artifacts(duplicate)
+
+
+def test_final_assembly_rejects_wrong_or_reordered_internal_scene_identity():
+    source = semantic(semantic_scene(0, scene_id="alpha"), semantic_scene(1, scene_id="beta"))
+    sound = AudioDirector().plan_sound_layers(source)
+    with pytest.raises(AudioContractError):
+        assemble_audio_artifacts(replace(sound, scenes=tuple(reversed(sound.scenes))))
+
+    wrong_analysis = replace(sound.scenes[0].energy_music.scene, scene_id="wrong")
+    wrong_energy_scene = replace(sound.scenes[0].energy_music, scene=wrong_analysis)
+    wrong_sound_scene = replace(sound.scenes[0], energy_music=wrong_energy_scene)
+    wrong_energy_plan = replace(
+        sound.energy_plan,
+        scenes=(wrong_energy_scene, sound.energy_plan.scenes[1]),
+    )
+    with pytest.raises(AudioContractError):
+        assemble_audio_artifacts(replace(
+            sound,
+            energy_plan=wrong_energy_plan,
+            scenes=(wrong_sound_scene, sound.scenes[1]),
+        ))
+
+
+def test_conservative_evidence_based_scene_is_not_fallback():
+    source = semantic(semantic_scene(
+        text="A clear factual explanation provides useful context.",
+        narrative_intent="context",
+    ))
+    artifacts = AudioDirector().build_audio_artifacts(source)
+    scene = artifacts.plan.scenes[0]
+    assert scene.audio_intent == "support"
+    assert scene.emotional_tone == "neutral"
+    assert scene.music.style == "documentary"
+    assert scene.diagnostics.fallback_used is False
+    assert artifacts.plan.status == "planned"
+
+
+@pytest.mark.parametrize("bad_plan", [None, {}, {"scenes": "invalid"}])
+def test_final_core_fails_closed_for_invalid_required_semantics(bad_plan):
+    with pytest.raises(AudioContractError):
+        AudioDirector().build_audio_artifacts(bad_plan)
