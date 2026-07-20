@@ -411,6 +411,11 @@ class CacheKey:
     def __str__(self) -> str:
         return f"cache-v{self.contract_version}:{self.algorithm}:{self.digest}"
 
+    def canonical_bytes(self) -> bytes:
+        """Return the established canonical cache-key string as UTF-8 bytes."""
+
+        return str(self).encode("utf-8")
+
     @classmethod
     def parse(cls, value: str) -> "CacheKey":
         if not isinstance(value, str) or value.count(":") != 2:
