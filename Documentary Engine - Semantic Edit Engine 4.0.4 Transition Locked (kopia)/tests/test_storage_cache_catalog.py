@@ -19,6 +19,7 @@ from engine.storage.cache_catalog import (
     MAX_CATALOG_TRAVERSAL_DEPTH,
     CacheCatalogContractError,
     CacheCatalogFinalProvenance,
+    CacheCatalogFinalState,
     CacheCatalogFinalSummary,
     CacheCatalogIdentity,
     CacheCatalogCursor,
@@ -28,6 +29,7 @@ from engine.storage.cache_catalog import (
     CacheCatalogLookupStatus,
     CacheCatalogBackend,
     CacheCatalogLiveRecord,
+    CacheCatalogLockState,
     CacheCatalogPage,
     CacheCatalogReadOnlyBackend,
     CacheCatalogRecord,
@@ -48,19 +50,56 @@ from engine.storage.cache_catalog import (
     lookup_catalog_record,
     parse_cache_catalog_record,
     serialize_cache_catalog_record,
+    tombstone_catalog_empty,
+    upsert_catalog_from_lookup,
+    upsert_catalog_from_promotion,
+    upsert_catalog_from_recovery,
     _write_catalog_record,
 )
 from engine.storage.cache_keys import CacheKey
-from engine.storage.cache_lookup import CacheLookupPermissionError, CacheLookupReason
+from engine.storage.cache_lookup import (
+    CacheArtifactExpectation,
+    CacheLookupPermissionError,
+    CacheLookupReason,
+    CacheLookupRequest,
+    CacheLookupStatus,
+    CacheLookupVerificationPolicy,
+    CacheVerificationLevel,
+    LockObservationPolicy,
+    ProducerPayloadExpectation,
+    ReadOnlyCacheLookupResult,
+    ValidatedCacheEntryReference,
+    ValidatedCacheRoot,
+)
 from engine.storage.cache_recovery import (
+    CacheRecoveryInspectionRequest,
+    CacheRecoveryObservation,
     CacheRecoveryReason,
     CacheRecoveryStatus,
     FinalRecoveryState,
     LockRecoveryState,
+    FinalRecoveryObservation,
+    LockRecoveryObservation,
+    RecoveryInspectionPolicy,
+    StagingRecoveryObservation,
+    StagingRecoveryState,
+)
+from engine.storage.cache_promotion import (
+    CachePromotionResult,
+    CachePromotionStatus,
+    PromotedCacheEntryReference,
 )
 from engine.storage.persistent_cache import (
     CACHE_ENTRY_CONTRACT_VERSION,
     CacheKeyReference,
+    CacheLookupExpectation,
+    CacheEntryMetadata,
+    CacheArtifactMetadata,
+    CacheProducerMetadata,
+    CacheRuntimeFingerprint,
+    CompletenessMarker,
+    PayloadManifest,
+    PayloadManifestRecord,
     CacheNamespace,
     canonical_json_bytes,
     derive_entry_digest,
@@ -1318,3 +1357,460 @@ def test_h1d_cursor_change_does_not_rewind_and_later_insert_may_appear(tmp_path)
     emitted = [record.identity for record in second.records]
     assert values[0] not in emitted
     assert all(item.entry_digest > first.next_cursor.entry_digest for item in emitted)
+
+
+def _trusted_h1e_evidence(tmp_path):
+    root = tmp_path / "cache"
+    root.mkdir(parents=True)
+    key = CacheKey("a" * 64)
+    namespace = CacheNamespace("audio", "transcription.whisper", 3)
+    manifest = PayloadManifest(
+        (PayloadManifestRecord("artifact.json", 7, "sha256:" + "b" * 64,
+                               "application/json", "primary"),)
+    )
+    metadata = CacheEntryMetadata(
+        derive_entry_digest(key),
+        CacheKeyReference.from_cache_key(key),
+        namespace,
+        CacheArtifactMetadata("transcript", "private-logical-id", 1),
+        CacheProducerMetadata(namespace.producer_id, "4.2.0", 3),
+        CacheRuntimeFingerprint(1, {"model": "large-v3", "secret": "not-persisted"}),
+        "2026-07-20T09:00:00Z",
+        "sha256:" + hashlib.sha256(manifest.canonical_bytes()).hexdigest(),
+        1,
+        7,
+    )
+    marker = CompletenessMarker(
+        metadata.entry_digest,
+        "sha256:" + hashlib.sha256(metadata.canonical_bytes()).hexdigest(),
+        metadata.payload_manifest_digest,
+    )
+    validated = ValidatedCacheEntryReference(
+        root / "entries/exact",
+        metadata.entry_digest,
+        namespace,
+        metadata.cache_key,
+        metadata,
+        manifest,
+        marker,
+        CacheVerificationLevel.FULL_PAYLOAD_SHA256,
+    )
+    lookup = ReadOnlyCacheLookupResult(
+        CacheLookupStatus.HIT,
+        None,
+        validated.entry_path,
+        validated,
+        metadata.entry_digest,
+        namespace,
+        metadata.cache_key,
+        (),
+        CacheVerificationLevel.FULL_PAYLOAD_SHA256,
+        CACHE_ENTRY_CONTRACT_VERSION,
+        True,
+        metadata,
+        manifest,
+        marker,
+    )
+    promoted = PromotedCacheEntryReference(
+        root / "entries/final",
+        metadata.entry_digest,
+        namespace,
+        metadata.cache_key,
+        metadata,
+        manifest,
+        marker,
+        1,
+        7,
+    )
+    promotion = CachePromotionResult(
+        CachePromotionStatus.PROMOTED_AND_RELEASED, promoted
+    )
+    expectation = CacheLookupExpectation(
+        namespace,
+        namespace.producer_id,
+        namespace.producer_schema_version,
+        metadata.runtime_fingerprint,
+    )
+    recovery_request = CacheRecoveryInspectionRequest(
+        ValidatedCacheRoot.from_path(root),
+        namespace,
+        key,
+        expectation,
+        None,
+        ProducerPayloadExpectation(),
+        CacheLookupVerificationPolicy(),
+        LockObservationPolicy(60),
+        RecoveryInspectionPolicy(),
+    )
+    catalog_identity = CacheCatalogIdentity(
+        namespace, metadata.entry_digest, metadata.cache_key
+    )
+    backend = LocalCacheCatalogBackend.from_root(root)
+    return catalog_identity, backend, lookup, promotion, recovery_request
+
+
+def _recovery_observation(request, status=CacheRecoveryStatus.EMPTY, *, root_failure=False):
+    reason = (
+        CacheRecoveryReason.UNSAFE_ROOT
+        if status in {
+            CacheRecoveryStatus.RECOVERY_UNSAFE,
+            CacheRecoveryStatus.RECOVERY_UNSUPPORTED,
+            CacheRecoveryStatus.RECOVERY_UNSTABLE,
+            CacheRecoveryStatus.RECOVERY_INVALID,
+        }
+        else None
+    )
+    return CacheRecoveryObservation(
+        derive_entry_digest(request.cache_key),
+        (StagingRecoveryObservation(
+            0,
+            "staging/v1/candidate",
+            None if root_failure else StagingRecoveryState.STAGING_ABSENT,
+        ),),
+        FinalRecoveryObservation(
+            "entries/v1/final",
+            None if root_failure else FinalRecoveryState.FINAL_ABSENT,
+        ),
+        LockRecoveryObservation(
+            "locks/v1/lock",
+            None if root_failure else LockRecoveryState.LOCK_ABSENT,
+        ),
+        status,
+        reason,
+    )
+
+
+def test_h1e_lookup_hit_upsert_derives_summary_and_fingerprint_digest(tmp_path):
+    catalog_identity, backend, lookup, _, _ = _trusted_h1e_evidence(tmp_path)
+    original_lookup = lookup
+    result = upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=None, backend=backend
+    )
+    assert result.record_revision == 1 and lookup is original_lookup
+    record = lookup_catalog_record(catalog_identity, backend=backend).record
+    summary = record.last_validated_final
+    assert summary.provenance is CacheCatalogFinalProvenance.STEP5B_HIT
+    assert summary.runtime_fingerprint_digest == (
+        "sha256:" + hashlib.sha256(
+            lookup.metadata.runtime_fingerprint.canonical_bytes()
+        ).hexdigest()
+    )
+    serialized = record.canonical_bytes()
+    assert b"private-logical-id" not in serialized
+    assert b"not-persisted" not in serialized
+
+
+def test_h1e_non_hit_cannot_become_final_provenance(tmp_path):
+    catalog_identity, backend, lookup, _, _ = _trusted_h1e_evidence(tmp_path)
+    rejected = replace(
+        lookup,
+        status=CacheLookupStatus.MISS,
+        validated_entry=None,
+        payload_bytes_fully_hashed=False,
+        metadata=None,
+        manifest=None,
+        marker=None,
+    )
+    with pytest.raises(CacheCatalogContractError, match="only a fully verified"):
+        upsert_catalog_from_lookup(
+            catalog_identity, rejected, expected_revision=None, backend=backend
+        )
+    assert not (backend.cache_root.resolved_path / "catalog").exists()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [CachePromotionStatus.PROMOTED_AND_RELEASED,
+     CachePromotionStatus.PROMOTED_LOCK_RETAINED],
+)
+def test_h1e_successful_promotion_upsert_supports_both_final_outcomes(tmp_path, status):
+    catalog_identity, backend, _, promotion, _ = _trusted_h1e_evidence(tmp_path)
+    promotion = replace(promotion, status=status)
+    original = promotion
+    result = upsert_catalog_from_promotion(
+        catalog_identity, promotion, expected_revision=None, backend=backend
+    )
+    assert result.record_revision == 1 and promotion is original
+    summary = lookup_catalog_record(catalog_identity, backend=backend).record.last_validated_final
+    assert summary.provenance is CacheCatalogFinalProvenance.STEP5D_PROMOTION
+
+
+def test_h1e_failed_promotion_is_rejected_without_catalog_or_upstream_change(tmp_path):
+    catalog_identity, backend, _, promotion, _ = _trusted_h1e_evidence(tmp_path)
+    failed = CachePromotionResult(CachePromotionStatus.PROMOTION_IO_FAILURE)
+    with pytest.raises(CacheCatalogContractError, match="only successful"):
+        upsert_catalog_from_promotion(
+            catalog_identity, failed, expected_revision=None, backend=backend
+        )
+    assert failed.status is CachePromotionStatus.PROMOTION_IO_FAILURE
+    assert promotion.promoted_entry is not None
+    assert not (backend.cache_root.resolved_path / "catalog").exists()
+
+
+def test_h1e_root_failure_maps_to_explicit_unobserved_summary(tmp_path):
+    catalog_identity, backend, _, _, request = _trusted_h1e_evidence(tmp_path)
+    observation = _recovery_observation(
+        request, CacheRecoveryStatus.RECOVERY_UNSAFE, root_failure=True
+    )
+    result = upsert_catalog_from_recovery(
+        catalog_identity, request, observation, expected_revision=None, backend=backend
+    )
+    assert result.record_revision == 1
+    summary = lookup_catalog_record(catalog_identity, backend=backend).record.last_recovery_observation
+    assert summary.final_state is CacheCatalogFinalState.FINAL_UNOBSERVED
+    assert summary.lock_state is CacheCatalogLockState.LOCK_UNOBSERVED
+    assert summary.staging_candidate_count is None
+    assert summary.status is observation.status and summary.reason is observation.reason
+    assert parse_cache_catalog_record(
+        lookup_catalog_record(catalog_identity, backend=backend).record.canonical_bytes()
+    ).last_recovery_observation == summary
+
+
+def test_h1e_observed_absence_and_zero_candidates_remain_concrete(tmp_path):
+    catalog_identity, backend, _, _, request = _trusted_h1e_evidence(tmp_path)
+    observation = _recovery_observation(request)
+    upsert_catalog_from_recovery(
+        catalog_identity, request, observation, expected_revision=None, backend=backend
+    )
+    summary = lookup_catalog_record(catalog_identity, backend=backend).record.last_recovery_observation
+    assert summary.final_state is FinalRecoveryState.FINAL_ABSENT
+    assert summary.lock_state is LockRecoveryState.LOCK_ABSENT
+    assert summary.staging_candidate_count == 0
+    assert summary.final_state is not CacheCatalogFinalState.FINAL_UNOBSERVED
+    assert summary.lock_state is not CacheCatalogLockState.LOCK_UNOBSERVED
+    assert parse_cache_catalog_record(
+        lookup_catalog_record(catalog_identity, backend=backend).record.canonical_bytes()
+    ).last_recovery_observation == summary
+
+
+@pytest.mark.parametrize("staging", [(), (
+    StagingRecoveryObservation(0, "staging/v1/one", None),
+    StagingRecoveryObservation(1, "staging/v1/two", None),
+)])
+def test_h1e_unobserved_staging_requires_exactly_one_placeholder(tmp_path, staging):
+    catalog_identity, backend, _, _, request = _trusted_h1e_evidence(tmp_path)
+    observation = replace(_recovery_observation(request, root_failure=True), staging=staging)
+    with pytest.raises(CacheCatalogContractError, match="staging evidence"):
+        upsert_catalog_from_recovery(
+            catalog_identity,
+            request,
+            observation,
+            expected_revision=None,
+            backend=backend,
+        )
+    assert not (backend.cache_root.resolved_path / "catalog").exists()
+
+
+@pytest.mark.parametrize(
+    "concrete",
+    [
+        StagingRecoveryState.STAGING_ABSENT,
+        StagingRecoveryState.STAGING_COMPLETE_VALID,
+    ],
+)
+def test_h1e_unobserved_staging_cannot_mix_with_concrete_evidence(
+    tmp_path, concrete
+):
+    catalog_identity, backend, _, _, request = _trusted_h1e_evidence(tmp_path)
+    staging = (
+        StagingRecoveryObservation(0, "staging/v1/placeholder", None),
+        StagingRecoveryObservation(1, "staging/v1/concrete", concrete),
+    )
+    observation = replace(_recovery_observation(request, root_failure=True), staging=staging)
+    with pytest.raises(CacheCatalogContractError, match="mixes observed and unobserved"):
+        upsert_catalog_from_recovery(
+            catalog_identity,
+            request,
+            observation,
+            expected_revision=None,
+            backend=backend,
+        )
+    assert not (backend.cache_root.resolved_path / "catalog").exists()
+
+
+@pytest.mark.parametrize("candidate_count", [1, 64])
+def test_h1e_concrete_staging_candidate_count_preserves_exact_bounds(
+    tmp_path, candidate_count
+):
+    catalog_identity, backend, _, _, request = _trusted_h1e_evidence(tmp_path)
+    staging = tuple(
+        StagingRecoveryObservation(
+            index,
+            f"staging/v1/candidate-{index}",
+            StagingRecoveryState.STAGING_COMPLETE_VALID,
+        )
+        for index in range(candidate_count)
+    )
+    observation = replace(_recovery_observation(request), staging=staging)
+    upsert_catalog_from_recovery(
+        catalog_identity,
+        request,
+        observation,
+        expected_revision=None,
+        backend=backend,
+    )
+    summary = lookup_catalog_record(
+        catalog_identity, backend=backend
+    ).record.last_recovery_observation
+    assert summary.staging_candidate_count == candidate_count
+    assert parse_cache_catalog_record(
+        lookup_catalog_record(catalog_identity, backend=backend).record.canonical_bytes()
+    ).last_recovery_observation == summary
+
+
+def test_h1e_every_recovery_status_is_accepted_as_completed_evidence(tmp_path):
+    for index, status in enumerate(CacheRecoveryStatus):
+        case = tmp_path / str(index)
+        catalog_identity, backend, _, _, request = _trusted_h1e_evidence(case)
+        observation = _recovery_observation(request, status)
+        result = upsert_catalog_from_recovery(
+            catalog_identity, request, observation, expected_revision=None, backend=backend
+        )
+        assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED
+        stored = lookup_catalog_record(catalog_identity, backend=backend).record.last_recovery_observation
+        assert stored.status is status and stored.reason is observation.reason
+
+
+def test_h1e_final_and_recovery_updates_preserve_each_other(tmp_path):
+    catalog_identity, backend, lookup, _, request = _trusted_h1e_evidence(tmp_path)
+    assert upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=None, backend=backend
+    ).record_revision == 1
+    observation = _recovery_observation(request)
+    assert upsert_catalog_from_recovery(
+        catalog_identity, request, observation, expected_revision=1, backend=backend
+    ).record_revision == 2
+    after_recovery = lookup_catalog_record(catalog_identity, backend=backend).record
+    original_final = after_recovery.last_validated_final
+    assert original_final is not None and after_recovery.last_recovery_observation is not None
+    assert upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=2, backend=backend
+    ).record_revision == 3
+    merged = lookup_catalog_record(catalog_identity, backend=backend).record
+    assert merged.last_recovery_observation == after_recovery.last_recovery_observation
+
+
+def test_h1e_empty_tombstone_and_exact_resurrection_preserve_cache_truth(tmp_path):
+    catalog_identity, backend, lookup, _, request = _trusted_h1e_evidence(tmp_path)
+    truth = backend.cache_root.resolved_path / "entries/v1/truth"
+    truth.mkdir(parents=True)
+    truth.joinpath("payload").write_bytes(b"untouched")
+    backend = LocalCacheCatalogBackend.from_root(backend.cache_root.resolved_path)
+    upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=None, backend=backend
+    )
+    empty = _recovery_observation(request)
+    tombstoned = tombstone_catalog_empty(
+        catalog_identity, request, empty, expected_revision=1, backend=backend
+    )
+    assert tombstoned.record_revision == 2
+    absent = lookup_catalog_record(catalog_identity, backend=backend)
+    assert absent.status is CacheCatalogLookupStatus.RECORD_ABSENT
+    assert absent.tombstone_revision == 2
+    assert truth.joinpath("payload").read_bytes() == b"untouched"
+    resurrected = upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=2, backend=backend
+    )
+    assert resurrected.record_revision == 3
+
+
+def test_h1e_nonempty_or_mismatched_recovery_cannot_authorize_mutation(tmp_path):
+    catalog_identity, backend, _, _, request = _trusted_h1e_evidence(tmp_path)
+    nonempty = _recovery_observation(request, CacheRecoveryStatus.FINAL_PUBLISHED)
+    with pytest.raises(CacheCatalogContractError, match="only Step 5E EMPTY"):
+        tombstone_catalog_empty(
+            catalog_identity, request, nonempty, expected_revision=1, backend=backend
+        )
+    mismatched = replace(catalog_identity, namespace=CacheNamespace("video", "p", 1))
+    with pytest.raises(CacheCatalogContractError, match="does not match"):
+        upsert_catalog_from_recovery(
+            mismatched, request, nonempty, expected_revision=None, backend=backend
+        )
+    assert not (backend.cache_root.resolved_path / "catalog").exists()
+
+
+def test_h1e_public_exports_exclude_native_and_raw_mutation_helpers():
+    import engine.storage as storage
+
+    approved = {
+        "CacheCatalogIdentity", "CacheCatalogRecord", "CacheCatalogLiveRecord",
+        "CacheCatalogTombstone", "CacheCatalogLookupResult", "CacheCatalogPage",
+        "lookup_catalog_record", "upsert_catalog_from_lookup",
+        "upsert_catalog_from_promotion", "upsert_catalog_from_recovery",
+        "tombstone_catalog_empty", "enumerate_catalog_namespace",
+        "iterate_catalog_records",
+    }
+    assert approved <= set(storage.__all__)
+    forbidden = {
+        "LocalCacheCatalogBackend", "LocalCacheCatalogReadOnlyBackend",
+        "CacheCatalogWriteRequest", "_write_catalog_record", "renameatx_np",
+    }
+    assert forbidden.isdisjoint(storage.__all__)
+    result_fields = set(CacheCatalogLookupResult.__dataclass_fields__)
+    assert "validated_entry" not in result_fields
+    assert all(term not in " ".join(storage.__all__).lower() for term in (
+        "cleanup", "retention", "quota", "pruning", "reconcile", "rebuild"
+    ))
+
+
+class _FailingH1EPublicationBackend(LocalCacheCatalogBackend):
+    def publish_record_bytes(self, *args, **kwargs):
+        raise OSError("private native publication detail")
+
+
+def test_h1e_catalog_is_only_an_optional_hint_before_authoritative_step5b(tmp_path):
+    catalog_identity, backend, lookup, _, _ = _trusted_h1e_evidence(tmp_path)
+    absent = lookup_catalog_record(catalog_identity, backend=backend)
+    assert absent.status is CacheCatalogLookupStatus.CATALOG_UNAVAILABLE
+    assert lookup.status is CacheLookupStatus.HIT
+    assert lookup.validated_entry is not None
+
+    upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=None, backend=backend
+    )
+    hint = lookup_catalog_record(catalog_identity, backend=backend)
+    assert hint.status is CacheCatalogLookupStatus.RECORD_FOUND
+    assert "validated_entry" not in CacheCatalogLookupResult.__dataclass_fields__
+    assert lookup.status is CacheLookupStatus.HIT
+
+
+def test_h1e_catalog_failure_never_changes_lookup_or_promotion_authority(tmp_path):
+    catalog_identity, backend, lookup, promotion, _ = _trusted_h1e_evidence(tmp_path)
+    failing = _FailingH1EPublicationBackend.from_root(backend.cache_root.resolved_path)
+
+    lookup_result = upsert_catalog_from_lookup(
+        catalog_identity, lookup, expected_revision=None, backend=failing
+    )
+    assert lookup_result.status is CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE
+    assert lookup.status is CacheLookupStatus.HIT
+    assert lookup.validated_entry is not None
+
+    promotion_result = upsert_catalog_from_promotion(
+        catalog_identity, promotion, expected_revision=None, backend=failing
+    )
+    assert promotion_result.status is CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE
+    assert promotion.status is CachePromotionStatus.PROMOTED_AND_RELEASED
+    assert promotion.promoted_entry is not None
+
+
+def test_h1e_all_typed_integrations_reject_identity_mismatch_before_mutation(tmp_path):
+    catalog_identity, backend, lookup, promotion, request = _trusted_h1e_evidence(tmp_path)
+    mismatched = replace(catalog_identity, namespace=CacheNamespace("video", "p", 1))
+
+    with pytest.raises(CacheCatalogContractError, match="identity"):
+        upsert_catalog_from_lookup(
+            mismatched, lookup, expected_revision=None, backend=backend
+        )
+    with pytest.raises(CacheCatalogContractError, match="identity"):
+        upsert_catalog_from_promotion(
+            mismatched, promotion, expected_revision=None, backend=backend
+        )
+    with pytest.raises(CacheCatalogContractError, match="identity"):
+        upsert_catalog_from_recovery(
+            mismatched,
+            request,
+            _recovery_observation(request),
+            expected_revision=None,
+            backend=backend,
+        )
+    assert not (backend.cache_root.resolved_path / "catalog").exists()

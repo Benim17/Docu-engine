@@ -35,14 +35,14 @@ The current major workstream is the **Cache and Storage Manager**, within the
 Cache & Storage / Housekeeping Foundation phase.
 
 - **Current phase:** Cache & Storage / Housekeeping Foundation
-- **Current task:** Post-5E housekeeping design / contract phase
+- **Current task:** H2 — Catalog Rebuild / Reconciliation design
 - **Status:** DESIGN PHASE — IMPLEMENTATION NOT YET APPROVED
-- **Next task:** Define and lock post-5E housekeeping contracts — no implementation task approved
+- **Next task:** Define and lock H2 Catalog Rebuild / Reconciliation contract
 - **Current branch:** `feature/cache-storage-foundation`
 
-The persistent-cache construction sequence is complete through Step 5E. Post-5E
-housekeeping remains a design and contract phase; no housekeeping implementation is
-approved.
+The persistent-cache construction sequence is complete through Step 5E, and H1 —
+Persistent Cache Catalog / Index is complete. H2 remains a design and contract phase;
+no H2 implementation is approved.
 
 ## Cache & Storage / Housekeeping Foundation
 
@@ -85,13 +85,15 @@ the contract-complete public read-only lookup behavior.
 These items require their applicable design and implementation approvals. Checked
 status here records sequence and progress; it does not replace a locked contract.
 
-### Housekeeping — design not yet locked
+### Housekeeping
 
-- [ ] Persistent cache index / fast cache catalog
-- [ ] Retention and cleanup policy
-- [ ] Safe cleanup executor
-- [ ] Quota / storage-budget enforcement
-- [ ] Automatic housekeeping / pruning
+- [x] H1 — Persistent Cache Catalog / Index
+- [ ] H2 — Catalog Rebuild / Reconciliation — future, implementation not approved
+- [ ] H3 — Retention & Cleanup Policy — future, implementation not approved
+- [ ] H4 — Immutable Cleanup Planning — future, implementation not approved
+- [ ] H5 — Identity-Safe Cleanup Mutation — future, implementation not approved
+- [ ] H6 — Quota / Storage-Budget Policy — future, implementation not approved
+- [ ] H7 — Automatic Housekeeping — future, implementation not approved
 
 These later layers are intended to let Documentary Engine retain valuable,
 expensive-to-produce artifacts while safely identifying and deleting regenerable,

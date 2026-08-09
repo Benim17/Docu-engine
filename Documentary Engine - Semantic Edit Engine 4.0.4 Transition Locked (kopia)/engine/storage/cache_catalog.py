@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import hashlib
 import os
 import re
 import secrets
@@ -27,19 +28,31 @@ from .cache_lookup import (
     CacheLookupIOError,
     CacheLookupPermissionError,
     CacheLookupReason,
+    CacheLookupStatus,
+    CacheVerificationLevel,
     FileIdentity,
     FilesystemObjectType,
     LocalReadOnlyCacheFilesystem,
+    ReadOnlyCacheLookupResult,
     SymlinkRejectedError,
     UnstableFilesystemObjectError,
     UnsupportedFilesystemObjectError,
+    ValidatedCacheEntryReference,
     ValidatedCacheRoot,
 )
 from .cache_recovery import (
+    CacheRecoveryInspectionRequest,
+    CacheRecoveryObservation,
     CacheRecoveryReason,
     CacheRecoveryStatus,
     FinalRecoveryState,
     LockRecoveryState,
+    StagingRecoveryState,
+)
+from .cache_promotion import (
+    CachePromotionResult,
+    CachePromotionStatus,
+    PromotedCacheEntryReference,
 )
 from .persistent_cache import (
     CACHE_ENTRY_CONTRACT_VERSION,
@@ -91,6 +104,14 @@ class CacheCatalogFinalProvenance(str, Enum):
 
 class CacheCatalogRecoveryProvenance(str, Enum):
     STEP5E_OBSERVATION = "step5e_observation"
+
+
+class CacheCatalogFinalState(str, Enum):
+    FINAL_UNOBSERVED = "final_unobserved"
+
+
+class CacheCatalogLockState(str, Enum):
+    LOCK_UNOBSERVED = "lock_unobserved"
 
 
 class CacheCatalogVerificationLevel(str, Enum):
@@ -414,9 +435,9 @@ _FAILURE_RECOVERY_STATUSES = frozenset(
 class CacheCatalogRecoverySummary:
     status: CacheRecoveryStatus
     reason: CacheRecoveryReason | CacheLookupReason | None
-    staging_candidate_count: int
-    final_state: FinalRecoveryState
-    lock_state: LockRecoveryState
+    staging_candidate_count: int | None
+    final_state: FinalRecoveryState | CacheCatalogFinalState
+    lock_state: LockRecoveryState | CacheCatalogLockState
     provenance: CacheCatalogRecoveryProvenance = (
         CacheCatalogRecoveryProvenance.STEP5E_OBSERVATION
     )
@@ -436,15 +457,16 @@ class CacheCatalogRecoverySummary:
             raise CacheCatalogContractError("failure recovery status requires a reason.")
         if self.status not in _FAILURE_RECOVERY_STATUSES and self.reason is not None:
             raise CacheCatalogContractError("lifecycle recovery status requires null reason.")
-        _nonnegative_int(
-            self.staging_candidate_count,
-            "staging_candidate_count",
-            maximum=64,
-        )
-        if not isinstance(self.final_state, FinalRecoveryState):
-            raise CacheCatalogContractError("final_state must be FinalRecoveryState.")
-        if not isinstance(self.lock_state, LockRecoveryState):
-            raise CacheCatalogContractError("lock_state must be LockRecoveryState.")
+        if self.staging_candidate_count is not None:
+            _nonnegative_int(
+                self.staging_candidate_count,
+                "staging_candidate_count",
+                maximum=64,
+            )
+        if not isinstance(self.final_state, (FinalRecoveryState, CacheCatalogFinalState)):
+            raise CacheCatalogContractError("final_state must be a supported summary state.")
+        if not isinstance(self.lock_state, (LockRecoveryState, CacheCatalogLockState)):
+            raise CacheCatalogContractError("lock_state must be a supported summary state.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -474,14 +496,30 @@ class CacheCatalogRecoverySummary:
             _enum(data["status"], CacheRecoveryStatus, "recovery status"),
             _reason(data["reason"]),
             data["staging_candidate_count"],
-            _enum(data["final_state"], FinalRecoveryState, "final_state"),
-            _enum(data["lock_state"], LockRecoveryState, "lock_state"),
+            _recovery_summary_state(
+                data["final_state"], FinalRecoveryState, CacheCatalogFinalState, "final_state"
+            ),
+            _recovery_summary_state(
+                data["lock_state"], LockRecoveryState, CacheCatalogLockState, "lock_state"
+            ),
             _enum(
                 data["provenance"],
                 CacheCatalogRecoveryProvenance,
                 "recovery provenance",
             ),
         )
+
+
+def _recovery_summary_state(value: Any, concrete, sentinel, name: str):
+    if not isinstance(value, str):
+        raise CacheCatalogContractError(f"{name} must be a supported string value.")
+    try:
+        return concrete(value)
+    except ValueError:
+        try:
+            return sentinel(value)
+        except ValueError as exc:
+            raise CacheCatalogContractError(f"Unsupported {name}: {value!r}.") from exc
 
 
 _IDENTITY_FIELDS = frozenset(
@@ -2011,5 +2049,288 @@ def iterate_catalog_records(
         cursor=cursor,
         scope=CacheCatalogCursorScope.FULL_CATALOG,
         limit=page_limit,
+        backend=backend,
+    )
+
+
+def _require_reference_identity(
+    identity: CacheCatalogIdentity,
+    reference: ValidatedCacheEntryReference | PromotedCacheEntryReference,
+) -> None:
+    if (
+        reference.entry_digest != identity.entry_digest
+        or reference.namespace != identity.namespace
+        or reference.cache_key_reference != identity.cache_key_reference
+        or reference.metadata.entry_digest != identity.entry_digest
+        or reference.metadata.namespace != identity.namespace
+        or reference.metadata.cache_key != identity.cache_key_reference
+        or derive_entry_digest(identity.cache_key_reference.to_cache_key())
+        != identity.entry_digest
+    ):
+        raise CacheCatalogContractError("trusted evidence does not match catalog identity.")
+    manifest_digest = "sha256:" + hashlib.sha256(
+        reference.manifest.canonical_bytes()
+    ).hexdigest()
+    if (
+        reference.metadata.payload_manifest_digest != manifest_digest
+        or reference.marker.manifest_digest != manifest_digest
+        or reference.marker.entry_digest != identity.entry_digest
+        or reference.marker.metadata_digest
+        != "sha256:" + hashlib.sha256(reference.metadata.canonical_bytes()).hexdigest()
+    ):
+        raise CacheCatalogContractError("trusted evidence document integrity is inconsistent.")
+
+
+def _final_summary_from_reference(
+    reference: ValidatedCacheEntryReference | PromotedCacheEntryReference,
+    provenance: CacheCatalogFinalProvenance,
+) -> CacheCatalogFinalSummary:
+    metadata = reference.metadata
+    return CacheCatalogFinalSummary(
+        provenance=provenance,
+        cache_entry_contract_version=metadata.cache_entry_contract_version,
+        producer_id=metadata.producer.producer_id,
+        producer_version=metadata.producer.producer_version,
+        producer_schema_version=metadata.producer.producer_schema_version,
+        artifact_kind=metadata.artifact.artifact_kind,
+        artifact_contract_version=metadata.artifact.artifact_contract_version,
+        runtime_fingerprint_digest="sha256:"
+        + hashlib.sha256(metadata.runtime_fingerprint.canonical_bytes()).hexdigest(),
+        created_at_utc=metadata.created_at_utc,
+        payload_manifest_digest=metadata.payload_manifest_digest,
+        payload_file_count=metadata.payload_file_count,
+        payload_total_bytes=metadata.payload_total_bytes,
+    )
+
+
+def _record_for_typed_merge(
+    identity: CacheCatalogIdentity,
+    expected_revision: int | None,
+    backend: CacheCatalogReadOnlyBackend,
+) -> CacheCatalogLiveRecord | None | CacheCatalogWriteResult:
+    if expected_revision is None:
+        return None
+    current = lookup_catalog_record(identity, backend=backend)
+    if current.status is CacheCatalogLookupStatus.RECORD_FOUND:
+        assert current.record is not None
+        if current.record.record_revision != expected_revision:
+            return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, identity)
+        return current.record
+    if current.status is CacheCatalogLookupStatus.RECORD_ABSENT:
+        if current.tombstone_revision != expected_revision:
+            return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, identity)
+        return None
+    return _write_result(_map_lookup_to_write(current.status), identity)
+
+
+def _typed_upsert(
+    identity: CacheCatalogIdentity,
+    *,
+    expected_revision: int | None,
+    backend: CacheCatalogBackend,
+    final_summary: CacheCatalogFinalSummary | None = None,
+    recovery_summary: CacheCatalogRecoverySummary | None = None,
+) -> CacheCatalogWriteResult:
+    existing = _record_for_typed_merge(identity, expected_revision, backend)
+    if isinstance(existing, CacheCatalogWriteResult):
+        return existing
+    record = CacheCatalogLiveRecord(
+        identity=identity,
+        record_revision=1,
+        last_validated_final=(
+            final_summary
+            if final_summary is not None
+            else None if existing is None else existing.last_validated_final
+        ),
+        last_recovery_observation=(
+            recovery_summary
+            if recovery_summary is not None
+            else None if existing is None else existing.last_recovery_observation
+        ),
+    )
+    return _write_catalog_record(
+        CacheCatalogWriteRequest(record, expected_revision), backend=backend
+    )
+
+
+def upsert_catalog_from_lookup(
+    identity: CacheCatalogIdentity,
+    lookup_result: ReadOnlyCacheLookupResult,
+    *,
+    expected_revision: int | None,
+    backend: CacheCatalogBackend,
+) -> CacheCatalogWriteResult:
+    """Persist only strict Step 5B HIT evidence; never alter the lookup result."""
+
+    if not isinstance(identity, CacheCatalogIdentity):
+        raise TypeError("identity must be CacheCatalogIdentity.")
+    if not isinstance(lookup_result, ReadOnlyCacheLookupResult):
+        raise TypeError("lookup_result must be ReadOnlyCacheLookupResult.")
+    if (
+        lookup_result.status is not CacheLookupStatus.HIT
+        or not isinstance(lookup_result.validated_entry, ValidatedCacheEntryReference)
+        or lookup_result.verification_level is not CacheVerificationLevel.FULL_PAYLOAD_SHA256
+        or not lookup_result.payload_bytes_fully_hashed
+    ):
+        raise CacheCatalogContractError("only a fully verified Step 5B HIT is catalog authority.")
+    reference = lookup_result.validated_entry
+    if (
+        lookup_result.entry_digest != identity.entry_digest
+        or lookup_result.namespace != identity.namespace
+        or lookup_result.cache_key_reference != identity.cache_key_reference
+        or lookup_result.metadata != reference.metadata
+        or lookup_result.manifest != reference.manifest
+        or lookup_result.marker != reference.marker
+    ):
+        raise CacheCatalogContractError("Step 5B result identity is inconsistent.")
+    _require_reference_identity(identity, reference)
+    return _typed_upsert(
+        identity,
+        expected_revision=expected_revision,
+        backend=backend,
+        final_summary=_final_summary_from_reference(
+            reference, CacheCatalogFinalProvenance.STEP5B_HIT
+        ),
+    )
+
+
+def upsert_catalog_from_promotion(
+    identity: CacheCatalogIdentity,
+    promotion_result: CachePromotionResult,
+    *,
+    expected_revision: int | None,
+    backend: CacheCatalogBackend,
+) -> CacheCatalogWriteResult:
+    """Persist only a completed successful Step 5D promotion reference."""
+
+    if not isinstance(identity, CacheCatalogIdentity):
+        raise TypeError("identity must be CacheCatalogIdentity.")
+    if not isinstance(promotion_result, CachePromotionResult):
+        raise TypeError("promotion_result must be CachePromotionResult.")
+    if promotion_result.status not in {
+        CachePromotionStatus.PROMOTED_AND_RELEASED,
+        CachePromotionStatus.PROMOTED_LOCK_RETAINED,
+    } or not isinstance(promotion_result.promoted_entry, PromotedCacheEntryReference):
+        raise CacheCatalogContractError("only successful Step 5D promotion is catalog authority.")
+    reference = promotion_result.promoted_entry
+    _require_reference_identity(identity, reference)
+    if (
+        reference.payload_file_count != reference.metadata.payload_file_count
+        or reference.payload_total_bytes != reference.metadata.payload_total_bytes
+        or reference.payload_file_count != len(reference.manifest.files)
+        or reference.payload_total_bytes
+        != sum(item.size_bytes for item in reference.manifest.files)
+    ):
+        raise CacheCatalogContractError("promotion payload summary is inconsistent.")
+    return _typed_upsert(
+        identity,
+        expected_revision=expected_revision,
+        backend=backend,
+        final_summary=_final_summary_from_reference(
+            reference, CacheCatalogFinalProvenance.STEP5D_PROMOTION
+        ),
+    )
+
+
+def _recovery_summary_from_observation(
+    observation: CacheRecoveryObservation,
+) -> CacheCatalogRecoverySummary:
+    if observation.status is None:
+        raise CacheCatalogContractError("recovery observation must be completed.")
+    classifications = tuple(item.classification for item in observation.staging)
+    if len(classifications) == 1 and classifications[0] is None:
+        staging_count = None
+    elif any(value is None for value in classifications):
+        raise CacheCatalogContractError("staging evidence mixes observed and unobserved states.")
+    elif not classifications:
+        raise CacheCatalogContractError("staging evidence requires a completed observation.")
+    elif classifications == (StagingRecoveryState.STAGING_ABSENT,):
+        staging_count = 0
+    elif StagingRecoveryState.STAGING_ABSENT in classifications:
+        raise CacheCatalogContractError("staging absence cannot coexist with candidates.")
+    else:
+        staging_count = len(classifications)
+    final_state = (
+        CacheCatalogFinalState.FINAL_UNOBSERVED
+        if observation.final.classification is None
+        else observation.final.classification
+    )
+    lock_state = (
+        CacheCatalogLockState.LOCK_UNOBSERVED
+        if observation.lock.classification is None
+        else observation.lock.classification
+    )
+    return CacheCatalogRecoverySummary(
+        status=observation.status,
+        reason=observation.reason,
+        staging_candidate_count=staging_count,
+        final_state=final_state,
+        lock_state=lock_state,
+    )
+
+
+def _require_recovery_identity(
+    identity: CacheCatalogIdentity,
+    request: CacheRecoveryInspectionRequest,
+    observation: CacheRecoveryObservation,
+) -> None:
+    request_reference = CacheKeyReference.from_cache_key(request.cache_key)
+    if (
+        request.namespace != identity.namespace
+        or request_reference != identity.cache_key_reference
+        or derive_entry_digest(request.cache_key) != identity.entry_digest
+        or observation.entry_digest != identity.entry_digest
+    ):
+        raise CacheCatalogContractError("Step 5E evidence does not match catalog identity.")
+
+
+def upsert_catalog_from_recovery(
+    identity: CacheCatalogIdentity,
+    recovery_request: CacheRecoveryInspectionRequest,
+    recovery_observation: CacheRecoveryObservation,
+    *,
+    expected_revision: int | None,
+    backend: CacheCatalogBackend,
+) -> CacheCatalogWriteResult:
+    """Persist one completed Step 5E observation as descriptive history only."""
+
+    if not isinstance(identity, CacheCatalogIdentity):
+        raise TypeError("identity must be CacheCatalogIdentity.")
+    if not isinstance(recovery_request, CacheRecoveryInspectionRequest):
+        raise TypeError("recovery_request must be CacheRecoveryInspectionRequest.")
+    if not isinstance(recovery_observation, CacheRecoveryObservation):
+        raise TypeError("recovery_observation must be CacheRecoveryObservation.")
+    _require_recovery_identity(identity, recovery_request, recovery_observation)
+    return _typed_upsert(
+        identity,
+        expected_revision=expected_revision,
+        backend=backend,
+        recovery_summary=_recovery_summary_from_observation(recovery_observation),
+    )
+
+
+def tombstone_catalog_empty(
+    identity: CacheCatalogIdentity,
+    recovery_request: CacheRecoveryInspectionRequest,
+    recovery_observation: CacheRecoveryObservation,
+    *,
+    expected_revision: int,
+    backend: CacheCatalogBackend,
+) -> CacheCatalogWriteResult:
+    """Publish a tombstone only from exact completed Step 5E EMPTY evidence."""
+
+    if not isinstance(recovery_request, CacheRecoveryInspectionRequest) or not isinstance(
+        recovery_observation, CacheRecoveryObservation
+    ):
+        raise TypeError("tombstone requires typed Step 5E request and observation.")
+    _require_recovery_identity(identity, recovery_request, recovery_observation)
+    _recovery_summary_from_observation(recovery_observation)
+    if recovery_observation.status is not CacheRecoveryStatus.EMPTY:
+        raise CacheCatalogContractError("only Step 5E EMPTY authorizes a tombstone.")
+    return _write_catalog_record(
+        CacheCatalogWriteRequest(
+            CacheCatalogTombstone(identity=identity, record_revision=1),
+            expected_revision,
+        ),
         backend=backend,
     )
