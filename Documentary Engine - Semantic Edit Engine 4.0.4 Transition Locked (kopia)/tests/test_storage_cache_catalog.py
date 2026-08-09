@@ -21,10 +21,14 @@ from engine.storage.cache_catalog import (
     CacheCatalogFinalProvenance,
     CacheCatalogFinalSummary,
     CacheCatalogIdentity,
+    CacheCatalogCursor,
+    CacheCatalogCursorScope,
+    CacheCatalogDirectoryListing,
     CacheCatalogLookupResult,
     CacheCatalogLookupStatus,
     CacheCatalogBackend,
     CacheCatalogLiveRecord,
+    CacheCatalogPage,
     CacheCatalogReadOnlyBackend,
     CacheCatalogRecord,
     CacheCatalogRecordState,
@@ -39,6 +43,8 @@ from engine.storage.cache_catalog import (
     LocalCacheCatalogReadOnlyBackend,
     catalog_identity_sort_key,
     derive_catalog_record_relative_path,
+    enumerate_catalog_namespace,
+    iterate_catalog_records,
     lookup_catalog_record,
     parse_cache_catalog_record,
     serialize_cache_catalog_record,
@@ -430,7 +436,6 @@ def test_h1b_module_has_only_the_approved_read_only_backend_surface():
     forbidden = {
         "Path",
         "open",
-        "enumerate_catalog_namespace",
         "write_lock",
         "publish",
         "replace",
@@ -439,7 +444,12 @@ def test_h1b_module_has_only_the_approved_read_only_backend_surface():
         "fsync",
     }
     assert forbidden.isdisjoint(public)
-    assert {"lookup_catalog_record", "CacheCatalogReadOnlyBackend"} <= public
+    assert {
+        "lookup_catalog_record",
+        "enumerate_catalog_namespace",
+        "iterate_catalog_records",
+        "CacheCatalogReadOnlyBackend",
+    } <= public
 
 
 def _initialized_backend(tmp_path, record=None):
@@ -626,6 +636,12 @@ class _DelegatingBackend:
         if self.read_override is not None:
             return self.read_override(self.delegate.read_record_bounded(identity))
         return self.delegate.read_record_bounded(identity)
+
+    def read_discovered_record(self, namespace, entry_digest):
+        return self.delegate.read_discovered_record(namespace, entry_digest)
+
+    def list_catalog_relative(self, relative_path):
+        return self.delegate.list_catalog_relative(relative_path)
 
 
 @pytest.mark.parametrize("subject", ["root", "parent"])
@@ -952,6 +968,12 @@ class _FailingCatalogBackend:
     def read_record_bounded(self, identity):
         return self._invoke("read_record_bounded", identity)
 
+    def read_discovered_record(self, namespace, entry_digest):
+        return self._invoke("read_discovered_record", namespace, entry_digest)
+
+    def list_catalog_relative(self, relative_path):
+        return self._invoke("list_catalog_relative", relative_path)
+
     def initialize_catalog(self):
         return self._invoke("initialize_catalog")
 
@@ -997,3 +1019,302 @@ def test_h1c_writer_backend_has_no_cache_mutation_or_cleanup_surface(tmp_path):
         "prune", "unlink", "lock_cache_entry", "mutate_staging",
     }
     assert forbidden.isdisjoint(dir(backend))
+
+
+def _catalog_record_for(value):
+    summary = replace(
+        final_summary(),
+        producer_id=value.namespace.producer_id,
+        producer_schema_version=value.namespace.producer_schema_version,
+    )
+    return live_record(identity=value, last_validated_final=summary)
+
+
+def _populate(backend, values, *, tombstones=()):
+    for value in values:
+        record = tombstone(identity=value) if value in tombstones else _catalog_record_for(value)
+        result = _write(backend, record)
+        assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED
+
+
+def _keys(count, **namespace):
+    return [identity(key_text=f"{number:064x}", **namespace) for number in range(1, count + 1)]
+
+
+def test_h1d_cursor_and_page_models_are_strict_immutable_and_not_snapshots():
+    namespace = identity().namespace
+    cursor = CacheCatalogCursor(CacheCatalogCursorScope.NAMESPACE, namespace, "a" * 64)
+    page = CacheCatalogPage(next_cursor=cursor)
+    assert page.is_snapshot is False
+    with pytest.raises(FrozenInstanceError):
+        cursor.entry_digest = "b" * 64
+    with pytest.raises(CacheCatalogContractError):
+        CacheCatalogCursor(CacheCatalogCursorScope.NAMESPACE, namespace, "bad")
+    with pytest.raises(ValueError, match="snapshot"):
+        CacheCatalogPage(is_snapshot=True)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 257, 1.5])
+def test_h1d_page_limit_rejects_invalid_values(tmp_path, limit):
+    backend = _writer_backend(tmp_path)
+    with pytest.raises(CacheCatalogContractError, match="limit"):
+        enumerate_catalog_namespace(identity().namespace, limit=limit, backend=backend)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 256])
+def test_h1d_namespace_page_limits_and_exclusive_cursors(tmp_path, limit):
+    values = _keys(5)
+    backend = _writer_backend(tmp_path)
+    _populate(backend, values)
+    expected = sorted(values)
+    page = enumerate_catalog_namespace(values[0].namespace, limit=limit, backend=backend)
+    assert [record.identity for record in page.records] == expected[:limit]
+    if limit < len(values):
+        assert page.next_cursor is not None
+        second = enumerate_catalog_namespace(
+            values[0].namespace, cursor=page.next_cursor, limit=256, backend=backend
+        )
+        assert [record.identity for record in second.records] == expected[limit:]
+        assert page.next_cursor.entry_digest not in {
+            record.identity.entry_digest for record in second.records
+        }
+    else:
+        assert page.next_cursor is None
+
+
+def test_h1d_empty_namespace_and_uninitialized_catalog_are_distinct(tmp_path):
+    backend = _writer_backend(tmp_path)
+    unavailable = enumerate_catalog_namespace(identity().namespace, backend=backend)
+    assert unavailable.failure_status is CacheCatalogLookupStatus.CATALOG_UNAVAILABLE
+    backend.initialize_catalog()
+    empty = enumerate_catalog_namespace(identity().namespace, backend=backend)
+    assert empty == CacheCatalogPage()
+
+
+def test_h1d_tombstones_are_omitted_without_breaking_pagination(tmp_path):
+    values = sorted(_keys(4))
+    backend = _writer_backend(tmp_path)
+    _populate(backend, values, tombstones=(values[1], values[3]))
+    first = enumerate_catalog_namespace(values[0].namespace, limit=1, backend=backend)
+    second = enumerate_catalog_namespace(
+        values[0].namespace, cursor=first.next_cursor, limit=1, backend=backend
+    )
+    live = [values[0], values[2]]
+    assert [first.records[0].identity, second.records[0].identity] == live
+    assert second.next_cursor is None
+
+
+def test_h1d_namespace_cursor_mismatch_is_rejected(tmp_path):
+    namespace = identity().namespace
+    other = CacheNamespace("video", namespace.producer_id, namespace.producer_schema_version)
+    cursor = CacheCatalogCursor(CacheCatalogCursorScope.NAMESPACE, other, "a" * 64)
+    with pytest.raises(CacheCatalogContractError, match="does not belong"):
+        enumerate_catalog_namespace(namespace, cursor=cursor, backend=_writer_backend(tmp_path))
+
+
+def test_h1d_full_catalog_order_is_namespace_then_numeric_schema_then_digest(tmp_path):
+    values = [
+        identity(domain="video", producer_id="p", schema=2, key_text="1" * 64),
+        identity(domain="audio", producer_id="z", schema=2, key_text="2" * 64),
+        identity(domain="audio", producer_id="p", schema=10, key_text="3" * 64),
+        identity(domain="audio", producer_id="p", schema=2, key_text="4" * 64),
+    ]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, values)
+    page = iterate_catalog_records(limit=256, backend=backend)
+    assert [record.identity for record in page.records] == sorted(values)
+    assert [
+        item.identity.namespace.producer_schema_version for item in page.records[:2]
+    ] == [2, 10]
+
+
+def test_h1d_full_catalog_paginates_across_namespace_boundaries(tmp_path):
+    values = [
+        identity(domain="audio", producer_id="p", schema=2, key_text="1" * 64),
+        identity(domain="audio", producer_id="q", schema=1, key_text="2" * 64),
+        identity(domain="video", producer_id="p", schema=1, key_text="3" * 64),
+    ]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, values)
+    seen = []
+    cursor = None
+    while True:
+        page = iterate_catalog_records(cursor=cursor, limit=1, backend=backend)
+        seen.extend(record.identity for record in page.records)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+    assert seen == sorted(values)
+    assert len(seen) == len(set(seen))
+
+
+def test_h1d_namespace_enumeration_never_descends_into_unrelated_namespace(tmp_path):
+    wanted = _keys(1)[0]
+    unrelated = identity(domain="video", key_text="f" * 64)
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (wanted, unrelated))
+
+    class Guarded(_DelegatingBackend):
+        def list_catalog_relative(self, relative_path):
+            if "video" in relative_path.parts:
+                raise AssertionError("unrelated namespace traversed")
+            return self.delegate.list_catalog_relative(relative_path)
+
+    page = enumerate_catalog_namespace(wanted.namespace, backend=Guarded(backend))
+    assert [record.identity for record in page.records] == [wanted]
+
+
+def test_h1d_approved_temp_name_is_ignored_but_malformed_name_is_corrupt(tmp_path):
+    value = _keys(1)[0]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (value,))
+    leaf = (tmp_path / derive_catalog_record_relative_path(value)).parent
+    leaf.joinpath(".catalog-tmp-" + "a" * 32).write_bytes(b"partial")
+    assert enumerate_catalog_namespace(value.namespace, backend=backend).failure_status is None
+    leaf.joinpath("almost-a-record.json").write_bytes(b"{}")
+    failed = enumerate_catalog_namespace(value.namespace, backend=backend)
+    assert failed.failure_status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+@pytest.mark.parametrize("kind", ["malformed", "unsupported", "symlink"])
+def test_h1d_broken_canonical_record_fails_the_page(tmp_path, kind):
+    value = _keys(1)[0]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (value,))
+    target = tmp_path / derive_catalog_record_relative_path(value)
+    if kind == "malformed":
+        target.write_bytes(b"{")
+    elif kind == "unsupported":
+        target.write_bytes(
+            target.read_bytes().replace(
+                b'"catalog_record_version":1', b'"catalog_record_version":2'
+            )
+        )
+    else:
+        target.unlink()
+        os.symlink(tmp_path / "elsewhere", target)
+    backend = _writer_backend(tmp_path)
+    page = enumerate_catalog_namespace(value.namespace, backend=backend)
+    expected = {
+        "malformed": CacheCatalogLookupStatus.CATALOG_CORRUPT,
+        "unsupported": CacheCatalogLookupStatus.CATALOG_UNSUPPORTED,
+        "symlink": CacheCatalogLookupStatus.CATALOG_UNSAFE,
+    }[kind]
+    assert page.failure_status is expected
+    assert page.records == ()
+
+
+def test_h1d_directory_one_over_limit_is_structured_corruption(tmp_path):
+    backend = _writer_backend(tmp_path)
+    backend.initialize_catalog()
+    root = Path("catalog/v1/records")
+    observed = backend.inspect_catalog_relative(root)
+
+    class OverCapacity(_DelegatingBackend):
+        def list_catalog_relative(self, relative_path):
+            if relative_path == root:
+                names = tuple(f"x{number:04d}" for number in range(4097))
+                return CacheCatalogDirectoryListing(names, True, observed, observed)
+            return self.delegate.list_catalog_relative(relative_path)
+
+    page = iterate_catalog_records(backend=OverCapacity(backend))
+    assert page.failure_status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+def test_h1d_exact_4096_directory_entries_allowed_and_one_over_rejected(tmp_path):
+    value = _keys(1)[0]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (value,))
+    leaf = (tmp_path / derive_catalog_record_relative_path(value)).parent
+    for number in range(MAX_CATALOG_DIRECTORY_ENTRIES - 1):
+        leaf.joinpath(f".catalog-tmp-{number:032x}").touch()
+    accepted = enumerate_catalog_namespace(value.namespace, backend=backend)
+    assert accepted.failure_status is None
+    assert [record.identity for record in accepted.records] == [value]
+    leaf.joinpath(f".catalog-tmp-{MAX_CATALOG_DIRECTORY_ENTRIES:032x}").touch()
+    rejected = enumerate_catalog_namespace(value.namespace, backend=backend)
+    assert rejected.failure_status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+def test_h1d_reduced_directory_identity_evidence_is_unstable(tmp_path):
+    value = _keys(1)[0]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (value,))
+
+    class Reduced(_DelegatingBackend):
+        def list_catalog_relative(self, relative_path):
+            listing = self.delegate.list_catalog_relative(relative_path)
+            if relative_path.name == str(value.namespace.producer_schema_version):
+                return replace(
+                    listing,
+                    post_identity=replace(listing.post_identity, file_id=None),
+                )
+            return listing
+
+    page = enumerate_catalog_namespace(value.namespace, backend=Reduced(backend))
+    assert page.failure_status is CacheCatalogLookupStatus.CATALOG_UNSTABLE
+
+
+@pytest.mark.parametrize("failure", ["unstable", "io"])
+def test_h1d_record_read_failure_is_not_silently_skipped(tmp_path, failure):
+    value = _keys(1)[0]
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (value,))
+
+    class FailedRead(_DelegatingBackend):
+        calls = 0
+
+        def read_discovered_record(self, namespace, entry_digest):
+            self.calls += 1
+            if failure == "io":
+                raise CacheLookupPermissionError("private native detail")
+            return replace(
+                self.delegate.read_discovered_record(namespace, entry_digest),
+                stable_read=False,
+            )
+
+    failing = FailedRead(backend)
+    page = enumerate_catalog_namespace(value.namespace, backend=failing)
+    expected = (
+        CacheCatalogLookupStatus.CATALOG_UNSTABLE
+        if failure == "unstable"
+        else CacheCatalogLookupStatus.CATALOG_IO_FAILURE
+    )
+    assert page.failure_status is expected
+    assert page.records == () and failing.calls == 1
+    assert "private native detail" not in repr(page)
+
+
+def test_h1d_full_iteration_stops_after_page_plus_one_live_records(tmp_path):
+    values = _keys(8)
+    backend = _writer_backend(tmp_path)
+    _populate(backend, values)
+
+    class Counting(_DelegatingBackend):
+        reads = 0
+
+        def read_discovered_record(self, namespace, entry_digest):
+            self.reads += 1
+            return self.delegate.read_discovered_record(namespace, entry_digest)
+
+    counting = Counting(backend)
+    page = iterate_catalog_records(limit=1, backend=counting)
+    assert len(page.records) == 1 and page.next_cursor is not None
+    assert counting.reads == 2
+
+
+def test_h1d_cursor_change_does_not_rewind_and_later_insert_may_appear(tmp_path):
+    values = sorted(_keys(3))
+    backend = _writer_backend(tmp_path)
+    _populate(backend, (values[1], values[2]))
+    first = enumerate_catalog_namespace(values[0].namespace, limit=1, backend=backend)
+    assert first.records[0].identity == values[1]
+    _populate(backend, (values[0],))
+    later = identity(key_text="f" * 64)
+    _populate(backend, (later,))
+    second = enumerate_catalog_namespace(
+        values[0].namespace, cursor=first.next_cursor, limit=256, backend=backend
+    )
+    emitted = [record.identity for record in second.records]
+    assert values[0] not in emitted
+    assert all(item.entry_digest > first.next_cursor.entry_digest for item in emitted)

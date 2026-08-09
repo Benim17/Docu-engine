@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import Enum
 from functools import total_ordering
 from pathlib import Path as _Path
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
 
 from .cache_lookup import (
     BoundedFileRead,
@@ -704,7 +704,9 @@ class CacheCatalogLookupStatus(str, Enum):
 
 class CacheCatalogSubject(str, Enum):
     CATALOG_ROOT = "catalog_root"
+    NAMESPACE = "namespace"
     RECORD = "record"
+    WRITE_LOCK = "write_lock"
 
 
 @dataclass(frozen=True, order=True)
@@ -791,6 +793,12 @@ class CacheCatalogReadOnlyBackend(Protocol):
 
     def inspect_catalog_relative(self, relative_path: _Path) -> FileIdentity: ...
 
+    def list_catalog_relative(self, relative_path: _Path) -> "CacheCatalogDirectoryListing": ...
+
+    def read_discovered_record(
+        self, namespace: CacheNamespace, entry_digest: str
+    ) -> BoundedFileRead: ...
+
     def read_record_bounded(self, identity: CacheCatalogIdentity) -> BoundedFileRead: ...
 
 
@@ -830,10 +838,82 @@ class LocalCacheCatalogReadOnlyBackend:
     def inspect_catalog_relative(self, relative_path: _Path) -> FileIdentity:
         return self._filesystem.inspect(self._catalog_path(relative_path))
 
+    def list_catalog_relative(self, relative_path: _Path) -> "CacheCatalogDirectoryListing":
+        path = self._catalog_path(relative_path)
+        pre = self._filesystem.inspect(path)
+        if pre.object_type is FilesystemObjectType.SYMLINK:
+            raise SymlinkRejectedError("Catalog directory cannot be a symlink.")
+        if pre.object_type is not FilesystemObjectType.DIRECTORY:
+            raise UnsupportedFilesystemObjectError("Catalog listing requires a directory.")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, flags)
+            handle = FileIdentity.from_stat(os.fstat(descriptor))
+            if not pre.same_stable_object(handle):
+                raise UnstableFilesystemObjectError("Catalog directory changed before listing.")
+            names: list[str] = []
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    names.append(entry.name)
+                    if len(names) == MAX_CATALOG_DIRECTORY_ENTRIES + 1:
+                        break
+            handle_after = FileIdentity.from_stat(os.fstat(descriptor))
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise UnsupportedFilesystemObjectError("Catalog directory is unsafe.") from exc
+            raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        try:
+            post = self._filesystem.inspect(path)
+        except FileNotFoundError as exc:
+            raise UnstableFilesystemObjectError("Catalog directory disappeared.") from exc
+        stable = (
+            pre.same_stable_object(handle)
+            and handle.same_stable_object(handle_after)
+            and handle_after.same_stable_object(post)
+        )
+        if not stable:
+            raise UnstableFilesystemObjectError("Catalog directory changed while listed.")
+        return CacheCatalogDirectoryListing(
+            tuple(sorted(names)),
+            len(names) > MAX_CATALOG_DIRECTORY_ENTRIES,
+            pre,
+            post,
+        )
+
     def read_record_bounded(self, identity: CacheCatalogIdentity) -> BoundedFileRead:
         return self._filesystem.read_regular_file_bounded(
             self._catalog_path(derive_catalog_record_relative_path(identity)),
             max_bytes=MAX_CATALOG_RECORD_BYTES,
+        )
+
+    def read_discovered_record(
+        self, namespace: CacheNamespace, entry_digest: str
+    ) -> BoundedFileRead:
+        if not isinstance(namespace, CacheNamespace):
+            raise TypeError("namespace must be CacheNamespace.")
+        _digest(entry_digest, "entry_digest")
+        relative = _Path(
+            "catalog",
+            f"v{CACHE_CATALOG_LAYOUT_VERSION}",
+            "records",
+            namespace.domain,
+            namespace.producer_id,
+            str(namespace.producer_schema_version),
+            entry_digest[:2],
+            entry_digest[2:4],
+            f"{entry_digest}.json",
+        )
+        return self._filesystem.read_regular_file_bounded(
+            self._catalog_path(relative), max_bytes=MAX_CATALOG_RECORD_BYTES
         )
 
 
@@ -1428,3 +1508,508 @@ def _write_catalog_record(
         return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSTABLE, identity)
     except (CacheLookupFilesystemError, PermissionError, OSError):
         return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE, identity)
+
+
+@dataclass(frozen=True)
+class CacheCatalogDirectoryListing:
+    names: tuple[str, ...]
+    limit_exceeded: bool
+    pre_identity: FileIdentity
+    post_identity: FileIdentity
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.names, tuple)
+            or any(not isinstance(name, str) or not name for name in self.names)
+            or self.names != tuple(sorted(set(self.names)))
+            or len(self.names) > MAX_CATALOG_DIRECTORY_ENTRIES + 1
+        ):
+            raise ValueError("names must be a bounded sorted unique tuple.")
+        if self.limit_exceeded != (len(self.names) > MAX_CATALOG_DIRECTORY_ENTRIES):
+            raise ValueError("limit_exceeded must describe the one-over probe.")
+        if not isinstance(self.pre_identity, FileIdentity) or not isinstance(
+            self.post_identity, FileIdentity
+        ):
+            raise TypeError("directory identities must be FileIdentity.")
+
+
+class CacheCatalogCursorScope(str, Enum):
+    NAMESPACE = "namespace"
+    FULL_CATALOG = "full_catalog"
+
+
+@dataclass(frozen=True)
+class CacheCatalogCursor:
+    scope: CacheCatalogCursorScope
+    namespace: CacheNamespace
+    entry_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scope, CacheCatalogCursorScope):
+            raise CacheCatalogContractError("cursor scope must be canonical.")
+        if not isinstance(self.namespace, CacheNamespace):
+            raise CacheCatalogContractError("cursor namespace must be CacheNamespace.")
+        _digest(self.entry_digest, "cursor entry_digest")
+
+    @property
+    def sort_key(self) -> tuple[str, str, int, str]:
+        return (
+            self.namespace.domain,
+            self.namespace.producer_id,
+            self.namespace.producer_schema_version,
+            self.entry_digest,
+        )
+
+
+@dataclass(frozen=True)
+class CacheCatalogPage:
+    records: tuple[CacheCatalogLiveRecord, ...] = ()
+    next_cursor: CacheCatalogCursor | None = None
+    failure_status: CacheCatalogLookupStatus | None = None
+    diagnostics: tuple[CacheCatalogDiagnostic, ...] = ()
+    is_snapshot: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.records, tuple)
+            or any(not isinstance(record, CacheCatalogLiveRecord) for record in self.records)
+            or len(self.records) > MAX_CATALOG_PAGE_RECORDS
+        ):
+            raise ValueError("records must be a bounded tuple of live catalog records.")
+        if self.next_cursor is not None and not isinstance(
+            self.next_cursor, CacheCatalogCursor
+        ):
+            raise TypeError("next_cursor must be CacheCatalogCursor or null.")
+        if self.failure_status is not None and self.failure_status not in {
+            CacheCatalogLookupStatus.CATALOG_UNAVAILABLE,
+            CacheCatalogLookupStatus.CATALOG_CORRUPT,
+            CacheCatalogLookupStatus.CATALOG_UNSUPPORTED,
+            CacheCatalogLookupStatus.CATALOG_UNSAFE,
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE,
+            CacheCatalogLookupStatus.CATALOG_IO_FAILURE,
+        }:
+            raise ValueError("failure_status must be one H1 catalog failure.")
+        if self.failure_status is not None and (self.records or self.next_cursor is not None):
+            raise ValueError("Failed pages cannot expose partial records or a cursor.")
+        if not isinstance(self.diagnostics, tuple) or len(self.diagnostics) > MAX_CATALOG_OPERATION_DIAGNOSTICS:
+            raise ValueError("diagnostics must be a bounded tuple.")
+        if self.is_snapshot is not False:
+            raise ValueError("H1 pages never claim global snapshot semantics.")
+
+
+class _CatalogEnumerationFailure(RuntimeError):
+    def __init__(
+        self,
+        status: CacheCatalogLookupStatus,
+        relative: _Path,
+        namespace: CacheNamespace | None = None,
+    ) -> None:
+        self.status = status
+        self.relative = relative
+        self.namespace = namespace
+
+
+_SHARD_NAME = re.compile(r"^[0-9a-f]{2}$")
+_RECORD_NAME = re.compile(r"^([0-9a-f]{64})\.json$")
+_TEMP_NAME = re.compile(r"^\.catalog-tmp-[0-9a-f]{32}$")
+
+
+def _page_limit(limit: object) -> int:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_CATALOG_PAGE_RECORDS
+    ):
+        raise CacheCatalogContractError(
+            f"limit must be an integer from 1 through {MAX_CATALOG_PAGE_RECORDS}."
+        )
+    return limit
+
+
+def _enumeration_diagnostic(
+    failure: _CatalogEnumerationFailure,
+) -> tuple[CacheCatalogDiagnostic, ...]:
+    namespace = failure.namespace
+    identity = (
+        (namespace.domain, namespace.producer_id, namespace.producer_schema_version, "")
+        if namespace is not None
+        else ("", "", 0, "")
+    )
+    return (
+        CacheCatalogDiagnostic(
+            CacheCatalogSubject.NAMESPACE,
+            identity,
+            failure.status.value,
+            failure.relative.as_posix(),
+        ),
+    )
+
+
+def _failed_page(failure: _CatalogEnumerationFailure) -> CacheCatalogPage:
+    return CacheCatalogPage(
+        failure_status=failure.status,
+        diagnostics=_enumeration_diagnostic(failure),
+    )
+
+
+def _list_catalog_directory(
+    backend: CacheCatalogReadOnlyBackend,
+    relative: _Path,
+    *,
+    missing_status: CacheCatalogLookupStatus,
+    namespace: CacheNamespace | None = None,
+    expected_identity: FileIdentity | None = None,
+) -> tuple[str, ...]:
+    if (
+        len(relative.parts) > MAX_CATALOG_TRAVERSAL_DEPTH
+        or len(relative.as_posix().encode("utf-8"))
+        > MAX_CATALOG_RELATIVE_PATH_UTF8_BYTES
+    ):
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+        )
+    try:
+        listing = backend.list_catalog_relative(relative)
+    except FileNotFoundError as exc:
+        raise _CatalogEnumerationFailure(missing_status, relative, namespace) from exc
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError) as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSAFE, relative, namespace
+        ) from exc
+    except UnstableFilesystemObjectError as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        ) from exc
+    except (CacheLookupFilesystemError, PermissionError, OSError) as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_IO_FAILURE, relative, namespace
+        ) from exc
+    if listing.limit_exceeded:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+        )
+    if not listing.pre_identity.same_stable_object(listing.post_identity):
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        )
+    if expected_identity is not None and not expected_identity.same_stable_object(
+        listing.pre_identity
+    ):
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        )
+    return listing.names
+
+
+def _require_directory(
+    backend: CacheCatalogReadOnlyBackend,
+    relative: _Path,
+    namespace: CacheNamespace | None,
+) -> FileIdentity:
+    try:
+        observed = backend.inspect_catalog_relative(relative)
+    except FileNotFoundError as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        ) from exc
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError) as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSAFE, relative, namespace
+        ) from exc
+    except (CacheLookupFilesystemError, OSError) as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_IO_FAILURE, relative, namespace
+        ) from exc
+    if observed.object_type is not FilesystemObjectType.DIRECTORY:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSAFE, relative, namespace
+        )
+    return observed
+
+
+def _namespace_record_identities(
+    namespace: CacheNamespace,
+    backend: CacheCatalogReadOnlyBackend,
+    expected_namespace_identity: FileIdentity | None = None,
+) -> Iterator[tuple[str, _Path]]:
+    base = _Path(
+        "catalog",
+        f"v{CACHE_CATALOG_LAYOUT_VERSION}",
+        "records",
+        namespace.domain,
+        namespace.producer_id,
+        str(namespace.producer_schema_version),
+    )
+    try:
+        first_names = _list_catalog_directory(
+            backend,
+            base,
+            missing_status=CacheCatalogLookupStatus.RECORD_ABSENT,
+            namespace=namespace,
+            expected_identity=expected_namespace_identity,
+        )
+    except _CatalogEnumerationFailure as failure:
+        if failure.status is CacheCatalogLookupStatus.RECORD_ABSENT:
+            return
+        raise
+    for first in first_names:
+        first_relative = base / first
+        if _SHARD_NAME.fullmatch(first) is None:
+            raise _CatalogEnumerationFailure(
+                CacheCatalogLookupStatus.CATALOG_CORRUPT, first_relative, namespace
+            )
+        first_identity = _require_directory(backend, first_relative, namespace)
+        second_names = _list_catalog_directory(
+            backend,
+            first_relative,
+            missing_status=CacheCatalogLookupStatus.CATALOG_UNSTABLE,
+            namespace=namespace,
+            expected_identity=first_identity,
+        )
+        for second in second_names:
+            second_relative = first_relative / second
+            if _SHARD_NAME.fullmatch(second) is None:
+                raise _CatalogEnumerationFailure(
+                    CacheCatalogLookupStatus.CATALOG_CORRUPT, second_relative, namespace
+                )
+            second_identity = _require_directory(backend, second_relative, namespace)
+            record_names = _list_catalog_directory(
+                backend,
+                second_relative,
+                missing_status=CacheCatalogLookupStatus.CATALOG_UNSTABLE,
+                namespace=namespace,
+                expected_identity=second_identity,
+            )
+            for name in record_names:
+                relative = second_relative / name
+                if _TEMP_NAME.fullmatch(name) is not None:
+                    continue
+                matched = _RECORD_NAME.fullmatch(name)
+                if matched is None:
+                    raise _CatalogEnumerationFailure(
+                        CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+                    )
+                digest = matched.group(1)
+                if digest[:2] != first or digest[2:4] != second:
+                    raise _CatalogEnumerationFailure(
+                        CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+                    )
+                yield digest, relative
+
+
+def _record_from_discovery(
+    namespace: CacheNamespace,
+    digest: str,
+    relative: _Path,
+    backend: CacheCatalogReadOnlyBackend,
+) -> CacheCatalogLiveRecord | None:
+    try:
+        read = backend.read_discovered_record(namespace, digest)
+    except FileNotFoundError as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        ) from exc
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError) as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSAFE, relative, namespace
+        ) from exc
+    except UnstableFilesystemObjectError as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        ) from exc
+    except (CacheLookupFilesystemError, OSError) as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_IO_FAILURE, relative, namespace
+        ) from exc
+    if read.limit_exceeded or read.data is None:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+        )
+    if not read.stable_read:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSTABLE, relative, namespace
+        )
+    try:
+        record = parse_cache_catalog_record(read.data)
+    except CacheCatalogUnsupportedVersionError as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_UNSUPPORTED, relative, namespace
+        ) from exc
+    except CacheCatalogContractError as exc:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+        ) from exc
+    if record.identity.namespace != namespace or record.identity.entry_digest != digest:
+        raise _CatalogEnumerationFailure(
+            CacheCatalogLookupStatus.CATALOG_CORRUPT, relative, namespace
+        )
+    return record if isinstance(record, CacheCatalogLiveRecord) else None
+
+
+def _full_catalog_identities(
+    backend: CacheCatalogReadOnlyBackend,
+) -> Iterator[tuple[CacheNamespace, str, _Path]]:
+    records_root = _Path("catalog", f"v{CACHE_CATALOG_LAYOUT_VERSION}", "records")
+    domains = _list_catalog_directory(
+        backend,
+        records_root,
+        missing_status=CacheCatalogLookupStatus.CATALOG_UNAVAILABLE,
+    )
+    for domain in domains:
+        domain_relative = records_root / domain
+        try:
+            CacheNamespace(domain, "catalog.validation", 1)
+        except (CacheEntryContractError, TypeError, ValueError) as exc:
+            raise _CatalogEnumerationFailure(
+                CacheCatalogLookupStatus.CATALOG_CORRUPT, domain_relative
+            ) from exc
+        domain_identity = _require_directory(backend, domain_relative, None)
+        producers = _list_catalog_directory(
+            backend,
+            domain_relative,
+            missing_status=CacheCatalogLookupStatus.CATALOG_UNSTABLE,
+            expected_identity=domain_identity,
+        )
+        for producer in producers:
+            producer_relative = domain_relative / producer
+            try:
+                CacheNamespace(domain, producer, 1)
+            except (CacheEntryContractError, TypeError, ValueError) as exc:
+                raise _CatalogEnumerationFailure(
+                    CacheCatalogLookupStatus.CATALOG_CORRUPT, producer_relative
+                ) from exc
+            producer_identity = _require_directory(backend, producer_relative, None)
+            schema_names = _list_catalog_directory(
+                backend,
+                producer_relative,
+                missing_status=CacheCatalogLookupStatus.CATALOG_UNSTABLE,
+                expected_identity=producer_identity,
+            )
+            schemas: list[tuple[int, str]] = []
+            for schema_name in schema_names:
+                try:
+                    schema = int(schema_name, 10)
+                except ValueError as exc:
+                    raise _CatalogEnumerationFailure(
+                        CacheCatalogLookupStatus.CATALOG_CORRUPT,
+                        producer_relative / schema_name,
+                    ) from exc
+                if schema <= 0 or str(schema) != schema_name:
+                    raise _CatalogEnumerationFailure(
+                        CacheCatalogLookupStatus.CATALOG_CORRUPT,
+                        producer_relative / schema_name,
+                    )
+                schemas.append((schema, schema_name))
+            for schema, schema_name in sorted(schemas):
+                namespace = CacheNamespace(domain, producer, schema)
+                schema_relative = producer_relative / schema_name
+                schema_identity = _require_directory(backend, schema_relative, namespace)
+                # The namespace generator independently opens the same schema root;
+                # require that discovery identity to remain current before traversal.
+                for digest, relative in _namespace_record_identities(
+                    namespace, backend, schema_identity
+                ):
+                    yield namespace, digest, relative
+
+
+def _page_from_identities(
+    identities: Iterator[tuple[CacheNamespace, str, _Path]],
+    *,
+    cursor: CacheCatalogCursor | None,
+    scope: CacheCatalogCursorScope,
+    limit: int,
+    backend: CacheCatalogReadOnlyBackend,
+) -> CacheCatalogPage:
+    live: list[CacheCatalogLiveRecord] = []
+    cursor_key = None if cursor is None else cursor.sort_key
+    try:
+        for namespace, digest, relative in identities:
+            key = (
+                namespace.domain,
+                namespace.producer_id,
+                namespace.producer_schema_version,
+                digest,
+            )
+            if cursor_key is not None and key <= cursor_key:
+                continue
+            record = _record_from_discovery(namespace, digest, relative, backend)
+            if record is None:
+                continue
+            live.append(record)
+            if len(live) > limit:
+                break
+    except _CatalogEnumerationFailure as failure:
+        return _failed_page(failure)
+    if len(live) <= limit:
+        return CacheCatalogPage(records=tuple(live))
+    records = tuple(live[:limit])
+    last = records[-1].identity
+    return CacheCatalogPage(
+        records=records,
+        next_cursor=CacheCatalogCursor(scope, last.namespace, last.entry_digest),
+    )
+
+
+def enumerate_catalog_namespace(
+    namespace: CacheNamespace,
+    *,
+    cursor: CacheCatalogCursor | None = None,
+    limit: int = MAX_CATALOG_PAGE_RECORDS,
+    backend: CacheCatalogReadOnlyBackend,
+) -> CacheCatalogPage:
+    """Enumerate one exact namespace through the fixed two-shard layout."""
+
+    if not isinstance(namespace, CacheNamespace):
+        raise CacheCatalogContractError("namespace must be CacheNamespace.")
+    page_limit = _page_limit(limit)
+    if cursor is not None:
+        if not isinstance(cursor, CacheCatalogCursor):
+            raise CacheCatalogContractError("cursor must be CacheCatalogCursor or null.")
+        if cursor.scope is not CacheCatalogCursorScope.NAMESPACE or cursor.namespace != namespace:
+            raise CacheCatalogContractError("cursor does not belong to this namespace.")
+    if not isinstance(backend, CacheCatalogReadOnlyBackend):
+        raise TypeError("backend must implement CacheCatalogReadOnlyBackend.")
+    try:
+        _list_catalog_directory(
+            backend,
+            _Path("catalog", f"v{CACHE_CATALOG_LAYOUT_VERSION}", "records"),
+            missing_status=CacheCatalogLookupStatus.CATALOG_UNAVAILABLE,
+        )
+    except _CatalogEnumerationFailure as failure:
+        return _failed_page(failure)
+    identities = (
+        (namespace, digest, relative)
+        for digest, relative in _namespace_record_identities(namespace, backend)
+    )
+    return _page_from_identities(
+        identities,
+        cursor=cursor,
+        scope=CacheCatalogCursorScope.NAMESPACE,
+        limit=page_limit,
+        backend=backend,
+    )
+
+
+def iterate_catalog_records(
+    *,
+    cursor: CacheCatalogCursor | None = None,
+    limit: int = MAX_CATALOG_PAGE_RECORDS,
+    backend: CacheCatalogReadOnlyBackend,
+) -> CacheCatalogPage:
+    """Return one bounded page in canonical full-catalog identity order."""
+
+    page_limit = _page_limit(limit)
+    if cursor is not None:
+        if not isinstance(cursor, CacheCatalogCursor):
+            raise CacheCatalogContractError("cursor must be CacheCatalogCursor or null.")
+        if cursor.scope is not CacheCatalogCursorScope.FULL_CATALOG:
+            raise CacheCatalogContractError("cursor is not a full-catalog cursor.")
+    if not isinstance(backend, CacheCatalogReadOnlyBackend):
+        raise TypeError("backend must implement CacheCatalogReadOnlyBackend.")
+    return _page_from_identities(
+        _full_catalog_identities(backend),
+        cursor=cursor,
+        scope=CacheCatalogCursorScope.FULL_CATALOG,
+        limit=page_limit,
+        backend=backend,
+    )
