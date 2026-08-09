@@ -1,4 +1,7 @@
-from dataclasses import fields, replace
+import hashlib
+import os
+from dataclasses import dataclass, fields, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -6,8 +9,10 @@ import pytest
 from engine.storage.cache_keys import CacheKey
 from engine.storage.cache_lookup import (
     CacheLookupExpectation,
+    CacheLookupIOError,
     CacheLookupVerificationPolicy,
     LockObservationPolicy,
+    FileIdentity,
     ProducerPayloadExpectation,
     ValidatedCacheRoot,
 )
@@ -19,16 +24,29 @@ from engine.storage.cache_recovery import (
     RecoveryReadOnlyFilesystem,
     RecoveryTraversalError,
     RecoveryTraversalLimitError,
+    FinalRecoveryState,
+    LockRecoveryState,
+    StagingRecoveryState,
+    _observe_recovery_components,
     _prepare_recovery_inspection,
 )
 from engine.storage.persistent_cache import (
+    CacheArtifactMetadata,
     CacheNamespace,
+    CacheProducerMetadata,
     CacheRuntimeFingerprint,
+    canonical_json_bytes,
     derive_entry_digest,
     derive_final_entry_path,
     derive_lock_path,
     derive_staging_entry_path,
 )
+from engine.storage.cache_writer import (
+    CacheStagingWriteRequest,
+    StagingPayloadSource,
+    write_cache_staging_entry,
+)
+from engine.storage.cache_promotion import WriterLockDocument
 
 
 def _request(tmp_path, *, known_writer_token=None):
@@ -208,6 +226,7 @@ def test_step5e1_filesystem_surface_is_read_only():
     public = {name for name in dir(RecoveryReadOnlyFilesystem) if not name.startswith("_")}
     assert public == {
         "inspect",
+        "list_directory",
         "resolve",
         "read_regular_file_bounded",
         "stream_regular_file_sha256",
@@ -215,3 +234,350 @@ def test_step5e1_filesystem_surface_is_read_only():
     }
     forbidden = {"write", "unlink", "rename", "mkdir", "chmod", "promote", "cleanup"}
     assert not public & forbidden
+
+
+@dataclass(frozen=True)
+class _FixedClock:
+    instant: datetime = datetime(2026, 7, 20, 9, 1, tzinfo=timezone.utc)
+
+    def now_utc(self):
+        return self.instant
+
+
+def _write_staging(request, token="writer-1"):
+    source = request.cache_root.resolved_path.parent / f"source-{token}"
+    source.write_bytes(b"payload")
+    staged = write_cache_staging_entry(CacheStagingWriteRequest(
+        request.cache_root,
+        request.namespace,
+        request.cache_key,
+        token,
+        CacheArtifactMetadata("transcript", "logical-1", 1),
+        CacheProducerMetadata("transcription.whisper", "1.0", 3),
+        request.expectation.runtime_fingerprint,
+        "2026-07-20T09:00:00Z",
+        (StagingPayloadSource(source.resolve(), "one.bin"),),
+        request.lookup_policy,
+    ))
+    return staged
+
+
+def _refresh_root(request):
+    return replace(
+        request,
+        cache_root=ValidatedCacheRoot.from_path(request.cache_root.resolved_path),
+    )
+
+
+def _write_lock(request, *, heartbeat="2026-07-20T09:00:00Z", digest=None, version=1):
+    path = derive_lock_path(
+        request.cache_root.resolved_path, request.namespace, request.cache_key
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if version == 1:
+        data = WriterLockDocument(
+            digest or derive_entry_digest(request.cache_key),
+            "2026-07-20T09:00:00Z",
+            heartbeat,
+            "owner-token",
+            "host-1",
+            123,
+        ).canonical_bytes()
+    else:
+        data = canonical_json_bytes({"lock_version": version})
+    path.write_bytes(data)
+    return path
+
+
+def test_step5e2_component_observation_absent_states(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert observed.staging[0].classification is StagingRecoveryState.STAGING_ABSENT
+    assert observed.final.classification is FinalRecoveryState.FINAL_ABSENT
+    assert observed.lock.classification is LockRecoveryState.LOCK_ABSENT
+    assert observed.status is None and observed.reason is None
+
+
+def test_step5e2_valid_staging_and_final_reuse_full_lookup_semantics(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    request = _refresh_root(request)
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert observed.staging[0].classification is StagingRecoveryState.STAGING_COMPLETE_VALID
+    assert observed.final.classification is FinalRecoveryState.FINAL_ABSENT
+    final = derive_final_entry_path(request.cache_root.resolved_path, request.namespace, request.cache_key)
+    final.parent.mkdir(parents=True); os.rename(staged.staging_path, final)
+    request = _refresh_root(request)
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert observed.final.classification is FinalRecoveryState.FINAL_VALID
+
+
+@pytest.mark.parametrize("missing", ["COMPLETE", "manifest.json"])
+def test_step5e2_staging_incomplete_only_for_safe_missing_objects(tmp_path, missing):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    (staged.staging_path / "COMPLETE").unlink()
+    if missing != "COMPLETE":
+        (staged.staging_path / missing).unlink()
+    request = _refresh_root(request)
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert observed.staging[0].classification is StagingRecoveryState.STAGING_INCOMPLETE
+
+
+@pytest.mark.parametrize("document", ["metadata.json", "manifest.json", "COMPLETE"])
+def test_step5e2_malformed_staging_documents_are_invalid(tmp_path, document):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    (staged.staging_path / document).write_bytes(b"{")
+    request = _refresh_root(request)
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert observed.staging[0].classification is StagingRecoveryState.STAGING_INVALID
+
+
+def test_step5e2_unsupported_staging_document(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    (staged.staging_path / "COMPLETE").write_bytes(canonical_json_bytes({
+        "cache_entry_contract_version": 2,
+        "entry_digest": derive_entry_digest(request.cache_key),
+        "manifest_digest": "sha256:" + "0" * 64,
+        "metadata_digest": "sha256:" + "0" * 64,
+    }))
+    request = _refresh_root(request)
+    assert _observe_recovery_components(
+        request, lock_clock=_FixedClock()
+    ).staging[0].classification is StagingRecoveryState.STAGING_UNSUPPORTED
+
+
+@pytest.mark.parametrize("mutation", ["payload-missing", "payload-digest", "unexpected", "hardlink", "unsafe-descendant"])
+def test_step5e2_invalid_and_unsafe_staging_content(tmp_path, mutation):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    payload = staged.staging_path / "payload" / "one.bin"
+    if mutation == "payload-missing":
+        payload.unlink()
+    elif mutation == "payload-digest":
+        payload.write_bytes(b"changed")
+    elif mutation == "unexpected":
+        (staged.staging_path / "unexpected").write_bytes(b"x")
+    elif mutation == "hardlink":
+        os.link(payload, tmp_path / "hardlink")
+    else:
+        payload.unlink(); payload.symlink_to(tmp_path / "outside")
+    request = _refresh_root(request)
+    state = _observe_recovery_components(
+        request, lock_clock=_FixedClock()
+    ).staging[0].classification
+    expected = StagingRecoveryState.STAGING_UNSAFE if mutation == "unsafe-descendant" else StagingRecoveryState.STAGING_INVALID
+    assert state is expected
+
+
+def test_step5e2_unsafe_staging_candidate(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    path = derive_staging_entry_path(
+        request.cache_root.resolved_path, request.namespace, request.cache_key, "writer-1"
+    )
+    path.parent.mkdir(parents=True); path.symlink_to(tmp_path / "outside")
+    request = _refresh_root(request)
+    assert _observe_recovery_components(
+        request, lock_clock=_FixedClock()
+    ).staging[0].classification is StagingRecoveryState.STAGING_UNSAFE
+
+
+def test_step5e2_discovered_candidate_disappearance_is_unstable(tmp_path):
+    request = _request(tmp_path)
+    staged = _write_staging(request)
+    request = _refresh_root(request)
+    class DisappearingFilesystem(LocalRecoveryReadOnlyFilesystem):
+        removed = False
+        def inspect(self, path):
+            if Path(path) == staged.staging_path and not self.removed:
+                self.removed = True
+                os.rename(path, Path(path).with_name(Path(path).name + "-gone"))
+            return super().inspect(path)
+    state = _observe_recovery_components(
+        request, filesystem=DisappearingFilesystem(), lock_clock=_FixedClock()
+    ).staging[0].classification
+    assert state is StagingRecoveryState.STAGING_UNSTABLE
+
+
+def test_step5e2_reduced_staging_identity_is_unstable(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request); request = _refresh_root(request)
+    class ReducedIdentityFilesystem(LocalRecoveryReadOnlyFilesystem):
+        def inspect(self, path):
+            identity = super().inspect(path)
+            if Path(path) == staged.staging_path:
+                return replace(identity, device_id=None)
+            return identity
+    state = _observe_recovery_components(
+        request, filesystem=ReducedIdentityFilesystem(), lock_clock=_FixedClock()
+    ).staging[0].classification
+    assert state is StagingRecoveryState.STAGING_UNSTABLE
+
+
+def test_step5e2_multiple_candidates_are_independently_ordered_and_classified(tmp_path):
+    request = _request(tmp_path)
+    complete = _write_staging(request, "writer-z")
+    incomplete = _write_staging(_refresh_root(request), "writer-a")
+    (incomplete.staging_path / "COMPLETE").unlink()
+    request = _refresh_root(request)
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert tuple(item.classification for item in observed.staging) == (
+        StagingRecoveryState.STAGING_INCOMPLETE,
+        StagingRecoveryState.STAGING_COMPLETE_VALID,
+    )
+    assert complete.staging_path.exists()
+
+
+@pytest.mark.parametrize("state", ["invalid", "unsupported", "unsafe"])
+def test_step5e2_final_rejection_mapping(tmp_path, state):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    final = derive_final_entry_path(request.cache_root.resolved_path, request.namespace, request.cache_key)
+    final.parent.mkdir(parents=True)
+    if state == "unsafe":
+        final.symlink_to(staged.staging_path, target_is_directory=True)
+    else:
+        os.rename(staged.staging_path, final)
+        if state == "invalid":
+            (final / "COMPLETE").unlink()
+        else:
+            (final / "COMPLETE").write_bytes(canonical_json_bytes({
+                "cache_entry_contract_version": 2,
+                "entry_digest": derive_entry_digest(request.cache_key),
+                "manifest_digest": "sha256:" + "0" * 64,
+                "metadata_digest": "sha256:" + "0" * 64,
+            }))
+    request = _refresh_root(request)
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    expected = {
+        "invalid": FinalRecoveryState.FINAL_INVALID,
+        "unsupported": FinalRecoveryState.FINAL_UNSUPPORTED,
+        "unsafe": FinalRecoveryState.FINAL_UNSAFE,
+    }[state]
+    assert observed.final.classification is expected
+
+
+def test_step5e2_final_observation_does_not_read_lock_when_final_absent(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    lock_path = derive_lock_path(request.cache_root.resolved_path, request.namespace, request.cache_key)
+    class NoLockFilesystem(LocalRecoveryReadOnlyFilesystem):
+        def inspect(self, path):
+            if Path(path) == lock_path:
+                raise AssertionError("final-only observation inspected lock")
+            return super().inspect(path)
+    from engine.storage.cache_recovery import _observe_final_component
+    final = _observe_final_component(request, filesystem=NoLockFilesystem())
+    assert final.classification is FinalRecoveryState.FINAL_ABSENT
+
+
+def test_step5e2_final_unstable_uses_step5b_snapshot_semantics(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request)
+    final_path = derive_final_entry_path(
+        request.cache_root.resolved_path, request.namespace, request.cache_key
+    )
+    final_path.parent.mkdir(parents=True); os.rename(staged.staging_path, final_path)
+    request = _refresh_root(request)
+    class UnstableFinalFilesystem(LocalRecoveryReadOnlyFilesystem):
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            read = super().read_regular_file_bounded(path, max_bytes=max_bytes)
+            if Path(path).parent == final_path and Path(path).name == "COMPLETE":
+                return replace(read, stable_read=False)
+            return read
+    observed = _observe_recovery_components(
+        request, filesystem=UnstableFinalFilesystem(), lock_clock=_FixedClock()
+    )
+    assert observed.final.classification is FinalRecoveryState.FINAL_UNSTABLE
+
+
+def test_step5e2_staging_io_failure_is_not_invalid_or_incomplete(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    staged = _write_staging(request); request = _refresh_root(request)
+    class FailingStagingFilesystem(LocalRecoveryReadOnlyFilesystem):
+        def inspect(self, path):
+            if Path(path) == staged.staging_path:
+                raise CacheLookupIOError("injected")
+            return super().inspect(path)
+    observed = _observe_recovery_components(
+        request, filesystem=FailingStagingFilesystem(), lock_clock=_FixedClock()
+    )
+    assert observed.staging[0].classification is StagingRecoveryState.STAGING_IO_FAILURE
+
+
+@pytest.mark.parametrize("age,state", [(60, LockRecoveryState.LOCK_ACTIVE), (61, LockRecoveryState.LOCK_STALE)])
+def test_step5e2_lock_active_stale_exact_boundary(tmp_path, age, state):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    _write_lock(request)
+    request = _refresh_root(request)
+    clock = _FixedClock(
+        datetime(2026, 7, 20, 9, 0, tzinfo=timezone.utc)
+        + timedelta(seconds=age)
+    )
+    assert _observe_recovery_components(
+        request, lock_clock=clock
+    ).lock.classification is state
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("malformed", LockRecoveryState.LOCK_MALFORMED),
+    ("unsupported", LockRecoveryState.LOCK_UNSUPPORTED),
+    ("unsafe", LockRecoveryState.LOCK_UNSAFE),
+    ("identity", LockRecoveryState.LOCK_IDENTITY_CONFLICT),
+    ("timestamp", LockRecoveryState.LOCK_TIMESTAMP_INVALID),
+])
+def test_step5e2_lock_rejection_mapping(tmp_path, kind, expected):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    if kind == "unsupported":
+        lock = _write_lock(request, version=2)
+    elif kind == "identity":
+        lock = _write_lock(request, digest="b" * 64)
+    elif kind == "timestamp":
+        lock = _write_lock(request, heartbeat="2026-07-20T09:02:00Z")
+    else:
+        lock = _write_lock(request)
+        lock.unlink()
+        if kind == "malformed":
+            lock.write_bytes(b"{")
+        else:
+            lock.symlink_to(tmp_path / "outside")
+    request = _refresh_root(request)
+    assert _observe_recovery_components(
+        request, lock_clock=_FixedClock()
+    ).lock.classification is expected
+
+
+def test_step5e2_lock_io_and_instability_mapping(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    lock = _write_lock(request); request = _refresh_root(request)
+    class FailingLockFilesystem(LocalRecoveryReadOnlyFilesystem):
+        unstable = False
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            if Path(path) == lock:
+                if self.unstable:
+                    lock.unlink(); lock.write_bytes(b"replacement")
+                    return super().read_regular_file_bounded(lock, max_bytes=max_bytes)
+                raise CacheLookupIOError("injected")
+            return super().read_regular_file_bounded(path, max_bytes=max_bytes)
+    filesystem = FailingLockFilesystem()
+    assert _observe_recovery_components(
+        request, filesystem=filesystem, lock_clock=_FixedClock()
+    ).lock.classification is LockRecoveryState.LOCK_IO_FAILURE
+    filesystem.unstable = True
+    # Replacement with malformed bytes is a deterministic malformed observation;
+    # inject stable-read failure directly for the instability classification.
+    from engine.storage.cache_lookup import BoundedFileRead
+    original = LocalRecoveryReadOnlyFilesystem().read_regular_file_bounded(lock, max_bytes=16 * 1024)
+    filesystem.read_regular_file_bounded = lambda path, max_bytes: replace(original, stable_read=False)
+    assert _observe_recovery_components(
+        request, filesystem=filesystem, lock_clock=_FixedClock()
+    ).lock.classification is LockRecoveryState.LOCK_UNSTABLE
+
+
+def test_step5e2_component_pipeline_remains_uncomposed_and_read_only(tmp_path):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    observed = _observe_recovery_components(request, lock_clock=_FixedClock())
+    assert observed.status is None and observed.reason is None
+    public = {name for name in dir(RecoveryReadOnlyFilesystem) if not name.startswith("_")}
+    assert not public & {"write", "create", "mkdir", "fsync", "rename", "replace", "unlink", "chmod", "promote", "cleanup"}

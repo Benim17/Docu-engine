@@ -17,17 +17,40 @@ from .cache_keys import CacheKey
 from .cache_lookup import (
     BoundedFileRead,
     CacheArtifactExpectation,
+    CacheLookupFilesystemError,
+    CacheLookupIOError,
     CacheLookupExpectation,
+    CacheLookupPermissionError,
+    CacheLookupReason,
+    CacheLookupRequest,
+    CacheLookupStatus,
     CacheLookupVerificationPolicy,
     FileIdentity,
     FilesystemObjectType,
     LocalReadOnlyCacheFilesystem,
     LockObservationPolicy,
+    LockObservationClock,
     ProducerPayloadExpectation,
+    SYSTEM_LOCK_OBSERVATION_CLOCK,
     SymlinkRejectedError,
     UnstableFilesystemObjectError,
     UnsupportedFilesystemObjectError,
     ValidatedCacheRoot,
+    _CacheDocumentClassification,
+    _CacheDocumentName,
+    _FinalEntryStructureClassification,
+    _LockObservationClassification,
+    _PayloadValidationClassification,
+    _StableSnapshotClassification,
+    _capture_entry_snapshot,
+    _inspect_final_entry_structure,
+    _observe_final_cache_entry,
+    _observe_matching_lock,
+    _read_and_parse_cache_document,
+    _read_and_parse_final_entry_documents,
+    _validate_final_entry_document_integrity,
+    _validate_final_entry_payload,
+    _validate_stable_entry_snapshot,
 )
 from .persistent_cache import (
     CacheNamespace,
@@ -83,6 +106,39 @@ class RecoverySubject(str, Enum):
     STAGING = "staging"
     FINAL = "final"
     LOCK = "lock"
+
+
+class StagingRecoveryState(str, Enum):
+    STAGING_ABSENT = "staging_absent"
+    STAGING_COMPLETE_VALID = "staging_complete_valid"
+    STAGING_INCOMPLETE = "staging_incomplete"
+    STAGING_INVALID = "staging_invalid"
+    STAGING_UNSUPPORTED = "staging_unsupported"
+    STAGING_UNSAFE = "staging_unsafe"
+    STAGING_UNSTABLE = "staging_unstable"
+    STAGING_IO_FAILURE = "staging_io_failure"
+
+
+class FinalRecoveryState(str, Enum):
+    FINAL_ABSENT = "final_absent"
+    FINAL_VALID = "final_valid"
+    FINAL_INVALID = "final_invalid"
+    FINAL_UNSUPPORTED = "final_unsupported"
+    FINAL_UNSAFE = "final_unsafe"
+    FINAL_UNSTABLE = "final_unstable"
+
+
+class LockRecoveryState(str, Enum):
+    LOCK_ABSENT = "lock_absent"
+    LOCK_ACTIVE = "lock_active"
+    LOCK_STALE = "lock_stale"
+    LOCK_MALFORMED = "lock_malformed"
+    LOCK_UNSUPPORTED = "lock_unsupported"
+    LOCK_UNSAFE = "lock_unsafe"
+    LOCK_UNSTABLE = "lock_unstable"
+    LOCK_IO_FAILURE = "lock_io_failure"
+    LOCK_IDENTITY_CONFLICT = "lock_identity_conflict"
+    LOCK_TIMESTAMP_INVALID = "lock_timestamp_invalid"
 
 
 @dataclass(frozen=True)
@@ -155,39 +211,45 @@ class CacheRecoveryInspectionRequest:
 class StagingRecoveryObservation:
     candidate_index: int
     relative_contract_path: str
-    classification: str | None = None
+    classification: StagingRecoveryState | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.candidate_index, bool) or self.candidate_index < 0:
             raise ValueError("candidate_index must be non-negative.")
         if not self.relative_contract_path or Path(self.relative_contract_path).is_absolute():
             raise ValueError("staging observation path must be root-relative.")
-        if self.classification is not None:
-            raise ValueError("Step 5E1 does not classify staging observations.")
+        if self.classification is not None and not isinstance(
+            self.classification, StagingRecoveryState
+        ):
+            raise TypeError("classification must be a StagingRecoveryState or None.")
 
 
 @dataclass(frozen=True)
 class FinalRecoveryObservation:
     relative_contract_path: str
-    classification: str | None = None
+    classification: FinalRecoveryState | None = None
 
     def __post_init__(self) -> None:
         if not self.relative_contract_path or Path(self.relative_contract_path).is_absolute():
             raise ValueError("final observation path must be root-relative.")
-        if self.classification is not None:
-            raise ValueError("Step 5E1 does not classify final observations.")
+        if self.classification is not None and not isinstance(
+            self.classification, FinalRecoveryState
+        ):
+            raise TypeError("classification must be a FinalRecoveryState or None.")
 
 
 @dataclass(frozen=True)
 class LockRecoveryObservation:
     relative_contract_path: str
-    classification: str | None = None
+    classification: LockRecoveryState | None = None
 
     def __post_init__(self) -> None:
         if not self.relative_contract_path or Path(self.relative_contract_path).is_absolute():
             raise ValueError("lock observation path must be root-relative.")
-        if self.classification is not None:
-            raise ValueError("Step 5E1 does not classify lock observations.")
+        if self.classification is not None and not isinstance(
+            self.classification, LockRecoveryState
+        ):
+            raise TypeError("classification must be a LockRecoveryState or None.")
 
 
 @dataclass(frozen=True)
@@ -219,6 +281,7 @@ class _BoundedDirectoryListing:
 class RecoveryReadOnlyFilesystem(Protocol):
     def inspect(self, path: str | Path) -> FileIdentity: ...
     def resolve(self, path: str | Path) -> Path: ...
+    def list_directory(self, path: str | Path) -> tuple[str, ...]: ...
     def read_regular_file_bounded(
         self, path: str | Path, *, max_bytes: int
     ) -> BoundedFileRead: ...
@@ -469,4 +532,265 @@ def _prepare_recovery_inspection(
         staging_namespace,
         candidates,
         observation,
+    )
+
+
+_UNSUPPORTED_DOCUMENTS = frozenset(
+    classification
+    for classification in _CacheDocumentClassification
+    if classification.name.startswith("UNSUPPORTED_")
+)
+
+
+def _lookup_request(request: CacheRecoveryInspectionRequest) -> CacheLookupRequest:
+    return CacheLookupRequest(
+        request.cache_root,
+        request.namespace,
+        request.cache_key,
+        request.expectation,
+        request.artifact_expectation,
+        request.payload_expectation,
+        request.lookup_policy,
+        request.lock_observation_policy,
+    )
+
+
+def _observe_final_component(
+    request: CacheRecoveryInspectionRequest,
+    *,
+    filesystem: RecoveryReadOnlyFilesystem,
+) -> FinalRecoveryObservation:
+    result = _observe_final_cache_entry(
+        _lookup_request(request), filesystem=filesystem
+    )
+    if result.status is CacheLookupStatus.MISS:
+        state = FinalRecoveryState.FINAL_ABSENT
+    elif result.status is CacheLookupStatus.HIT:
+        state = FinalRecoveryState.FINAL_VALID
+    elif result.status is CacheLookupStatus.UNSUPPORTED_VERSION:
+        state = FinalRecoveryState.FINAL_UNSUPPORTED
+    elif result.status is CacheLookupStatus.UNSAFE_PATH:
+        state = FinalRecoveryState.FINAL_UNSAFE
+    elif result.reason is CacheLookupReason.UNSTABLE_SNAPSHOT:
+        state = FinalRecoveryState.FINAL_UNSTABLE
+    else:
+        state = FinalRecoveryState.FINAL_INVALID
+    relative = _relative_path(
+        request.cache_root.resolved_path,
+        result.expected_entry_path,
+        request.recovery_policy,
+    )
+    return FinalRecoveryObservation(relative, state)
+
+
+def _incomplete_staging_state(
+    path: Path,
+    names: tuple[str, ...],
+    request: CacheRecoveryInspectionRequest,
+    filesystem: RecoveryReadOnlyFilesystem,
+) -> StagingRecoveryState:
+    expected = {"COMPLETE", "metadata.json", "manifest.json", "payload"}
+    if set(names) - expected or "COMPLETE" in names:
+        return StagingRecoveryState.STAGING_INVALID
+    for name in names:
+        identity = filesystem.inspect(path / name)
+        expected_type = (
+            FilesystemObjectType.DIRECTORY
+            if name == "payload"
+            else FilesystemObjectType.REGULAR_FILE
+        )
+        if identity.object_type is not expected_type:
+            return StagingRecoveryState.STAGING_UNSAFE
+    for document_name in (_CacheDocumentName.METADATA, _CacheDocumentName.MANIFEST):
+        if document_name.value not in names:
+            continue
+        observed = _read_and_parse_cache_document(
+            path,
+            document_name,
+            policy=request.lookup_policy,
+            filesystem=filesystem,
+        )
+        if not observed.stable_read:
+            return StagingRecoveryState.STAGING_UNSTABLE
+        if observed.classification in _UNSUPPORTED_DOCUMENTS:
+            return StagingRecoveryState.STAGING_UNSUPPORTED
+        if observed.classification is not _CacheDocumentClassification.VALID:
+            return StagingRecoveryState.STAGING_INVALID
+    return StagingRecoveryState.STAGING_INCOMPLETE
+
+
+def _observe_staging_candidate(
+    request: CacheRecoveryInspectionRequest,
+    path: Path,
+    *,
+    candidate_index: int,
+    absence_is_stable: bool,
+    filesystem: RecoveryReadOnlyFilesystem,
+) -> StagingRecoveryObservation:
+    relative = _sanitized_staging_relative(request)
+    try:
+        identity = filesystem.inspect(path)
+    except FileNotFoundError:
+        state = (
+            StagingRecoveryState.STAGING_ABSENT
+            if absence_is_stable
+            else StagingRecoveryState.STAGING_UNSTABLE
+        )
+        return StagingRecoveryObservation(candidate_index, relative, state)
+    except (CacheLookupPermissionError, CacheLookupIOError, OSError):
+        return StagingRecoveryObservation(
+            candidate_index, relative, StagingRecoveryState.STAGING_IO_FAILURE
+        )
+    if identity.object_type is not FilesystemObjectType.DIRECTORY:
+        return StagingRecoveryObservation(
+            candidate_index, relative, StagingRecoveryState.STAGING_UNSAFE
+        )
+    try:
+        structure = _inspect_final_entry_structure(path, filesystem=filesystem)
+        if structure.classification is _FinalEntryStructureClassification.UNSAFE_OBJECT:
+            state = StagingRecoveryState.STAGING_UNSAFE
+        elif structure.classification is _FinalEntryStructureClassification.UNEXPECTED_TOP_LEVEL_OBJECT:
+            state = StagingRecoveryState.STAGING_INVALID
+        elif structure.classification is _FinalEntryStructureClassification.INCOMPLETE_ENTRY:
+            state = _incomplete_staging_state(
+                path, structure.observed_names, request, filesystem
+            )
+        elif structure.classification is _FinalEntryStructureClassification.ENTRY_ABSENT:
+            state = StagingRecoveryState.STAGING_UNSTABLE
+        else:
+            before = _capture_entry_snapshot(
+                request.cache_root, path, filesystem=filesystem
+            )
+            documents = _read_and_parse_final_entry_documents(
+                path, policy=request.lookup_policy, filesystem=filesystem
+            )
+            if documents.classification in _UNSUPPORTED_DOCUMENTS:
+                state = StagingRecoveryState.STAGING_UNSUPPORTED
+            elif documents.classification is not _CacheDocumentClassification.VALID:
+                state = StagingRecoveryState.STAGING_INVALID
+            else:
+                integrity = _validate_final_entry_document_integrity(
+                    request.cache_root.resolved_path,
+                    path,
+                    documents,
+                    cache_key=request.cache_key,
+                    namespace=request.namespace,
+                    expectation=request.expectation,
+                    artifact_expectation=request.artifact_expectation,
+                    expected_entry_path=path,
+                )
+                if integrity.classification.name != "VALID":
+                    state = StagingRecoveryState.STAGING_INVALID
+                else:
+                    payload = _validate_final_entry_payload(
+                        path,
+                        integrity,
+                        payload_expectation=request.payload_expectation,
+                        policy=request.lookup_policy,
+                        filesystem=filesystem,
+                    )
+                    if payload.classification is _PayloadValidationClassification.UNSAFE_OBJECT:
+                        state = StagingRecoveryState.STAGING_UNSAFE
+                    elif payload.classification is _PayloadValidationClassification.PAYLOAD_READ_UNSTABLE:
+                        state = StagingRecoveryState.STAGING_UNSTABLE
+                    elif payload.classification is not _PayloadValidationClassification.VALID:
+                        state = StagingRecoveryState.STAGING_INVALID
+                    else:
+                        stable = _validate_stable_entry_snapshot(
+                            request.cache_root,
+                            path,
+                            before,
+                            documents,
+                            payload,
+                            filesystem=filesystem,
+                            observer=None,
+                        )
+                        state = (
+                            StagingRecoveryState.STAGING_COMPLETE_VALID
+                            if stable.classification
+                            is _StableSnapshotClassification.VALID
+                            else StagingRecoveryState.STAGING_UNSTABLE
+                        )
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+        state = StagingRecoveryState.STAGING_UNSAFE
+    except (FileNotFoundError, UnstableFilesystemObjectError):
+        state = StagingRecoveryState.STAGING_UNSTABLE
+    except (CacheLookupPermissionError, CacheLookupIOError, OSError):
+        state = StagingRecoveryState.STAGING_IO_FAILURE
+    return StagingRecoveryObservation(candidate_index, relative, state)
+
+
+_LOCK_STATE_MAP = {
+    _LockObservationClassification.ABSENT: LockRecoveryState.LOCK_ABSENT,
+    _LockObservationClassification.ACTIVE: LockRecoveryState.LOCK_ACTIVE,
+    _LockObservationClassification.STALE: LockRecoveryState.LOCK_STALE,
+    _LockObservationClassification.MALFORMED_LOCK: LockRecoveryState.LOCK_MALFORMED,
+    _LockObservationClassification.UNSUPPORTED_LOCK_VERSION: LockRecoveryState.LOCK_UNSUPPORTED,
+    _LockObservationClassification.UNSAFE_OBJECT: LockRecoveryState.LOCK_UNSAFE,
+    _LockObservationClassification.UNSTABLE_SNAPSHOT: LockRecoveryState.LOCK_UNSTABLE,
+    _LockObservationClassification.IO_FAILURE: LockRecoveryState.LOCK_IO_FAILURE,
+    _LockObservationClassification.LOCK_IDENTITY_CONFLICT: LockRecoveryState.LOCK_IDENTITY_CONFLICT,
+    _LockObservationClassification.LOCK_TIMESTAMP_INVALID: LockRecoveryState.LOCK_TIMESTAMP_INVALID,
+}
+
+
+def _observe_lock_component(
+    request: CacheRecoveryInspectionRequest,
+    *,
+    filesystem: RecoveryReadOnlyFilesystem,
+    lock_clock: LockObservationClock,
+) -> LockRecoveryObservation:
+    lock = _observe_matching_lock(
+        request.cache_root,
+        request.namespace,
+        request.cache_key,
+        policy=request.lock_observation_policy,
+        clock=lock_clock,
+        filesystem=filesystem,
+    )
+    relative = _relative_path(
+        request.cache_root.resolved_path,
+        lock.lock_path,
+        request.recovery_policy,
+    )
+    return LockRecoveryObservation(relative, _LOCK_STATE_MAP[lock.classification])
+
+
+def _observe_recovery_components(
+    request: CacheRecoveryInspectionRequest,
+    *,
+    filesystem: RecoveryReadOnlyFilesystem = DEFAULT_RECOVERY_READ_ONLY_FILESYSTEM,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+) -> CacheRecoveryObservation:
+    """Privately observe components without composing lifecycle status or diagnostics."""
+
+    traversal = _prepare_recovery_inspection(request, filesystem=filesystem)
+    if traversal.staging_candidate_paths:
+        staging = tuple(
+            _observe_staging_candidate(
+                request,
+                path,
+                candidate_index=index,
+                absence_is_stable=request.known_writer_token is not None,
+                filesystem=filesystem,
+            )
+            for index, path in enumerate(traversal.staging_candidate_paths)
+        )
+    else:
+        staging = (
+            StagingRecoveryObservation(
+                0,
+                _sanitized_staging_relative(request),
+                StagingRecoveryState.STAGING_ABSENT,
+            ),
+        )
+    final = _observe_final_component(request, filesystem=filesystem)
+    lock = _observe_lock_component(
+        request, filesystem=filesystem, lock_clock=lock_clock
+    )
+    return CacheRecoveryObservation(
+        traversal.entry_digest,
+        staging,
+        final,
+        lock,
     )

@@ -1403,6 +1403,7 @@ def _validate_final_entry_document_integrity(
     namespace: CacheNamespace,
     expectation: CacheLookupExpectation,
     artifact_expectation: _CacheArtifactExpectation | None = None,
+    expected_entry_path: str | Path | None = None,
 ) -> _FinalEntryDocumentIntegrityObservation:
     """Validate Step 5B2C identity and document integrity without payload access."""
 
@@ -1454,7 +1455,11 @@ def _validate_final_entry_document_integrity(
         )
 
     expected_digest = derive_entry_digest(cache_key)
-    expected_path = derive_final_entry_path(cache_root, namespace, cache_key)
+    expected_path = (
+        derive_final_entry_path(cache_root, namespace, cache_key)
+        if expected_entry_path is None
+        else Path(expected_entry_path)
+    )
     reconstructed_digest = derive_entry_digest(observed.cache_key.to_cache_key())
     if (
         Path(entry_path) != expected_path
@@ -2296,14 +2301,15 @@ def _diagnostic_for_reason(reason: CacheLookupReason) -> CacheLookupDiagnostic:
     return CacheLookupDiagnostic(code, subject)
 
 
-def lookup_cache_entry(
+def _lookup_cache_entry_impl(
     request: CacheLookupRequest,
     *,
     filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
     lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
     observer: CacheLookupObserver | None = None,
+    observe_lock_when_final_absent: bool,
 ) -> ReadOnlyCacheLookupResult:
-    """Perform one contract-complete, read-only Step 5B cache lookup."""
+    """Shared Step 5B validator with an internal final-only observation mode."""
 
     if not isinstance(request, CacheLookupRequest):
         raise TypeError("request must be a CacheLookupRequest.")
@@ -2383,6 +2389,12 @@ def lookup_cache_entry(
         return fail(CacheLookupReason.IO_FAILURE, CacheVerificationLevel.NONE)
 
     if structure.classification is _FinalEntryStructureClassification.ENTRY_ABSENT:
+        if not observe_lock_when_final_absent:
+            return finish(
+                CacheLookupStatus.MISS,
+                None,
+                CacheVerificationLevel.NONE,
+            )
         try:
             lock = _observe_matching_lock(
                 root, request.namespace, request.cache_key,
@@ -2479,4 +2491,38 @@ def lookup_cache_entry(
     return finish(
         CacheLookupStatus.HIT, None, CacheVerificationLevel.FULL_PAYLOAD_SHA256,
         validated=validated, fully_hashed=True,
+    )
+
+
+def _observe_final_cache_entry(
+    request: CacheLookupRequest,
+    *,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> ReadOnlyCacheLookupResult:
+    """Validate only the derived final entry without observing its matching lock."""
+
+    return _lookup_cache_entry_impl(
+        request,
+        filesystem=filesystem,
+        lock_clock=SYSTEM_LOCK_OBSERVATION_CLOCK,
+        observer=None,
+        observe_lock_when_final_absent=False,
+    )
+
+
+def lookup_cache_entry(
+    request: CacheLookupRequest,
+    *,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+    observer: CacheLookupObserver | None = None,
+) -> ReadOnlyCacheLookupResult:
+    """Perform one contract-complete, read-only Step 5B cache lookup."""
+
+    return _lookup_cache_entry_impl(
+        request,
+        filesystem=filesystem,
+        lock_clock=lock_clock,
+        observer=observer,
+        observe_lock_when_final_absent=True,
     )
