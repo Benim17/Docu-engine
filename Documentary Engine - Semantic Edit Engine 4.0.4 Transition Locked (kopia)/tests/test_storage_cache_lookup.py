@@ -11,8 +11,10 @@ import pytest
 from engine.storage.cache_keys import CacheKey
 from engine.storage.persistent_cache import (
     CacheArtifactMetadata,
+    CacheEntryContractError,
     CacheEntryMetadata,
     CacheKeyReference,
+    CacheLookupExpectation,
     CacheNamespace,
     CacheProducerMetadata,
     CacheRuntimeFingerprint,
@@ -21,6 +23,7 @@ from engine.storage.persistent_cache import (
     PayloadManifestRecord,
     canonical_json_bytes,
     derive_entry_digest,
+    derive_final_entry_path,
 )
 
 from engine.storage.cache_lookup import (
@@ -48,10 +51,16 @@ from engine.storage.cache_lookup import (
     ValidatedCacheRoot,
     _FinalEntryStructureClassification,
     _CacheDocumentClassification,
+    _CacheDocumentIntegrityClassification,
     _CacheDocumentName,
+    _CacheArtifactExpectation,
+    _CacheVerificationLevel,
+    _ObservedCacheEntryMetadataV1,
     _inspect_final_entry_structure,
+    _parse_observed_cache_entry_metadata_v1,
     _read_and_parse_cache_document,
     _read_and_parse_final_entry_documents,
+    _validate_final_entry_document_integrity,
 )
 
 
@@ -730,16 +739,9 @@ def _document_dict(name):
     }[name]
 
 
-@pytest.mark.parametrize(
-    ("name", "model_type"),
-    [
-        (_CacheDocumentName.COMPLETE, CompletenessMarker),
-        (_CacheDocumentName.METADATA, CacheEntryMetadata),
-        (_CacheDocumentName.MANIFEST, PayloadManifest),
-    ],
-)
-def test_internal_document_reader_parses_each_canonical_model_and_preserves_bytes(
-    tmp_path, name, model_type
+@pytest.mark.parametrize("name", tuple(_CacheDocumentName))
+def test_internal_document_reader_parses_each_canonical_document_and_preserves_bytes(
+    tmp_path, name
 ):
     entry = _make_complete_entry(tmp_path / "entry")
     documents, _ = _write_valid_documents(entry)
@@ -749,7 +751,17 @@ def test_internal_document_reader_parses_each_canonical_model_and_preserves_byte
     )
 
     assert observation.classification is _CacheDocumentClassification.VALID
-    assert isinstance(observation.model, model_type)
+    if name is _CacheDocumentName.METADATA:
+        assert observation.model is None
+        assert isinstance(observation.observed_metadata, _ObservedCacheEntryMetadataV1)
+    else:
+        assert isinstance(
+            observation.model,
+            CompletenessMarker
+            if name is _CacheDocumentName.COMPLETE
+            else PayloadManifest,
+        )
+        assert observation.observed_metadata is None
     assert observation.stored_bytes == documents[name]
     assert observation.stable_read
 
@@ -764,7 +776,8 @@ def test_internal_document_pipeline_reads_all_three_in_order_and_preserves_model
 
     assert observation.classification is _CacheDocumentClassification.VALID
     assert observation.complete.model == models[0]
-    assert observation.metadata.model == models[1]
+    assert observation.metadata.model is None
+    assert observation.metadata.observed_metadata.to_dict() == models[1].to_dict()
     assert observation.manifest.model == models[2]
     assert observation.complete.stored_bytes == documents[_CacheDocumentName.COMPLETE]
     assert observation.metadata.stored_bytes == documents[_CacheDocumentName.METADATA]
@@ -991,3 +1004,316 @@ def test_internal_document_surface_does_not_add_public_lookup_or_hash_payload():
     assert not hasattr(cache_lookup, "lookup_cache_entry")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
     assert not hasattr(cache_lookup, "hash_payload")
+
+
+def _step5b2c_documents(
+    tmp_path,
+    *,
+    metadata_mutator=None,
+    marker_mutator=None,
+    manifest_mutator=None,
+):
+    cache_key = CacheKey("a" * 64)
+    namespace = CacheNamespace("audio", "transcription.whisper", 3)
+    root = tmp_path / "cache"
+    root.mkdir()
+    entry = derive_final_entry_path(root, namespace, cache_key)
+    entry.mkdir(parents=True)
+    (entry / "payload").mkdir()
+
+    marker, metadata, manifest = _valid_document_models()
+    manifest_data = manifest.to_dict()
+    if manifest_mutator is not None:
+        manifest_mutator(manifest_data)
+    manifest_bytes = canonical_json_bytes(manifest_data)
+    metadata_data = metadata.to_dict()
+    if metadata_mutator is not None:
+        metadata_mutator(metadata_data)
+    metadata_bytes = canonical_json_bytes(metadata_data)
+    marker_data = marker.to_dict()
+    marker_data["metadata_digest"] = (
+        "sha256:" + hashlib.sha256(metadata_bytes).hexdigest()
+    )
+    marker_data["manifest_digest"] = (
+        "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    )
+    if marker_mutator is not None:
+        marker_mutator(marker_data)
+
+    (entry / "COMPLETE").write_bytes(canonical_json_bytes(marker_data))
+    (entry / "metadata.json").write_bytes(metadata_bytes)
+    (entry / "manifest.json").write_bytes(manifest_bytes)
+    documents = _read_and_parse_final_entry_documents(
+        entry,
+        policy=CacheLookupVerificationPolicy(),
+        filesystem=FILESYSTEM,
+    )
+    expectation = CacheLookupExpectation(
+        namespace,
+        namespace.producer_id,
+        namespace.producer_schema_version,
+        metadata.runtime_fingerprint,
+    )
+    return root, entry, cache_key, namespace, expectation, documents
+
+
+def _validate_step5b2c(fixture, *, entry_path=None, expectation=None, artifact=None):
+    root, entry, cache_key, namespace, default_expectation, documents = fixture
+    return _validate_final_entry_document_integrity(
+        root,
+        entry if entry_path is None else entry_path,
+        documents,
+        cache_key=cache_key,
+        namespace=namespace,
+        expectation=default_expectation if expectation is None else expectation,
+        artifact_expectation=artifact,
+    )
+
+
+def test_step5b2c_valid_documents_reach_document_integrity_only(tmp_path):
+    fixture = _step5b2c_documents(tmp_path)
+    result = _validate_step5b2c(fixture)
+
+    assert result.classification is _CacheDocumentIntegrityClassification.VALID
+    assert result.verification_level is _CacheVerificationLevel.DOCUMENT_INTEGRITY
+    assert isinstance(result.metadata, CacheEntryMetadata)
+    assert not result.payload_bytes_fully_hashed
+    assert result.metadata == _valid_document_models()[1]
+
+
+def test_step5b2b_preserves_relationally_invalid_metadata_as_private_observation(
+    tmp_path,
+):
+    fixture = _step5b2c_documents(
+        tmp_path,
+        metadata_mutator=lambda data: data["producer"].update(
+            producer_id="other.producer"
+        ),
+    )
+    documents = fixture[-1]
+
+    assert documents.classification is _CacheDocumentClassification.VALID
+    assert documents.metadata.model is None
+    assert isinstance(
+        documents.metadata.observed_metadata, _ObservedCacheEntryMetadataV1
+    )
+    assert documents.metadata.observed_metadata.producer.producer_id == "other.producer"
+    with pytest.raises(CacheEntryContractError, match="IDs"):
+        documents.metadata.observed_metadata.to_strict_metadata()
+
+
+def test_step5b2b_private_observation_round_trips_exact_canonical_metadata(tmp_path):
+    fixture = _step5b2c_documents(tmp_path)
+    metadata = fixture[-1].metadata
+    observed = _parse_observed_cache_entry_metadata_v1(metadata.stored_bytes)
+
+    assert observed.canonical_bytes() == metadata.stored_bytes
+    assert observed.to_strict_metadata() == _valid_document_models()[1]
+
+
+@pytest.mark.parametrize(
+    "fixture_change",
+    [
+        "path",
+        "shard",
+        "metadata_entry_digest",
+        "complete_entry_digest",
+        "cache_key",
+        "namespace",
+    ],
+)
+def test_step5b2c_entry_identity_conflicts_take_locked_precedence(
+    tmp_path, fixture_change
+):
+    metadata_mutator = None
+    marker_mutator = None
+    entry_path = None
+    if fixture_change == "metadata_entry_digest":
+        metadata_mutator = lambda data: data.update(entry_digest="b" * 64)
+    elif fixture_change == "complete_entry_digest":
+        marker_mutator = lambda data: data.update(entry_digest="b" * 64)
+    elif fixture_change == "cache_key":
+        metadata_mutator = lambda data: data["cache_key"].update(
+            canonical_value=str(CacheKey("c" * 64))
+        )
+    elif fixture_change == "namespace":
+        def metadata_mutator(data):
+            data["namespace"]["domain"] = "video"
+
+    fixture = _step5b2c_documents(
+        tmp_path,
+        metadata_mutator=metadata_mutator,
+        marker_mutator=marker_mutator,
+    )
+    if fixture_change == "path":
+        entry_path = fixture[1].parent / ("f" * 64)
+    elif fixture_change == "shard":
+        entry_path = fixture[1].parent.parent / "ff" / fixture[1].name
+
+    result = _validate_step5b2c(fixture, entry_path=entry_path)
+    assert (
+        result.classification
+        is _CacheDocumentIntegrityClassification.ENTRY_IDENTITY_CONFLICT
+    )
+    assert result.verification_level is _CacheVerificationLevel.CANONICAL_DOCUMENTS
+    assert result.metadata is None
+
+
+@pytest.mark.parametrize("field", ["producer_id", "producer_schema_version"])
+def test_step5b2c_namespace_producer_conflicts_remain_precise(tmp_path, field):
+    def change(data):
+        data["producer"][field] = (
+            "other.producer" if field == "producer_id" else 4
+        )
+
+    result = _validate_step5b2c(
+        _step5b2c_documents(tmp_path, metadata_mutator=change)
+    )
+    assert (
+        result.classification
+        is _CacheDocumentIntegrityClassification.NAMESPACE_PRODUCER_CONFLICT
+    )
+
+
+def test_step5b2c_runtime_fingerprint_uses_exact_step5a_equality(tmp_path):
+    fixture = _step5b2c_documents(tmp_path)
+    namespace = fixture[3]
+    mismatch = CacheLookupExpectation(
+        namespace,
+        namespace.producer_id,
+        namespace.producer_schema_version,
+        CacheRuntimeFingerprint(1, {"model": "small"}),
+    )
+
+    result = _validate_step5b2c(fixture, expectation=mismatch)
+    assert (
+        result.classification
+        is _CacheDocumentIntegrityClassification.RUNTIME_FINGERPRINT_MISMATCH
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        _CacheArtifactExpectation("audio", 1),
+        _CacheArtifactExpectation("transcript", 2),
+        _CacheArtifactExpectation("transcript", 1, "other-logical-id"),
+    ],
+)
+def test_step5b2c_rejects_explicit_artifact_expectation_mismatches(
+    tmp_path, artifact
+):
+    result = _validate_step5b2c(
+        _step5b2c_documents(tmp_path), artifact=artifact
+    )
+    assert result.classification is _CacheDocumentIntegrityClassification.ARTIFACT_MISMATCH
+
+
+def test_step5b2c_accepts_different_logical_id_when_not_explicitly_expected(tmp_path):
+    fixture = _step5b2c_documents(
+        tmp_path,
+        metadata_mutator=lambda data: data["artifact"].update(
+            logical_id="different-logical-id"
+        ),
+    )
+    result = _validate_step5b2c(
+        fixture,
+        artifact=_CacheArtifactExpectation("transcript", 1),
+    )
+
+    assert result.classification is _CacheDocumentIntegrityClassification.VALID
+
+
+@pytest.mark.parametrize(
+    ("target", "classification"),
+    [
+        ("metadata_manifest", _CacheDocumentIntegrityClassification.MANIFEST_DIGEST_MISMATCH),
+        ("complete_manifest", _CacheDocumentIntegrityClassification.MANIFEST_DIGEST_MISMATCH),
+        ("complete_metadata", _CacheDocumentIntegrityClassification.METADATA_DIGEST_MISMATCH),
+    ],
+)
+def test_step5b2c_validates_exact_stored_document_digests(
+    tmp_path, target, classification
+):
+    metadata_mutator = None
+    marker_mutator = None
+    if target == "metadata_manifest":
+        metadata_mutator = lambda data: data.update(
+            payload_manifest_digest="sha256:" + "d" * 64
+        )
+    elif target == "complete_manifest":
+        marker_mutator = lambda data: data.update(
+            manifest_digest="sha256:" + "d" * 64
+        )
+    else:
+        marker_mutator = lambda data: data.update(
+            metadata_digest="sha256:" + "d" * 64
+        )
+
+    result = _validate_step5b2c(
+        _step5b2c_documents(
+            tmp_path,
+            metadata_mutator=metadata_mutator,
+            marker_mutator=marker_mutator,
+        )
+    )
+    assert result.classification is classification
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("payload_file_count", 2), ("payload_total_bytes", 8)],
+)
+def test_step5b2c_reuses_step5a_summary_helper_for_manifest_consistency(
+    tmp_path, field, value
+):
+    result = _validate_step5b2c(
+        _step5b2c_documents(
+            tmp_path,
+            metadata_mutator=lambda data: data.update({field: value}),
+        )
+    )
+    assert (
+        result.classification
+        is _CacheDocumentIntegrityClassification.METADATA_MANIFEST_SUMMARY_MISMATCH
+    )
+    assert result.metadata is None
+    assert not result.payload_bytes_fully_hashed
+
+
+def test_step5b2c_summary_integrity_precedes_runtime_expectation(tmp_path):
+    fixture = _step5b2c_documents(
+        tmp_path,
+        metadata_mutator=lambda data: data.update(payload_file_count=2),
+    )
+    namespace = fixture[3]
+    runtime_mismatch = CacheLookupExpectation(
+        namespace,
+        namespace.producer_id,
+        namespace.producer_schema_version,
+        CacheRuntimeFingerprint(1, {"model": "small"}),
+    )
+
+    result = _validate_step5b2c(fixture, expectation=runtime_mismatch)
+    assert (
+        result.classification
+        is _CacheDocumentIntegrityClassification.METADATA_MANIFEST_SUMMARY_MISMATCH
+    )
+
+
+def test_step5b2c_never_accesses_payload_locks_or_public_lookup(tmp_path):
+    import engine.storage.cache_lookup as cache_lookup
+
+    fixture = _step5b2c_documents(tmp_path)
+    payload = fixture[1] / "payload" / "must-not-read"
+    payload.write_bytes(b"payload")
+    before = (payload.read_bytes(), payload.stat().st_mtime_ns)
+    result = _validate_step5b2c(fixture)
+    after = (payload.read_bytes(), payload.stat().st_mtime_ns)
+
+    assert result.classification is _CacheDocumentIntegrityClassification.VALID
+    assert before == after
+    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert not hasattr(cache_lookup, "HIT")
+    assert not hasattr(cache_lookup, "MISS")
+    assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")

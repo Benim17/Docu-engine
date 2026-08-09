@@ -588,13 +588,31 @@ class CacheEntryContract:
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, CacheEntryMetadata) or not isinstance(self.manifest, PayloadManifest):
             raise CacheEntryContractError("CacheEntryContract requires metadata and manifest models.")
-        if self.metadata.payload_file_count != len(self.manifest.files):
-            raise CacheEntryContractError("metadata payload count does not match manifest.")
-        if self.metadata.payload_total_bytes != sum(item.size_bytes for item in self.manifest.files):
-            raise CacheEntryContractError("metadata payload byte total does not match manifest.")
+        _validate_payload_summary(
+            self.metadata.payload_file_count,
+            self.metadata.payload_total_bytes,
+            self.manifest,
+        )
         expected_digest = "sha256:" + hashlib.sha256(self.manifest.canonical_bytes()).hexdigest()
         if self.metadata.payload_manifest_digest != expected_digest:
             raise CacheEntryContractError("metadata manifest digest does not match manifest bytes.")
+
+
+def _validate_payload_summary(
+    payload_file_count: int,
+    payload_total_bytes: int,
+    manifest: PayloadManifest,
+) -> None:
+    """Validate the Step 5A metadata/manifest count and byte-total invariants."""
+
+    _nonnegative_int(payload_file_count, "payload_file_count")
+    _nonnegative_int(payload_total_bytes, "payload_total_bytes")
+    if not isinstance(manifest, PayloadManifest):
+        raise CacheEntryContractError("manifest must be a PayloadManifest.")
+    if payload_file_count != len(manifest.files):
+        raise CacheEntryContractError("metadata payload count does not match manifest.")
+    if payload_total_bytes != sum(item.size_bytes for item in manifest.files):
+        raise CacheEntryContractError("metadata payload byte total does not match manifest.")
 
 
 class CacheLookupStatus(str, Enum):

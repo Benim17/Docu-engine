@@ -35,12 +35,12 @@ The current major workstream is the **Cache and Storage Manager**, within the
 Cache & Storage / Housekeeping Foundation phase.
 
 - **Current phase:** Cache & Storage / Housekeeping Foundation
-- **Current task:** Step 5B2C — Identity, expectations, and cross-document integrity validation
+- **Current task:** Step 5B3 — Payload validation
 - **Status:** NOT STARTED — NEXT APPROVED IMPLEMENTATION STEP
-- **Next task:** Step 5B3 — Payload validation
+- **Next task:** Step 5B4 — Stable snapshot, diagnostics, and read-only lock observation
 - **Current branch:** `feature/cache-storage-foundation`
 
-Step 5B2C is the next approved implementation step. It has not begun.
+Step 5B3 is the next approved implementation step. It has not begun.
 
 ## Cache & Storage / Housekeeping Foundation
 
@@ -60,7 +60,7 @@ Internal implementation slices:
 
 - [x] Step 5B2A — Final-entry structure validation
 - [x] Step 5B2B — Canonical document reads/parsing and unsupported-version classification
-- [ ] Step 5B2C — Identity, expectations, and cross-document integrity validation
+- [x] Step 5B2C — Identity, expectations, and cross-document integrity validation
 
 Step 5B2A and Step 5B2B/5B2C helpers remain internal. Contract-complete public
 `MISS` and `LOCKED_OR_IN_PROGRESS` behavior is reserved for Step 5B5.

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import errno
+import hashlib
 import json
 import stat
 from dataclasses import dataclass
@@ -22,10 +23,27 @@ from .persistent_cache import (
     PAYLOAD_MANIFEST_VERSION,
     RUNTIME_FINGERPRINT_SCHEMA_VERSION,
     CacheEntryContractError,
+    CacheArtifactMetadata,
     CacheEntryMetadata,
+    CacheKeyReference,
+    CacheLookupExpectation,
+    CacheNamespace,
+    CacheProducerMetadata,
+    CacheRuntimeFingerprint,
     CompletenessMarker,
     PayloadManifest,
+    _digest,
+    _fields,
+    _nonnegative_int,
+    _object,
+    _timestamp,
+    _validate_payload_summary,
+    canonical_json_bytes,
+    derive_entry_digest,
+    derive_final_entry_path,
+    parse_canonical_json,
 )
+from .cache_keys import CacheKey
 
 
 DEFAULT_MAX_COMPLETE_BYTES = 4 * 1024
@@ -573,6 +591,150 @@ class _CacheDocumentClassification(str, Enum):
     )
 
 
+class _CacheDocumentIntegrityClassification(str, Enum):
+    """Internal Step 5B2C classifications; never public lookup results."""
+
+    VALID = "valid"
+    ENTRY_IDENTITY_CONFLICT = "entry_identity_conflict"
+    CACHE_KEY_CONFLICT = "cache_key_conflict"
+    MANIFEST_DIGEST_MISMATCH = "manifest_digest_mismatch"
+    METADATA_DIGEST_MISMATCH = "metadata_digest_mismatch"
+    METADATA_MANIFEST_SUMMARY_MISMATCH = "metadata_manifest_summary_mismatch"
+    NAMESPACE_PRODUCER_CONFLICT = "namespace_producer_conflict"
+    PRODUCER_MISMATCH = "producer_mismatch"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    ARTIFACT_MISMATCH = "artifact_mismatch"
+    RUNTIME_FINGERPRINT_MISMATCH = "runtime_fingerprint_mismatch"
+
+
+class _CacheVerificationLevel(str, Enum):
+    NONE = "none"
+    STRUCTURE = "structure"
+    CANONICAL_DOCUMENTS = "canonical_documents"
+    DOCUMENT_INTEGRITY = "document_integrity"
+    FULL_PAYLOAD_SHA256 = "full_payload_sha256"
+
+
+@dataclass(frozen=True)
+class _CacheArtifactExpectation:
+    artifact_kind: str
+    artifact_contract_version: int
+    expected_logical_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.artifact_kind, str) or not self.artifact_kind:
+            raise ValueError("artifact_kind must be non-empty text.")
+        if (
+            isinstance(self.artifact_contract_version, bool)
+            or not isinstance(self.artifact_contract_version, int)
+            or self.artifact_contract_version <= 0
+        ):
+            raise ValueError("artifact_contract_version must be a positive integer.")
+        if self.expected_logical_id is not None and (
+            not isinstance(self.expected_logical_id, str)
+            or not self.expected_logical_id
+        ):
+            raise ValueError("expected_logical_id must be non-empty text or None.")
+
+
+@dataclass(frozen=True)
+class _ObservedCacheEntryMetadataV1:
+    """Schema-valid metadata before Step 5A aggregate relational invariants."""
+
+    entry_digest: str
+    cache_key: CacheKeyReference
+    namespace: CacheNamespace
+    artifact: CacheArtifactMetadata
+    producer: CacheProducerMetadata
+    runtime_fingerprint: CacheRuntimeFingerprint
+    created_at_utc: str
+    payload_manifest_digest: str
+    payload_file_count: int
+    payload_total_bytes: int
+    cache_entry_contract_version: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "artifact": self.artifact.to_dict(),
+            "cache_entry_contract_version": self.cache_entry_contract_version,
+            "cache_key": self.cache_key.to_dict(),
+            "created_at_utc": self.created_at_utc,
+            "entry_digest": self.entry_digest,
+            "namespace": self.namespace.to_dict(),
+            "payload_file_count": self.payload_file_count,
+            "payload_manifest_digest": self.payload_manifest_digest,
+            "payload_total_bytes": self.payload_total_bytes,
+            "producer": self.producer.to_dict(),
+            "runtime_fingerprint": self.runtime_fingerprint.to_dict(),
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_dict())
+
+    def to_strict_metadata(self) -> CacheEntryMetadata:
+        return CacheEntryMetadata(
+            self.entry_digest,
+            self.cache_key,
+            self.namespace,
+            self.artifact,
+            self.producer,
+            self.runtime_fingerprint,
+            self.created_at_utc,
+            self.payload_manifest_digest,
+            self.payload_file_count,
+            self.payload_total_bytes,
+            self.cache_entry_contract_version,
+        )
+
+
+def _parse_observed_cache_entry_metadata_v1(
+    stored_bytes: bytes,
+) -> _ObservedCacheEntryMetadataV1:
+    """Reuse Step 5A schema validators without enforcing aggregate relations."""
+
+    data = _object(parse_canonical_json(stored_bytes), "metadata")
+    expected = frozenset(
+        {
+            "cache_entry_contract_version",
+            "entry_digest",
+            "cache_key",
+            "namespace",
+            "artifact",
+            "producer",
+            "runtime_fingerprint",
+            "created_at_utc",
+            "payload_manifest_digest",
+            "payload_file_count",
+            "payload_total_bytes",
+        }
+    )
+    _fields(data, expected, "metadata")
+    _digest(data["entry_digest"], "entry_digest", qualified=False)
+    _timestamp(data["created_at_utc"])
+    _digest(
+        data["payload_manifest_digest"],
+        "payload_manifest_digest",
+        qualified=True,
+    )
+    _nonnegative_int(data["payload_file_count"], "payload_file_count")
+    _nonnegative_int(data["payload_total_bytes"], "payload_total_bytes")
+    return _ObservedCacheEntryMetadataV1(
+        entry_digest=data["entry_digest"],
+        cache_key=CacheKeyReference.from_dict(data["cache_key"]),
+        namespace=CacheNamespace.from_dict(data["namespace"]),
+        artifact=CacheArtifactMetadata.from_dict(data["artifact"]),
+        producer=CacheProducerMetadata.from_dict(data["producer"]),
+        runtime_fingerprint=CacheRuntimeFingerprint.from_dict(
+            data["runtime_fingerprint"]
+        ),
+        created_at_utc=data["created_at_utc"],
+        payload_manifest_digest=data["payload_manifest_digest"],
+        payload_file_count=data["payload_file_count"],
+        payload_total_bytes=data["payload_total_bytes"],
+        cache_entry_contract_version=data["cache_entry_contract_version"],
+    )
+
+
 _CACHE_DOCUMENT_LIMIT_FIELDS = {
     _CacheDocumentName.COMPLETE: "max_complete_bytes",
     _CacheDocumentName.METADATA: "max_metadata_bytes",
@@ -596,6 +758,7 @@ class _CacheDocumentObservation:
     classification: _CacheDocumentClassification
     stored_bytes: bytes | None = None
     model: CompletenessMarker | CacheEntryMetadata | PayloadManifest | None = None
+    observed_metadata: _ObservedCacheEntryMetadataV1 | None = None
     observed_versions: tuple[tuple[str, int], ...] = ()
     stable_read: bool | None = None
 
@@ -606,6 +769,15 @@ class _FinalEntryDocumentsObservation:
     complete: _CacheDocumentObservation
     metadata: _CacheDocumentObservation | None = None
     manifest: _CacheDocumentObservation | None = None
+
+
+@dataclass(frozen=True)
+class _FinalEntryDocumentIntegrityObservation:
+    classification: _CacheDocumentIntegrityClassification
+    verification_level: _CacheVerificationLevel
+    documents: _FinalEntryDocumentsObservation
+    metadata: CacheEntryMetadata | None = None
+    payload_bytes_fully_hashed: bool = False
 
 
 class _VersionProbeError(ValueError):
@@ -743,9 +915,13 @@ def _read_and_parse_cache_document(
             stable_read=read.stable_read,
         )
 
-    model_type = _CACHE_DOCUMENT_MODEL_TYPES[name]
     try:
-        model = model_type.from_json(read.data)
+        if name is _CacheDocumentName.METADATA:
+            observed_metadata = _parse_observed_cache_entry_metadata_v1(read.data)
+            model = None
+        else:
+            observed_metadata = None
+            model = _CACHE_DOCUMENT_MODEL_TYPES[name].from_json(read.data)
     except CacheEntryContractError:
         return _CacheDocumentObservation(
             name,
@@ -759,6 +935,7 @@ def _read_and_parse_cache_document(
         _CacheDocumentClassification.VALID,
         stored_bytes=read.data,
         model=model,
+        observed_metadata=observed_metadata,
         observed_versions=observed_versions,
         stable_read=read.stable_read,
     )
@@ -803,4 +980,143 @@ def _read_and_parse_final_entry_documents(
         complete,
         metadata,
         manifest,
+    )
+
+
+def _validate_final_entry_document_integrity(
+    cache_root: str | Path,
+    entry_path: str | Path,
+    documents: _FinalEntryDocumentsObservation,
+    *,
+    cache_key: CacheKey,
+    namespace: CacheNamespace,
+    expectation: CacheLookupExpectation,
+    artifact_expectation: _CacheArtifactExpectation | None = None,
+) -> _FinalEntryDocumentIntegrityObservation:
+    """Validate Step 5B2C identity and document integrity without payload access."""
+
+    if not isinstance(documents, _FinalEntryDocumentsObservation):
+        raise TypeError("documents must be a _FinalEntryDocumentsObservation.")
+    if documents.classification is not _CacheDocumentClassification.VALID:
+        raise ValueError("documents must have completed Step 5B2B successfully.")
+    if not isinstance(cache_key, CacheKey):
+        raise TypeError("cache_key must be a CacheKey.")
+    if not isinstance(namespace, CacheNamespace):
+        raise TypeError("namespace must be a CacheNamespace.")
+    if not isinstance(expectation, CacheLookupExpectation):
+        raise TypeError("expectation must be a CacheLookupExpectation.")
+    if expectation.namespace != namespace:
+        raise ValueError("expectation namespace must equal the expected namespace.")
+    if artifact_expectation is not None and not isinstance(
+        artifact_expectation, _CacheArtifactExpectation
+    ):
+        raise TypeError("artifact_expectation must be private expectation data or None.")
+
+    complete_observation = documents.complete
+    metadata_observation = documents.metadata
+    manifest_observation = documents.manifest
+    if metadata_observation is None or manifest_observation is None:
+        raise ValueError("valid documents must include metadata and manifest observations.")
+    marker = complete_observation.model
+    observed = metadata_observation.observed_metadata
+    manifest = manifest_observation.model
+    if not isinstance(marker, CompletenessMarker):
+        raise ValueError("valid COMPLETE observation must contain its Step 5A model.")
+    if not isinstance(observed, _ObservedCacheEntryMetadataV1):
+        raise ValueError("valid metadata observation must contain private typed fields.")
+    if not isinstance(manifest, PayloadManifest):
+        raise ValueError("valid manifest observation must contain its Step 5A model.")
+    if metadata_observation.stored_bytes is None or manifest_observation.stored_bytes is None:
+        raise ValueError("valid document observations must retain exact stored bytes.")
+
+    def result(
+        classification: _CacheDocumentIntegrityClassification,
+        *,
+        level: _CacheVerificationLevel = _CacheVerificationLevel.CANONICAL_DOCUMENTS,
+        metadata: CacheEntryMetadata | None = None,
+    ) -> _FinalEntryDocumentIntegrityObservation:
+        return _FinalEntryDocumentIntegrityObservation(
+            classification,
+            level,
+            documents,
+            metadata,
+        )
+
+    expected_digest = derive_entry_digest(cache_key)
+    expected_path = derive_final_entry_path(cache_root, namespace, cache_key)
+    reconstructed_digest = derive_entry_digest(observed.cache_key.to_cache_key())
+    if (
+        Path(entry_path) != expected_path
+        or observed.entry_digest != reconstructed_digest
+        or observed.entry_digest != expected_digest
+        or observed.namespace != namespace
+        or marker.entry_digest != expected_digest
+    ):
+        return result(_CacheDocumentIntegrityClassification.ENTRY_IDENTITY_CONFLICT)
+
+    expected_reference = CacheKeyReference.from_cache_key(cache_key)
+    if observed.cache_key != expected_reference:
+        return result(_CacheDocumentIntegrityClassification.CACHE_KEY_CONFLICT)
+
+    manifest_sha256 = (
+        "sha256:"
+        + hashlib.sha256(manifest_observation.stored_bytes).hexdigest()
+    )
+    metadata_sha256 = (
+        "sha256:"
+        + hashlib.sha256(metadata_observation.stored_bytes).hexdigest()
+    )
+    if (
+        observed.payload_manifest_digest != manifest_sha256
+        or marker.manifest_digest != manifest_sha256
+    ):
+        return result(_CacheDocumentIntegrityClassification.MANIFEST_DIGEST_MISMATCH)
+    if marker.metadata_digest != metadata_sha256:
+        return result(_CacheDocumentIntegrityClassification.METADATA_DIGEST_MISMATCH)
+    try:
+        _validate_payload_summary(
+            observed.payload_file_count,
+            observed.payload_total_bytes,
+            manifest,
+        )
+    except CacheEntryContractError:
+        return result(
+            _CacheDocumentIntegrityClassification.METADATA_MANIFEST_SUMMARY_MISMATCH
+        )
+
+    if (
+        observed.namespace.producer_id != observed.producer.producer_id
+        or observed.namespace.producer_schema_version
+        != observed.producer.producer_schema_version
+    ):
+        return result(_CacheDocumentIntegrityClassification.NAMESPACE_PRODUCER_CONFLICT)
+    if observed.producer.producer_id != expectation.producer_id:
+        return result(_CacheDocumentIntegrityClassification.PRODUCER_MISMATCH)
+    if (
+        observed.producer.producer_schema_version
+        != expectation.producer_schema_version
+    ):
+        return result(_CacheDocumentIntegrityClassification.SCHEMA_MISMATCH)
+
+    if artifact_expectation is not None and (
+        observed.artifact.artifact_kind != artifact_expectation.artifact_kind
+        or observed.artifact.artifact_contract_version
+        != artifact_expectation.artifact_contract_version
+        or (
+            artifact_expectation.expected_logical_id is not None
+            and observed.artifact.logical_id
+            != artifact_expectation.expected_logical_id
+        )
+    ):
+        return result(_CacheDocumentIntegrityClassification.ARTIFACT_MISMATCH)
+    if observed.runtime_fingerprint != expectation.runtime_fingerprint:
+        return result(
+            _CacheDocumentIntegrityClassification.RUNTIME_FINGERPRINT_MISMATCH
+        )
+
+    strict_metadata = observed.to_strict_metadata()
+    return result(
+        _CacheDocumentIntegrityClassification.VALID,
+        level=_CacheVerificationLevel.DOCUMENT_INTEGRITY,
+        metadata=strict_metadata,
     )
