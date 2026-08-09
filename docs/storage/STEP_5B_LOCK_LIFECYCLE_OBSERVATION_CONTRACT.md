@@ -266,6 +266,14 @@ breaking, cleanup, or recovery authority. Informational ownership fields are ret
 solely so that a future reviewed writer/recovery contract can use them without changing
 the observation schema.
 
+Writer-side atomic acquisition, optional explicit heartbeat replacement, ownership
+proof, capability-dependent release or safe lock retention, and staging-to-final
+promotion are now specified by
+`STEP_5D_LOCK_MUTATION_AND_PROMOTION_CONTRACT.md`. A retained lock does not alter this
+contract's present-entry precedence: a valid final entry remains `HIT`. The Step 5D
+contract does not change this document's read-only classifications, freshness
+predicate, absence behavior, or mutation prohibition.
+
 ## 14. Test contract
 
 Future implementation tests must cover:
