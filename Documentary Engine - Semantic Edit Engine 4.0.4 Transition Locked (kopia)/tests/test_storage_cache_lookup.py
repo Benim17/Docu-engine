@@ -29,6 +29,8 @@ from engine.storage.cache_lookup import (
     UnstableFilesystemObjectError,
     UnsupportedFilesystemObjectError,
     ValidatedCacheRoot,
+    _FinalEntryStructureClassification,
+    _inspect_final_entry_structure,
 )
 
 
@@ -468,3 +470,184 @@ def test_initial_directory_absence_remains_file_not_found(tmp_path):
     with pytest.raises(FileNotFoundError):
         adapter.list_directory(tmp_path / "missing")
     assert adapter.inspect_calls == 1
+
+
+def _make_complete_entry(path):
+    path.mkdir()
+    (path / "metadata.json").write_bytes(b"not-read")
+    (path / "manifest.json").write_bytes(b"not-read")
+    (path / "COMPLETE").write_bytes(b"not-read")
+    (path / "payload").mkdir()
+    return path
+
+
+def test_internal_structure_accepts_exact_v1_top_level_and_does_not_read_payload(tmp_path):
+    entry = _make_complete_entry(tmp_path / "entry")
+    nested = entry / "payload" / "unsafe-if-visited"
+    nested.symlink_to(tmp_path / "missing")
+
+    observation = _inspect_final_entry_structure(entry, filesystem=FILESYSTEM)
+
+    assert observation.classification is _FinalEntryStructureClassification.VALID
+    assert observation.observed_names == (
+        "COMPLETE",
+        "manifest.json",
+        "metadata.json",
+        "payload",
+    )
+    assert observation.missing_names == ()
+    assert observation.unexpected_names == ()
+    assert observation.unsafe_names == ()
+
+
+def test_internal_structure_observes_entry_absence_without_public_status(tmp_path):
+    observation = _inspect_final_entry_structure(
+        tmp_path / "absent", filesystem=FILESYSTEM
+    )
+    assert observation.classification is _FinalEntryStructureClassification.ENTRY_ABSENT
+    assert not hasattr(observation, "status")
+
+
+@pytest.mark.parametrize(
+    "missing_name", ["metadata.json", "manifest.json", "COMPLETE", "payload"]
+)
+def test_internal_structure_classifies_each_missing_required_object(tmp_path, missing_name):
+    entry = _make_complete_entry(tmp_path / "entry")
+    target = entry / missing_name
+    target.rmdir() if target.is_dir() else target.unlink()
+
+    observation = _inspect_final_entry_structure(entry, filesystem=FILESYSTEM)
+
+    assert observation.classification is _FinalEntryStructureClassification.INCOMPLETE_ENTRY
+    assert observation.missing_names == (missing_name,)
+
+
+@pytest.mark.parametrize(
+    ("name", "wrong_kind"),
+    [
+        ("metadata.json", "directory"),
+        ("manifest.json", "directory"),
+        ("COMPLETE", "directory"),
+        ("payload", "regular_file"),
+    ],
+)
+def test_internal_structure_classifies_wrong_required_types_as_unsafe(
+    tmp_path, name, wrong_kind
+):
+    entry = _make_complete_entry(tmp_path / "entry")
+    target = entry / name
+    target.rmdir() if target.is_dir() else target.unlink()
+    target.mkdir() if wrong_kind == "directory" else target.write_bytes(b"")
+
+    observation = _inspect_final_entry_structure(entry, filesystem=FILESYSTEM)
+
+    assert observation.classification is _FinalEntryStructureClassification.UNSAFE_OBJECT
+    assert observation.unsafe_names == (name,)
+
+
+@pytest.mark.parametrize("kind", ["regular_file", "directory"])
+def test_internal_structure_classifies_unknown_safe_object(tmp_path, kind):
+    entry = _make_complete_entry(tmp_path / "entry")
+    extra = entry / "extra"
+    extra.write_bytes(b"") if kind == "regular_file" else extra.mkdir()
+
+    observation = _inspect_final_entry_structure(entry, filesystem=FILESYSTEM)
+
+    assert (
+        observation.classification
+        is _FinalEntryStructureClassification.UNEXPECTED_TOP_LEVEL_OBJECT
+    )
+    assert observation.unexpected_names == ("extra",)
+
+
+@pytest.mark.parametrize(
+    "name", ["metadata.json", "manifest.json", "COMPLETE", "payload", "extra"]
+)
+def test_internal_structure_classifies_required_and_unknown_symlinks_as_unsafe(
+    tmp_path, name
+):
+    entry = _make_complete_entry(tmp_path / "entry")
+    target = entry / name
+    if target.exists():
+        target.rmdir() if target.is_dir() else target.unlink()
+    target.symlink_to(tmp_path / "missing")
+
+    observation = _inspect_final_entry_structure(entry, filesystem=FILESYSTEM)
+
+    assert observation.classification is _FinalEntryStructureClassification.UNSAFE_OBJECT
+    assert observation.unsafe_names == (name,)
+
+
+def test_internal_structure_inspects_every_top_level_object_before_unexpected(tmp_path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable")
+    entry = _make_complete_entry(tmp_path / "entry")
+    (entry / "ordinary-extra").write_bytes(b"")
+    os.mkfifo(entry / "unsafe-extra")
+
+    observation = _inspect_final_entry_structure(entry, filesystem=FILESYSTEM)
+
+    assert observation.classification is _FinalEntryStructureClassification.UNSAFE_OBJECT
+    assert observation.unsafe_names == ("unsafe-extra",)
+    assert observation.unexpected_names == ("ordinary-extra", "unsafe-extra")
+
+
+def test_internal_structure_does_not_recurse_scan_siblings_or_inspect_locks(tmp_path):
+    entry = _make_complete_entry(tmp_path / "entry")
+    (entry / "payload" / "nested").mkdir()
+    sibling = tmp_path / "sibling-entry"
+    sibling.mkdir()
+    locks = tmp_path / "locks"
+    locks.mkdir()
+
+    class RecordingFilesystem:
+        def __init__(self):
+            self.inspected = []
+            self.listed = []
+
+        def inspect(self, path):
+            self.inspected.append(Path(path))
+            return FILESYSTEM.inspect(path)
+
+        def resolve(self, path):
+            return FILESYSTEM.resolve(path)
+
+        def list_directory(self, path):
+            self.listed.append(Path(path))
+            return FILESYSTEM.list_directory(path)
+
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            raise AssertionError("structure validation must not read files")
+
+    filesystem = RecordingFilesystem()
+    before = tuple(sorted(tmp_path.rglob("*")))
+    observation = _inspect_final_entry_structure(entry, filesystem=filesystem)
+    after = tuple(sorted(tmp_path.rglob("*")))
+
+    assert observation.classification is _FinalEntryStructureClassification.VALID
+    assert filesystem.listed == [entry]
+    assert set(filesystem.inspected) == {
+        entry,
+        entry / "COMPLETE",
+        entry / "manifest.json",
+        entry / "metadata.json",
+        entry / "payload",
+    }
+    assert sibling not in filesystem.inspected
+    assert locks not in filesystem.inspected
+    assert entry / "payload" / "nested" not in filesystem.inspected
+    assert before == after
+
+
+def test_internal_structure_surface_adds_no_public_lookup_or_mutation_api():
+    import engine.storage.cache_lookup as cache_lookup
+
+    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
+    public = {name for name in dir(ReadOnlyCacheFilesystem) if not name.startswith("_")}
+    assert public == {
+        "inspect",
+        "list_directory",
+        "read_regular_file_bounded",
+        "resolve",
+    }

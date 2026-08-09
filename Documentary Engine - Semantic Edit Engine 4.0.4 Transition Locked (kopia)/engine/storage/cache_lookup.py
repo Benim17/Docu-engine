@@ -1,8 +1,8 @@
-"""Read-only filesystem primitives for persistent cache lookup Step 5B1.
+"""Read-only filesystem primitives and internal cache-entry structure validation.
 
-This module does not interpret cache documents or classify cache entries.  Its
-local adapter exposes metadata inspection, immediate directory listing, path
-resolution, and bounded regular-file reads only.
+This module does not interpret cache documents or expose public lookup
+orchestration.  Its local adapter exposes metadata inspection, immediate
+directory listing, path resolution, and bounded regular-file reads only.
 """
 
 from __future__ import annotations
@@ -419,3 +419,122 @@ class ValidatedCacheRoot:
                 "Lexical and resolved cache roots do not establish one stable identity."
             )
         return cls(lexical, resolved, initial)
+
+
+_EXPECTED_FINAL_ENTRY_OBJECT_TYPES = {
+    "COMPLETE": FilesystemObjectType.REGULAR_FILE,
+    "manifest.json": FilesystemObjectType.REGULAR_FILE,
+    "metadata.json": FilesystemObjectType.REGULAR_FILE,
+    "payload": FilesystemObjectType.DIRECTORY,
+}
+_EXPECTED_FINAL_ENTRY_NAMES = frozenset(_EXPECTED_FINAL_ENTRY_OBJECT_TYPES)
+
+
+class _FinalEntryStructureClassification(str, Enum):
+    """Internal 5B2A observations; these are not public lookup statuses."""
+
+    VALID = "valid"
+    ENTRY_ABSENT = "entry_absent"
+    INCOMPLETE_ENTRY = "incomplete_entry"
+    UNEXPECTED_TOP_LEVEL_OBJECT = "unexpected_top_level_object"
+    UNSAFE_OBJECT = "unsafe_object"
+
+
+@dataclass(frozen=True)
+class _FinalEntryStructureObservation:
+    classification: _FinalEntryStructureClassification
+    observed_names: tuple[str, ...] = ()
+    missing_names: tuple[str, ...] = ()
+    unexpected_names: tuple[str, ...] = ()
+    unsafe_names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "observed_names",
+            "missing_names",
+            "unexpected_names",
+            "unsafe_names",
+        ):
+            values = getattr(self, field_name)
+            if (
+                not isinstance(values, tuple)
+                or any(not isinstance(item, str) or not item for item in values)
+                or values != tuple(sorted(set(values)))
+            ):
+                raise ValueError(f"{field_name} must be sorted unique non-empty names.")
+
+
+def _inspect_final_entry_structure(
+    expected_entry_path: str | Path,
+    *,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> _FinalEntryStructureObservation:
+    """Inspect one expected entry's immediate v1 structure without reading payloads.
+
+    Entry absence is an internal observation only.  It is deliberately not a
+    public ``MISS`` because later orchestration must perform matching-lock
+    observation first.
+    """
+
+    if not isinstance(expected_entry_path, (str, Path)):
+        raise TypeError("expected_entry_path must be a string or Path.")
+    if not isinstance(filesystem, ReadOnlyCacheFilesystem):
+        raise TypeError("filesystem must implement ReadOnlyCacheFilesystem.")
+    entry_path = Path(expected_entry_path)
+
+    try:
+        entry_identity = filesystem.inspect(entry_path)
+    except FileNotFoundError:
+        return _FinalEntryStructureObservation(
+            _FinalEntryStructureClassification.ENTRY_ABSENT
+        )
+
+    if entry_identity.object_type is not FilesystemObjectType.DIRECTORY:
+        return _FinalEntryStructureObservation(
+            _FinalEntryStructureClassification.UNSAFE_OBJECT,
+            unsafe_names=(".",),
+        )
+
+    observed_names = filesystem.list_directory(entry_path)
+    observed_identities = {
+        name: filesystem.inspect(entry_path / name) for name in observed_names
+    }
+
+    unsafe_names = tuple(
+        sorted(
+            name
+            for name, identity in observed_identities.items()
+            if (
+                name in _EXPECTED_FINAL_ENTRY_OBJECT_TYPES
+                and identity.object_type
+                is not _EXPECTED_FINAL_ENTRY_OBJECT_TYPES[name]
+            )
+            or (
+                name not in _EXPECTED_FINAL_ENTRY_NAMES
+                and identity.object_type
+                not in {
+                    FilesystemObjectType.REGULAR_FILE,
+                    FilesystemObjectType.DIRECTORY,
+                }
+            )
+        )
+    )
+    missing_names = tuple(sorted(_EXPECTED_FINAL_ENTRY_NAMES - set(observed_names)))
+    unexpected_names = tuple(sorted(set(observed_names) - _EXPECTED_FINAL_ENTRY_NAMES))
+
+    if unsafe_names:
+        classification = _FinalEntryStructureClassification.UNSAFE_OBJECT
+    elif missing_names:
+        classification = _FinalEntryStructureClassification.INCOMPLETE_ENTRY
+    elif unexpected_names:
+        classification = _FinalEntryStructureClassification.UNEXPECTED_TOP_LEVEL_OBJECT
+    else:
+        classification = _FinalEntryStructureClassification.VALID
+
+    return _FinalEntryStructureObservation(
+        classification,
+        observed_names=observed_names,
+        missing_names=missing_names,
+        unexpected_names=unexpected_names,
+        unsafe_names=unsafe_names,
+    )
