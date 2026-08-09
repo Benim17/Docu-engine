@@ -1,6 +1,6 @@
 # Step 5B — Read-Only Persistent Cache Lookup Contract
 
-Status: **RECONCILED DESIGN — BLOCKED ON LOCK-LIFECYCLE CONTRACT**
+Status: **DESIGN LOCKED — approved for phased Step 5B implementation**
 Branch: `feature/cache-storage-foundation`
 Baseline: `0c6974a7cf64c761b55f9d944ce4b1de2b9bf755`
 Scope: **Read-only validation of one expected final cache entry; no production implementation in this document**
@@ -8,9 +8,10 @@ Scope: **Read-only validation of one expected final cache entry; no production i
 Authority: `STEP_5_VERSIONED_PERSISTENT_CACHE_ENTRY_CONTRACT.md` is the
 higher-level locked normative contract. This document refines it without
 overriding its observable behavior. Step 5B1 is implemented at `fb5c72a`.
-Structure and document validation helpers are the next implementation unit
-after the lock-lifecycle dependency identified in section 21.1 is approved;
-they must remain internal and must not expose contract-complete `MISS` results.
+The read-only lock dependency is locked by
+`STEP_5B_LOCK_LIFECYCLE_OBSERVATION_CONTRACT.md`. Step 5B2 is the next approved
+implementation unit. Step 5B2 and Step 5B3 remain internal and must not expose
+contract-complete `MISS` results.
 
 ## 1. Purpose and scope
 
@@ -60,12 +61,17 @@ def lookup_cache_entry(
     request: CacheLookupRequest,
     *,
     filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
     observer: CacheLookupObserver | None = None,
 ) -> CacheLookupResult:
     ...
 ```
 
-The filesystem dependency is injectable for deterministic tests. Its interface exposes bounded, no-follow reads and metadata inspection only. It exposes no write, create, rename, delete, chmod, or lock operation.
+The filesystem and lock-clock dependencies are injectable for deterministic tests.
+`SYSTEM_LOCK_OBSERVATION_CLOCK` supplies production UTC wall time but does not choose
+freshness policy. The filesystem interface exposes bounded, no-follow reads and
+metadata inspection only. It exposes no write, create, rename, delete, chmod, or lock
+mutation operation.
 
 ### 3.1 `ValidatedCacheRoot`
 
@@ -91,6 +97,7 @@ expectation: CacheLookupExpectation
 artifact_expectation: CacheArtifactExpectation | None
 payload_expectation: ProducerPayloadExpectation
 policy: CacheLookupVerificationPolicy
+lock_observation_policy: LockObservationPolicy
 ```
 
 Rules:
@@ -103,6 +110,9 @@ Rules:
 - `logical_id` is otherwise informational and never causes a compatibility mismatch, affects path derivation, or contributes to cache identity.
 - Absence of `artifact_expectation` means artifact metadata is still validated structurally but is not constrained by the caller.
 - `payload_expectation` is a trusted producer-derived contract described below; ordinary UI or configuration input cannot construct or weaken it.
+- `lock_observation_policy` is mandatory immutable request policy. Its
+  `active_freshness_seconds` is explicit; neither the public entry point nor the
+  production clock supplies an implicit freshness default.
 - Producer ID and schema are mandatory expectations. Producer version is observed and validated as metadata but is not an additional lookup constraint because Step 5A `CacheLookupExpectation` does not contain it.
 
 ### 3.3 `CacheArtifactExpectation`
@@ -229,27 +239,31 @@ Step 5B preserves the locked Step 5A status enum exactly. Each `CacheLookupReaso
 | 4 | `UNSUPPORTED_MANIFEST_VERSION` | `UNSUPPORTED_VERSION` | Recognizable manifest version is not supported. |
 | 5 | `UNSUPPORTED_CACHE_KEY_VERSION` | `UNSUPPORTED_VERSION` | Cache-key canonical version is recognizable but unsupported. |
 | 6 | `UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION` | `UNSUPPORTED_VERSION` | Runtime fingerprint schema is recognizable but unsupported. |
-| 7 | `INCOMPLETE_ENTRY` | `INVALID_ENTRY` | One or more required top-level objects are absent. |
-| 8 | `MALFORMED_COMPLETE` | `INVALID_ENTRY` | `COMPLETE` is invalid, noncanonical, oversized, or has unknown fields. |
-| 9 | `MALFORMED_METADATA` | `INVALID_ENTRY` | Metadata is invalid, noncanonical, oversized, or has unknown fields. |
-| 10 | `MALFORMED_MANIFEST` | `INVALID_ENTRY` | Manifest is invalid, noncanonical, oversized, or has unknown fields. |
-| 11 | `ENTRY_IDENTITY_CONFLICT` | `INVALID_ENTRY` | Path, expected digest, metadata digest identity, or marker entry digest disagree. |
-| 12 | `CACHE_KEY_CONFLICT` | `INVALID_ENTRY` | Expected key/reference and metadata cache-key reference disagree. |
-| 13 | `UNEXPECTED_TOP_LEVEL_OBJECT` | `INVALID_ENTRY` | A regular unknown file or directory exists at entry top level. |
-| 14 | `UNEXPECTED_PAYLOAD_OBJECT` | `INVALID_ENTRY` | Payload contains an undeclared regular file or unneeded directory. |
-| 15 | `UNSTABLE_SNAPSHOT` | `INVALID_ENTRY` | Entry changed or stability could not be established during validation. |
-| 16 | `IO_FAILURE` | `INVALID_ENTRY` | Permission or I/O failure prevented deterministic validation. |
-| 17 | `MANIFEST_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | Metadata or marker manifest digest does not match stored canonical manifest bytes. |
-| 18 | `METADATA_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | Marker metadata digest does not match stored canonical metadata bytes. |
-| 19 | `PAYLOAD_MISSING` | `INTEGRITY_FAILURE` | A manifest-declared payload path is absent. |
-| 20 | `PAYLOAD_SIZE_MISMATCH` | `INTEGRITY_FAILURE` | Observed size differs from the manifest. |
-| 21 | `PAYLOAD_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | SHA-256 differs from the manifest. |
-| 22 | `PAYLOAD_HARDLINK_DETECTED` | `INTEGRITY_FAILURE` | A payload regular file has a detectable link count greater than one. |
-| 23 | `NAMESPACE_PRODUCER_CONFLICT` | `PRODUCER_MISMATCH` | Metadata namespace and producer identity disagree. |
-| 24 | `PRODUCER_MISMATCH` | `PRODUCER_MISMATCH` | Observed producer ID differs from the expected producer. |
-| 25 | `SCHEMA_MISMATCH` | `SCHEMA_MISMATCH` | Observed producer schema differs from the expected schema. |
-| 26 | `ARTIFACT_MISMATCH` | `SCHEMA_MISMATCH` | Expected artifact kind/version, or explicitly expected logical ID, differs. |
-| 27 | `RUNTIME_FINGERPRINT_MISMATCH` | `RUNTIME_FINGERPRINT_MISMATCH` | Exact runtime fingerprint equality fails. |
+| 7 | `UNSUPPORTED_LOCK_VERSION` | `UNSUPPORTED_VERSION` | The matching lock has a recognizable unsupported version. |
+| 8 | `INCOMPLETE_ENTRY` | `INVALID_ENTRY` | One or more required top-level objects are absent. |
+| 9 | `MALFORMED_COMPLETE` | `INVALID_ENTRY` | `COMPLETE` is invalid, noncanonical, oversized, or has unknown fields. |
+| 10 | `MALFORMED_METADATA` | `INVALID_ENTRY` | Metadata is invalid, noncanonical, oversized, or has unknown fields. |
+| 11 | `MALFORMED_MANIFEST` | `INVALID_ENTRY` | Manifest is invalid, noncanonical, oversized, or has unknown fields. |
+| 12 | `MALFORMED_LOCK` | `INVALID_ENTRY` | The matching lock is invalid, noncanonical, oversized, or violates its supported schema. |
+| 13 | `ENTRY_IDENTITY_CONFLICT` | `INVALID_ENTRY` | Path, expected digest, metadata digest identity, or marker entry digest disagree. |
+| 14 | `CACHE_KEY_CONFLICT` | `INVALID_ENTRY` | Expected key/reference and metadata cache-key reference disagree. |
+| 15 | `LOCK_IDENTITY_CONFLICT` | `INVALID_ENTRY` | The matching lock entry digest disagrees with the expected entry identity. |
+| 16 | `LOCK_TIMESTAMP_INVALID` | `INVALID_ENTRY` | Matching-lock timestamps are inconsistent or in the future. |
+| 17 | `UNEXPECTED_TOP_LEVEL_OBJECT` | `INVALID_ENTRY` | A regular unknown file or directory exists at entry top level. |
+| 18 | `UNEXPECTED_PAYLOAD_OBJECT` | `INVALID_ENTRY` | Payload contains an undeclared regular file or unneeded directory. |
+| 19 | `UNSTABLE_SNAPSHOT` | `INVALID_ENTRY` | Entry or matching-lock observation changed or stability could not be established. |
+| 20 | `IO_FAILURE` | `INVALID_ENTRY` | Permission or I/O failure prevented deterministic validation. |
+| 21 | `MANIFEST_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | Metadata or marker manifest digest does not match stored canonical manifest bytes. |
+| 22 | `METADATA_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | Marker metadata digest does not match stored canonical metadata bytes. |
+| 23 | `PAYLOAD_MISSING` | `INTEGRITY_FAILURE` | A manifest-declared payload path is absent. |
+| 24 | `PAYLOAD_SIZE_MISMATCH` | `INTEGRITY_FAILURE` | Observed size differs from the manifest. |
+| 25 | `PAYLOAD_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | SHA-256 differs from the manifest. |
+| 26 | `PAYLOAD_HARDLINK_DETECTED` | `INTEGRITY_FAILURE` | A payload regular file has a detectable link count greater than one. |
+| 27 | `NAMESPACE_PRODUCER_CONFLICT` | `PRODUCER_MISMATCH` | Metadata namespace and producer identity disagree. |
+| 28 | `PRODUCER_MISMATCH` | `PRODUCER_MISMATCH` | Observed producer ID differs from the expected producer. |
+| 29 | `SCHEMA_MISMATCH` | `SCHEMA_MISMATCH` | Observed producer schema differs from the expected schema. |
+| 30 | `ARTIFACT_MISMATCH` | `SCHEMA_MISMATCH` | Expected artifact kind/version, or explicitly expected logical ID, differs. |
+| 31 | `RUNTIME_FINGERPRINT_MISMATCH` | `RUNTIME_FINGERPRINT_MISMATCH` | Exact runtime fingerprint equality fails. |
 
 `HIT`, `MISS`, and `LOCKED_OR_IN_PROGRESS` use `reason=None`.
 `LOCKED_OR_IN_PROGRESS` is emitted only when the expected final entry is absent
@@ -262,8 +276,9 @@ invalid, integrity, producer, schema, runtime, lock, miss, hit.
 `MISS` means the expected final-entry path is absent and the single matching lock
 is not active under the approved lock-lifecycle contract. Missing descendants are
 `INCOMPLETE_ENTRY`; unreadable, malformed, incompatible, or corrupt entries never
-become a miss. Until active-lock semantics are approved and implemented, no partial
-implementation may expose this contract-complete public `MISS` behavior.
+become a miss. Until read-only lock observation is implemented in Step 5B4 and
+composed by Step 5B5, no partial implementation may expose this contract-complete
+public `MISS` behavior.
 
 ## 6. Filesystem object policy
 
@@ -573,8 +588,7 @@ Step 5B implementation is not approved until tests cover:
 - proof that ordinary UI or generic configuration cannot construct or override `EMPTY_ALLOWED`;
 - absent expected entry plus an active matching lock returns `LOCKED_OR_IN_PROGRESS`;
 - absent expected entry plus no lock returns `MISS`;
-- absent expected entry plus a non-active or stale matching lock returns `MISS`,
-  once those terms are defined by the approved lock-lifecycle contract;
+- absent expected entry plus a non-active or stale matching lock returns `MISS`;
 - valid final entry plus any matching lock still returns `HIT`;
 - invalid final entry plus any matching lock returns the entry validation failure;
 - unrelated locks are never scanned or used;
@@ -693,8 +707,8 @@ Step 5B1 is implemented. The remaining units are a gated implementation plan:
 - directory re-enumeration;
 - deterministic broad statuses, detailed reasons, and sanitized diagnostics;
 - observability isolation.
-- internal read-only observation of only the matching lock, dependent on an
-  approved lock-lifecycle contract defining active, stale, malformed, and I/O cases.
+- internal read-only observation of only the matching lock under
+  `STEP_5B_LOCK_LIFECYCLE_OBSERVATION_CONTRACT.md`.
 
 ### Step 5B5 — Public lookup orchestration and regression/integration hardening
 
@@ -719,16 +733,13 @@ read-only observation of only the lock derived by Step 5A `derive_lock_path()` f
 validated namespace and cache key. It never scans lock siblings. A present final
 entry is validated without consulting or being overridden by lock state.
 
-The repository does not yet contain sufficient normative semantics to decide whether
-a matching lock is active. Section 11 of the locked parent contract recommends fields
-and lists conditions for recovery eligibility, but it does not lock a schema/parser,
-freshness threshold and source, clock behavior, active/stale predicate, or malformed,
-unsupported, permission, and I/O classifications. Pure lock-path derivation alone is
-insufficient. The smallest next design task is a locked, read-only lock-lifecycle
-observation contract covering those points. Step 5B4 lock observation and Step 5B5
-public orchestration remain blocked on that dependency. Step 5B2 and Step 5B3 may be
-implemented only as internal helpers after explicit approval; they may not expose a
-public result that treats bare entry absence as a contract-complete `MISS`.
+`STEP_5B_LOCK_LIFECYCLE_OBSERVATION_CONTRACT.md` normatively defines the strict lock
+document, explicit freshness policy, injected UTC clock, active/stale predicate,
+future-timestamp handling, result mapping, bounded stable read, and mutation boundary.
+Step 5B4 implements that read-only observation contract. Step 5B5 composes it with
+entry validation and is the first substep allowed to expose contract-complete public
+`MISS` and `LOCKED_OR_IN_PROGRESS` behavior. Step 5B2 and Step 5B3 remain internal
+helpers and must not treat bare entry absence as a final public result.
 
 ### 21.2 Nested payload directories
 
