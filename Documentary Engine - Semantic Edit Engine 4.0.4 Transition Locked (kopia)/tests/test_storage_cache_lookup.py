@@ -16,6 +16,7 @@ from engine.storage.persistent_cache import (
     CacheEntryMetadata,
     CacheKeyReference,
     CacheLookupExpectation,
+    CacheLookupStatus,
     CacheNamespace,
     CacheProducerMetadata,
     CacheRuntimeFingerprint,
@@ -42,7 +43,11 @@ from engine.storage.cache_lookup import (
     BoundedFileRead,
     CacheLookupIOError,
     CacheLookupPermissionError,
+    CacheArtifactExpectation,
+    CacheLookupReason,
+    CacheLookupRequest,
     CacheLookupVerificationPolicy,
+    CacheVerificationLevel,
     FileIdentity,
     FilesystemObjectType,
     LocalReadOnlyCacheFilesystem,
@@ -53,6 +58,7 @@ from engine.storage.cache_lookup import (
     UnstableFilesystemObjectError,
     UnsupportedFilesystemObjectError,
     ValidatedCacheRoot,
+    ValidatedCacheEntryReference,
     _FinalEntryStructureClassification,
     _CacheDocumentClassification,
     _CacheDocumentIntegrityClassification,
@@ -82,6 +88,7 @@ from engine.storage.cache_lookup import (
     _validate_final_entry_payload,
     _validate_stable_entry_snapshot,
     _trusted_producer_payload_expectation,
+    lookup_cache_entry,
 )
 
 
@@ -690,10 +697,10 @@ def test_internal_structure_does_not_recurse_scan_siblings_or_inspect_locks(tmp_
     assert before == after
 
 
-def test_internal_structure_surface_adds_no_public_lookup_or_mutation_api():
+def test_internal_structure_surface_adds_no_mutation_api():
     import engine.storage.cache_lookup as cache_lookup
 
-    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert callable(cache_lookup.lookup_cache_entry)
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
     public = {name for name in dir(ReadOnlyCacheFilesystem) if not name.startswith("_")}
     assert public == {
@@ -1019,10 +1026,10 @@ def test_internal_document_reader_keeps_malformed_discriminators_malformed(
     assert observation.classification.value.startswith("malformed_")
 
 
-def test_internal_document_surface_does_not_add_public_lookup_or_hash_payload():
+def test_internal_document_surface_does_not_add_public_hash_payload():
     import engine.storage.cache_lookup as cache_lookup
 
-    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert callable(cache_lookup.lookup_cache_entry)
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
     assert not hasattr(cache_lookup, "hash_payload")
 
@@ -1037,7 +1044,7 @@ def _step5b2c_documents(
     cache_key = CacheKey("a" * 64)
     namespace = CacheNamespace("audio", "transcription.whisper", 3)
     root = tmp_path / "cache"
-    root.mkdir()
+    root.mkdir(parents=True)
     entry = derive_final_entry_path(root, namespace, cache_key)
     entry.mkdir(parents=True)
     (entry / "payload").mkdir()
@@ -1322,7 +1329,7 @@ def test_step5b2c_summary_integrity_precedes_runtime_expectation(tmp_path):
     )
 
 
-def test_step5b2c_never_accesses_payload_locks_or_public_lookup(tmp_path):
+def test_step5b2c_never_accesses_payload_or_locks(tmp_path):
     import engine.storage.cache_lookup as cache_lookup
 
     fixture = _step5b2c_documents(tmp_path)
@@ -1334,7 +1341,7 @@ def test_step5b2c_never_accesses_payload_locks_or_public_lookup(tmp_path):
 
     assert result.classification is _CacheDocumentIntegrityClassification.VALID
     assert before == after
-    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert callable(cache_lookup.lookup_cache_entry)
     assert not hasattr(cache_lookup, "HIT")
     assert not hasattr(cache_lookup, "MISS")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
@@ -1448,10 +1455,10 @@ def test_empty_allowed_does_not_bypass_other_document_summary_integrity():
         )
 
 
-def test_payload_cardinality_prerequisite_adds_no_step5b3_io_or_public_lookup():
+def test_payload_cardinality_prerequisite_adds_no_step5b3_io():
     import engine.storage.cache_lookup as cache_lookup
 
-    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert callable(cache_lookup.lookup_cache_entry)
     assert not hasattr(cache_lookup, "hash_payload")
     assert not hasattr(cache_lookup, "observe_lock")
     assert not hasattr(cache_lookup, "HIT")
@@ -1851,7 +1858,7 @@ def test_step5b3_remains_internal_and_read_only(tmp_path):
 
     assert result.classification is _PayloadValidationClassification.VALID
     assert before == after
-    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert callable(cache_lookup.lookup_cache_entry)
     assert not hasattr(cache_lookup, "HIT")
     assert not hasattr(cache_lookup, "MISS")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
@@ -2286,11 +2293,11 @@ def test_step5b4_invalid_clock_is_dependency_error(tmp_path):
         )
 
 
-def test_step5b4_adds_no_public_lookup_or_mutation_surface():
+def test_step5b4_adds_no_mutation_surface():
     import engine.storage.cache_lookup as cache_lookup
 
-    assert not hasattr(cache_lookup, "lookup_cache_entry")
-    assert not hasattr(cache_lookup, "ValidatedCacheEntryReference")
+    assert callable(cache_lookup.lookup_cache_entry)
+    assert cache_lookup.ValidatedCacheEntryReference is ValidatedCacheEntryReference
     assert not hasattr(cache_lookup, "HIT")
     assert not hasattr(cache_lookup, "MISS")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
@@ -2301,3 +2308,502 @@ def test_step5b4_adds_no_public_lookup_or_mutation_surface():
         "read_regular_file_bounded",
         "resolve",
     }
+
+
+def _step5b5_request(tmp_path, payload_specs, *, payload_expectation=None):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    entry, integrity = _step5b3_fixture(tmp_path, payload_specs)
+    root_path = next(parent for parent in entry.parents if parent.name == "cache")
+    metadata = integrity.metadata
+    namespace = metadata.namespace
+    cache_key = metadata.cache_key.to_cache_key()
+    return CacheLookupRequest(
+        ValidatedCacheRoot.from_path(root_path, filesystem=FILESYSTEM),
+        namespace,
+        cache_key,
+        CacheLookupExpectation(
+            namespace,
+            namespace.producer_id,
+            namespace.producer_schema_version,
+            metadata.runtime_fingerprint,
+        ),
+        None,
+        payload_expectation or ProducerPayloadExpectation(),
+        CacheLookupVerificationPolicy(),
+        LockObservationPolicy(10),
+    )
+
+
+def _step5b5_request_from_documents(fixture, *, expectation=None, artifact=None):
+    root_path, _, cache_key, namespace, default_expectation, _ = fixture
+    return CacheLookupRequest(
+        ValidatedCacheRoot.from_path(root_path, filesystem=FILESYSTEM),
+        namespace,
+        cache_key,
+        expectation or default_expectation,
+        artifact,
+        ProducerPayloadExpectation(),
+        CacheLookupVerificationPolicy(),
+        LockObservationPolicy(10),
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_specs",
+    [
+        (("payload.bin", b"payload", None, None),),
+        (("nested/deeper/payload.bin", b"nested", None, None),),
+        (("empty.bin", b"", None, None),),
+    ],
+)
+def test_step5b5_public_hit_requires_full_stable_payload_validation(
+    tmp_path, payload_specs
+):
+    request = _step5b5_request(tmp_path, payload_specs)
+    result = lookup_cache_entry(request)
+
+    assert result.status is CacheLookupStatus.HIT
+    assert result.reason is None
+    assert result.verification_level is CacheVerificationLevel.FULL_PAYLOAD_SHA256
+    assert result.payload_bytes_fully_hashed
+    assert isinstance(result.validated_entry, ValidatedCacheEntryReference)
+    assert isinstance(result.metadata, CacheEntryMetadata)
+    assert isinstance(result.manifest, PayloadManifest)
+    assert isinstance(result.marker, CompletenessMarker)
+    assert result.expected_entry_path == derive_final_entry_path(
+        request.cache_root.resolved_path, request.namespace, request.cache_key
+    )
+
+
+def test_step5b5_public_hit_allows_trusted_empty_payload(tmp_path):
+    request = _step5b5_request(
+        tmp_path,
+        (),
+        payload_expectation=_trusted_producer_payload_expectation(
+            PayloadCardinalityExpectation.EMPTY_ALLOWED
+        ),
+    )
+    result = lookup_cache_entry(request)
+    assert result.status is CacheLookupStatus.HIT
+    assert result.payload_bytes_fully_hashed
+
+
+def _step5b5_absent_request(tmp_path):
+    root_path = tmp_path / "cache"
+    root_path.mkdir(parents=True)
+    namespace = CacheNamespace("audio", "transcription.whisper", 3)
+    cache_key = CacheKey("a" * 64)
+    _, metadata, _ = _valid_document_models()
+    return CacheLookupRequest(
+        ValidatedCacheRoot.from_path(root_path, filesystem=FILESYSTEM),
+        namespace,
+        cache_key,
+        CacheLookupExpectation(
+            namespace,
+            namespace.producer_id,
+            namespace.producer_schema_version,
+            metadata.runtime_fingerprint,
+        ),
+        None,
+        ProducerPayloadExpectation(),
+        CacheLookupVerificationPolicy(),
+        LockObservationPolicy(10),
+    )
+
+
+def _step5b5_with_lock(request, content):
+    lock_path = derive_lock_path(
+        request.cache_root.resolved_path, request.namespace, request.cache_key
+    )
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(content)
+    return replace(
+        request,
+        cache_root=ValidatedCacheRoot.from_path(
+            request.cache_root.resolved_path, filesystem=FILESYSTEM
+        ),
+    )
+
+
+def test_step5b5_absence_and_matching_lock_public_mapping(tmp_path):
+    absent = _step5b5_absent_request(tmp_path / "absent")
+    miss = lookup_cache_entry(absent)
+    assert (miss.status, miss.reason) == (CacheLookupStatus.MISS, None)
+
+    digest = derive_entry_digest(absent.cache_key)
+    active_request = _step5b5_with_lock(
+        _step5b5_absent_request(tmp_path / "active"), _lock_document(digest)
+    )
+    active = lookup_cache_entry(
+        active_request,
+        lock_clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, 20, tzinfo=timezone.utc)
+        ),
+    )
+    assert (active.status, active.reason) == (
+        CacheLookupStatus.LOCKED_OR_IN_PROGRESS,
+        None,
+    )
+
+    stale_request = _step5b5_with_lock(
+        _step5b5_absent_request(tmp_path / "stale"), _lock_document(digest)
+    )
+    stale = lookup_cache_entry(
+        stale_request,
+        lock_clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, 21, tzinfo=timezone.utc)
+        ),
+    )
+    assert (stale.status, stale.reason) == (CacheLookupStatus.MISS, None)
+    assert all(result.validated_entry is None for result in (miss, active, stale))
+
+
+def test_step5b5_present_entry_precedes_active_lock(tmp_path):
+    request = _step5b5_request(
+        tmp_path, (("payload.bin", b"payload", None, None),)
+    )
+    request = _step5b5_with_lock(
+        request, _lock_document(derive_entry_digest(request.cache_key))
+    )
+    result = lookup_cache_entry(
+        request,
+        lock_clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, 20, tzinfo=timezone.utc)
+        ),
+    )
+    assert result.status is CacheLookupStatus.HIT
+
+
+@pytest.mark.parametrize(
+    ("lock_bytes", "status", "reason"),
+    [
+        (canonical_json_bytes({"lock_version": 2}), CacheLookupStatus.UNSUPPORTED_VERSION,
+         CacheLookupReason.UNSUPPORTED_LOCK_VERSION),
+        (b"invalid", CacheLookupStatus.INVALID_ENTRY, CacheLookupReason.MALFORMED_LOCK),
+    ],
+)
+def test_step5b5_lock_failures_are_not_miss(tmp_path, lock_bytes, status, reason):
+    request = _step5b5_with_lock(_step5b5_absent_request(tmp_path), lock_bytes)
+    result = lookup_cache_entry(
+        request,
+        lock_clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, 20, tzinfo=timezone.utc)
+        ),
+    )
+    assert (result.status, result.reason) == (status, reason)
+
+
+def test_step5b5_invalid_lock_time_and_unrelated_lock_mapping(tmp_path):
+    request = _step5b5_absent_request(tmp_path / "future")
+    future_lock = _lock_document(
+        derive_entry_digest(request.cache_key),
+        heartbeat_at_utc="2026-07-20T09:00:21Z",
+    )
+    request = _step5b5_with_lock(request, future_lock)
+    result = lookup_cache_entry(
+        request,
+        lock_clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, 20, tzinfo=timezone.utc)
+        ),
+    )
+    assert (result.status, result.reason) == (
+        CacheLookupStatus.INVALID_ENTRY,
+        CacheLookupReason.LOCK_TIMESTAMP_INVALID,
+    )
+
+    unrelated = _step5b5_absent_request(tmp_path / "unrelated")
+    unrelated_path = unrelated.cache_root.resolved_path / "locks" / "unrelated.lock"
+    unrelated_path.parent.mkdir(parents=True)
+    unrelated_path.write_bytes(b"not relevant")
+    unrelated = replace(
+        unrelated,
+        cache_root=ValidatedCacheRoot.from_path(
+            unrelated.cache_root.resolved_path, filesystem=FILESYSTEM
+        ),
+    )
+    assert lookup_cache_entry(unrelated).status is CacheLookupStatus.MISS
+
+
+def test_step5b5_present_invalid_entry_is_not_overridden_by_active_lock(tmp_path):
+    request = _step5b5_request(
+        tmp_path, (("payload.bin", b"payload", None, None),)
+    )
+    entry = derive_final_entry_path(
+        request.cache_root.resolved_path, request.namespace, request.cache_key
+    )
+    (entry / "metadata.json").write_bytes(b"invalid")
+    request = _step5b5_with_lock(
+        request, _lock_document(derive_entry_digest(request.cache_key))
+    )
+    result = lookup_cache_entry(
+        request,
+        lock_clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, 20, tzinfo=timezone.utc)
+        ),
+    )
+    assert (result.status, result.reason) == (
+        CacheLookupStatus.INVALID_ENTRY,
+        CacheLookupReason.MALFORMED_METADATA,
+    )
+
+
+def test_step5b5_representative_public_failure_families(tmp_path):
+    unsafe_request = _step5b5_absent_request(tmp_path / "unsafe")
+    unsafe_entry = derive_final_entry_path(
+        unsafe_request.cache_root.resolved_path,
+        unsafe_request.namespace,
+        unsafe_request.cache_key,
+    )
+    unsafe_entry.parent.mkdir(parents=True)
+    unsafe_entry.write_bytes(b"not-a-directory")
+    unsafe_request = replace(
+        unsafe_request,
+        cache_root=ValidatedCacheRoot.from_path(
+            unsafe_request.cache_root.resolved_path, filesystem=FILESYSTEM
+        ),
+    )
+    unsafe = lookup_cache_entry(unsafe_request)
+    assert (unsafe.status, unsafe.reason) == (
+        CacheLookupStatus.UNSAFE_PATH,
+        CacheLookupReason.UNSAFE_OBJECT,
+    )
+
+    malformed_request = _step5b5_request(
+        tmp_path / "malformed", (("payload.bin", b"payload", None, None),)
+    )
+    malformed_path = derive_final_entry_path(
+        malformed_request.cache_root.resolved_path,
+        malformed_request.namespace,
+        malformed_request.cache_key,
+    ) / "metadata.json"
+    malformed_path.write_bytes(malformed_path.read_bytes() + b"\n")
+    malformed = lookup_cache_entry(malformed_request)
+    assert (malformed.status, malformed.reason) == (
+        CacheLookupStatus.INVALID_ENTRY,
+        CacheLookupReason.MALFORMED_METADATA,
+    )
+
+    digest_request = _step5b5_request(
+        tmp_path / "digest", (("payload.bin", b"payload", None, None),)
+    )
+    payload_path = derive_final_entry_path(
+        digest_request.cache_root.resolved_path,
+        digest_request.namespace,
+        digest_request.cache_key,
+    ) / "payload" / "payload.bin"
+    payload_path.write_bytes(b"changed")
+    digest_failure = lookup_cache_entry(digest_request)
+    assert digest_failure.status is CacheLookupStatus.INTEGRITY_FAILURE
+    assert digest_failure.reason is CacheLookupReason.PAYLOAD_DIGEST_MISMATCH
+
+    artifact_request = _step5b5_request(
+        tmp_path / "artifact", (("payload.bin", b"payload", None, None),)
+    )
+    artifact_failure = lookup_cache_entry(
+        replace(
+            artifact_request,
+            artifact_expectation=CacheArtifactExpectation("different", 1),
+        )
+    )
+    assert (artifact_failure.status, artifact_failure.reason) == (
+        CacheLookupStatus.SCHEMA_MISMATCH,
+        CacheLookupReason.ARTIFACT_MISMATCH,
+    )
+
+    producer_fixture = _step5b2c_documents(
+        tmp_path / "producer",
+        metadata_mutator=lambda data: data["producer"].update(
+            producer_id="other.producer"
+        ),
+    )
+    producer_failure = lookup_cache_entry(
+        _step5b5_request_from_documents(producer_fixture)
+    )
+    assert (producer_failure.status, producer_failure.reason) == (
+        CacheLookupStatus.PRODUCER_MISMATCH,
+        CacheLookupReason.NAMESPACE_PRODUCER_CONFLICT,
+    )
+
+    runtime_request = _step5b5_request(
+        tmp_path / "runtime", (("payload.bin", b"payload", None, None),)
+    )
+    runtime_expectation = replace(
+        runtime_request.expectation,
+        runtime_fingerprint=CacheRuntimeFingerprint(1, {"model": "different"}),
+    )
+    runtime_failure = lookup_cache_entry(
+        replace(runtime_request, expectation=runtime_expectation)
+    )
+    assert (runtime_failure.status, runtime_failure.reason) == (
+        CacheLookupStatus.RUNTIME_FINGERPRINT_MISMATCH,
+        CacheLookupReason.RUNTIME_FINGERPRINT_MISMATCH,
+    )
+
+
+def test_step5b5_public_incomplete_unsupported_manifest_unstable_and_io(tmp_path):
+    incomplete_request = _step5b5_request(
+        tmp_path / "incomplete", (("payload.bin", b"payload", None, None),)
+    )
+    incomplete_entry = derive_final_entry_path(
+        incomplete_request.cache_root.resolved_path,
+        incomplete_request.namespace,
+        incomplete_request.cache_key,
+    )
+    (incomplete_entry / "manifest.json").unlink()
+    incomplete = lookup_cache_entry(incomplete_request)
+    assert (incomplete.status, incomplete.reason) == (
+        CacheLookupStatus.INVALID_ENTRY,
+        CacheLookupReason.INCOMPLETE_ENTRY,
+    )
+
+    unsupported_fixture = _step5b2c_documents(
+        tmp_path / "unsupported_manifest",
+        manifest_mutator=lambda data: data.update(manifest_version=2),
+    )
+    unsupported = lookup_cache_entry(
+        _step5b5_request_from_documents(unsupported_fixture)
+    )
+    assert (unsupported.status, unsupported.reason) == (
+        CacheLookupStatus.UNSUPPORTED_VERSION,
+        CacheLookupReason.UNSUPPORTED_MANIFEST_VERSION,
+    )
+
+    unstable_request = _step5b5_request(
+        tmp_path / "unstable", (("payload.bin", b"payload", None, None),)
+    )
+
+    class UnstableRootFilesystem(LocalReadOnlyCacheFilesystem):
+        def __init__(self):
+            self.root_inspections = 0
+
+        def inspect(self, path):
+            identity = super().inspect(path)
+            if Path(path) == unstable_request.cache_root.resolved_path:
+                self.root_inspections += 1
+                if self.root_inspections >= 2:
+                    return replace(identity, modification_time_ns=-1)
+            return identity
+
+    unstable = lookup_cache_entry(
+        unstable_request, filesystem=UnstableRootFilesystem()
+    )
+    assert (unstable.status, unstable.reason) == (
+        CacheLookupStatus.INVALID_ENTRY,
+        CacheLookupReason.UNSTABLE_SNAPSHOT,
+    )
+
+    io_request = _step5b5_request(
+        tmp_path / "io", (("payload.bin", b"payload", None, None),)
+    )
+
+    class PermissionFilesystem(LocalReadOnlyCacheFilesystem):
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            raise CacheLookupPermissionError("private detail")
+
+    io_result = lookup_cache_entry(io_request, filesystem=PermissionFilesystem())
+    assert (io_result.status, io_result.reason) == (
+        CacheLookupStatus.INVALID_ENTRY,
+        CacheLookupReason.IO_FAILURE,
+    )
+    assert "private detail" not in repr(io_result)
+
+
+def test_step5b5_public_orchestration_preserves_locked_precedence(tmp_path):
+    unsupported_fixture = _step5b2c_documents(
+        tmp_path / "unsafe_unsupported",
+        metadata_mutator=lambda data: data.update(cache_entry_contract_version=2),
+    )
+    unexpected = unsupported_fixture[1] / "unsafe"
+    unexpected.symlink_to(unsupported_fixture[1] / "metadata.json")
+    unsafe_request = _step5b5_request_from_documents(unsupported_fixture)
+    assert lookup_cache_entry(unsafe_request).reason is CacheLookupReason.UNSAFE_OBJECT
+
+    unsupported_invalid = _step5b2c_documents(
+        tmp_path / "unsupported_invalid",
+        metadata_mutator=lambda data: data.update(cache_entry_contract_version=2),
+        manifest_mutator=lambda data: data.update(unexpected=True),
+    )
+    assert (
+        lookup_cache_entry(_step5b5_request_from_documents(unsupported_invalid)).reason
+        is CacheLookupReason.UNSUPPORTED_ENTRY_VERSION
+    )
+
+    invalid_integrity = _step5b5_request(
+        tmp_path / "invalid_integrity", (("payload.bin", b"payload", None, None),)
+    )
+    invalid_entry = derive_final_entry_path(
+        invalid_integrity.cache_root.resolved_path,
+        invalid_integrity.namespace,
+        invalid_integrity.cache_key,
+    )
+    (invalid_entry / "metadata.json").write_bytes(b"invalid")
+    (invalid_entry / "payload" / "payload.bin").write_bytes(b"changed")
+    assert lookup_cache_entry(invalid_integrity).reason is CacheLookupReason.MALFORMED_METADATA
+
+    integrity_producer = _step5b2c_documents(
+        tmp_path / "integrity_producer",
+        metadata_mutator=lambda data: data["producer"].update(
+            producer_id="other.producer"
+        ),
+        marker_mutator=lambda data: data.update(metadata_digest="sha256:" + "0" * 64),
+    )
+    assert (
+        lookup_cache_entry(_step5b5_request_from_documents(integrity_producer)).reason
+        is CacheLookupReason.METADATA_DIGEST_MISMATCH
+    )
+
+    producer_schema = _step5b2c_documents(
+        tmp_path / "producer_schema",
+        metadata_mutator=lambda data: data["producer"].update(
+            producer_id="other.producer"
+        ),
+    )
+    producer_schema_request = _step5b5_request_from_documents(
+        producer_schema, artifact=CacheArtifactExpectation("different", 1)
+    )
+    assert (
+        lookup_cache_entry(producer_schema_request).reason
+        is CacheLookupReason.NAMESPACE_PRODUCER_CONFLICT
+    )
+
+    schema_runtime = _step5b5_request(
+        tmp_path / "schema_runtime", (("payload.bin", b"payload", None, None),)
+    )
+    schema_runtime = replace(
+        schema_runtime,
+        artifact_expectation=CacheArtifactExpectation("different", 1),
+        expectation=replace(
+            schema_runtime.expectation,
+            runtime_fingerprint=CacheRuntimeFingerprint(1, {"model": "different"}),
+        ),
+    )
+    assert lookup_cache_entry(schema_runtime).reason is CacheLookupReason.ARTIFACT_MISMATCH
+
+
+def test_step5b5_observer_failure_and_dependency_misuse(tmp_path):
+    request = _step5b5_request(
+        tmp_path, (("payload.bin", b"payload", None, None),)
+    )
+
+    class FailingObserver:
+        def observe(self, event):
+            raise RuntimeError("must remain private")
+
+    assert lookup_cache_entry(request, observer=FailingObserver()).status is CacheLookupStatus.HIT
+    with pytest.raises(TypeError, match="CacheLookupRequest"):
+        lookup_cache_entry(object())
+    with pytest.raises(TypeError, match="read-only lookup interface"):
+        lookup_cache_entry(request, filesystem=object())
+
+
+def test_step5b5_public_exports_exclude_private_observations():
+    import engine.storage as storage
+    import engine.storage.cache_lookup as cache_lookup
+
+    assert storage.lookup_cache_entry is lookup_cache_entry
+    assert storage.CacheLookupRequest is CacheLookupRequest
+    assert storage.CacheLookupResult.__module__.endswith("persistent_cache")
+    assert storage.CacheLookupResult(CacheLookupStatus.MISS).status is CacheLookupStatus.MISS
+    assert storage.ReadOnlyCacheLookupResult is cache_lookup.CacheLookupResult
+    assert lookup_cache_entry.__annotations__["return"] == "ReadOnlyCacheLookupResult"
+    assert not any(name.startswith("_Observed") for name in storage.__all__)

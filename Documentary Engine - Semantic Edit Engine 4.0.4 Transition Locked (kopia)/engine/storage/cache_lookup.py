@@ -29,6 +29,7 @@ from .persistent_cache import (
     CacheEntryMetadata,
     CacheKeyReference,
     CacheLookupExpectation,
+    CacheLookupStatus,
     CacheNamespace,
     CacheProducerMetadata,
     CacheRuntimeFingerprint,
@@ -736,12 +737,15 @@ class _PayloadValidationClassification(str, Enum):
     PAYLOAD_READ_UNSTABLE = "payload_read_unstable"
 
 
-class _CacheVerificationLevel(str, Enum):
+class CacheVerificationLevel(str, Enum):
     NONE = "none"
     STRUCTURE = "structure"
     CANONICAL_DOCUMENTS = "canonical_documents"
     DOCUMENT_INTEGRITY = "document_integrity"
     FULL_PAYLOAD_SHA256 = "full_payload_sha256"
+
+
+_CacheVerificationLevel = CacheVerificationLevel
 
 
 class PayloadCardinalityExpectation(str, Enum):
@@ -797,7 +801,7 @@ def _payload_cardinality_is_valid(
 
 
 @dataclass(frozen=True)
-class _CacheArtifactExpectation:
+class CacheArtifactExpectation:
     artifact_kind: str
     artifact_contract_version: int
     expected_logical_id: str | None = None
@@ -816,6 +820,9 @@ class _CacheArtifactExpectation:
             or not self.expected_logical_id
         ):
             raise ValueError("expected_logical_id must be non-empty text or None.")
+
+
+_CacheArtifactExpectation = CacheArtifactExpectation
 
 
 @dataclass(frozen=True)
@@ -1053,7 +1060,18 @@ class _StableSnapshotObservation:
     payload_bytes_fully_hashed: bool
 
 
-class _CacheLookupDiagnosticCode(str, Enum):
+class CacheLookupDiagnosticCode(str, Enum):
+    ENTRY_ABSENT = "entry.absent"
+    REQUIRED_OBJECT_MISSING = "entry.required_object_missing"
+    DOCUMENT_INVALID = "document.invalid"
+    VERSION_UNSUPPORTED = "version.unsupported"
+    IDENTITY_MISMATCH = "identity.mismatch"
+    DIGEST_MISMATCH = "digest.mismatch"
+    PAYLOAD_MISSING = "payload.missing"
+    PAYLOAD_SIZE_MISMATCH = "payload.size_mismatch"
+    PAYLOAD_DIGEST_MISMATCH = "payload.digest_mismatch"
+    PAYLOAD_HARDLINK = "payload.hardlink"
+    EXPECTATION_MISMATCH = "expectation.mismatch"
     UNSAFE_OBJECT = "object.unsupported_type"
     UNEXPECTED_OBJECT = "entry.unexpected_payload_object"
     UNSTABLE = "snapshot.changed"
@@ -1063,7 +1081,7 @@ class _CacheLookupDiagnosticCode(str, Enum):
     TRUNCATED = "diagnostics.truncated"
 
 
-class _CacheLookupSubject(str, Enum):
+class CacheLookupSubject(str, Enum):
     ROOT = "root"
     ENTRY = "entry"
     DOCUMENT = "document"
@@ -1071,27 +1089,42 @@ class _CacheLookupSubject(str, Enum):
     LOCK = "lock"
 
 
+_CacheLookupDiagnosticCode = CacheLookupDiagnosticCode
+_CacheLookupSubject = CacheLookupSubject
+
+
 _DIAGNOSTIC_PRECEDENCE = {
-    _CacheLookupDiagnosticCode.UNSAFE_OBJECT: (1, 2),
-    _CacheLookupDiagnosticCode.UNEXPECTED_OBJECT: (3, 18),
-    _CacheLookupDiagnosticCode.UNSTABLE: (3, 19),
-    _CacheLookupDiagnosticCode.IO_FAILURE: (3, 20),
-    _CacheLookupDiagnosticCode.PERMISSION_DENIED: (3, 20),
-    _CacheLookupDiagnosticCode.REDUCED_IDENTITY: (3, 19),
-    _CacheLookupDiagnosticCode.TRUNCATED: (99, 99),
+    CacheLookupDiagnosticCode.ENTRY_ABSENT: (9, 99),
+    CacheLookupDiagnosticCode.REQUIRED_OBJECT_MISSING: (3, 8),
+    CacheLookupDiagnosticCode.DOCUMENT_INVALID: (3, 9),
+    CacheLookupDiagnosticCode.VERSION_UNSUPPORTED: (2, 3),
+    CacheLookupDiagnosticCode.IDENTITY_MISMATCH: (3, 13),
+    CacheLookupDiagnosticCode.DIGEST_MISMATCH: (4, 21),
+    CacheLookupDiagnosticCode.PAYLOAD_MISSING: (4, 23),
+    CacheLookupDiagnosticCode.PAYLOAD_SIZE_MISMATCH: (4, 24),
+    CacheLookupDiagnosticCode.PAYLOAD_DIGEST_MISMATCH: (4, 25),
+    CacheLookupDiagnosticCode.PAYLOAD_HARDLINK: (4, 26),
+    CacheLookupDiagnosticCode.EXPECTATION_MISMATCH: (5, 27),
+    CacheLookupDiagnosticCode.UNSAFE_OBJECT: (1, 2),
+    CacheLookupDiagnosticCode.UNEXPECTED_OBJECT: (3, 18),
+    CacheLookupDiagnosticCode.UNSTABLE: (3, 19),
+    CacheLookupDiagnosticCode.IO_FAILURE: (3, 20),
+    CacheLookupDiagnosticCode.PERMISSION_DENIED: (3, 20),
+    CacheLookupDiagnosticCode.REDUCED_IDENTITY: (3, 19),
+    CacheLookupDiagnosticCode.TRUNCATED: (99, 99),
 }
 
 
 @dataclass(frozen=True)
-class _CacheLookupDiagnostic:
-    code: _CacheLookupDiagnosticCode
-    subject: _CacheLookupSubject
+class CacheLookupDiagnostic:
+    code: CacheLookupDiagnosticCode
+    subject: CacheLookupSubject
     relative_path: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.code, _CacheLookupDiagnosticCode):
+        if not isinstance(self.code, CacheLookupDiagnosticCode):
             raise TypeError("diagnostic code must be internal stable enum data.")
-        if not isinstance(self.subject, _CacheLookupSubject):
+        if not isinstance(self.subject, CacheLookupSubject):
             raise TypeError("diagnostic subject must be internal stable enum data.")
         if self.relative_path is not None:
             if not isinstance(self.relative_path, str) or not self.relative_path:
@@ -1099,6 +1132,9 @@ class _CacheLookupDiagnostic:
             path = PurePosixPath(self.relative_path)
             if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
                 raise ValueError("diagnostic paths must be sanitized relative paths.")
+
+
+_CacheLookupDiagnostic = CacheLookupDiagnostic
 
 
 @dataclass(frozen=True)
@@ -1111,9 +1147,12 @@ class _CacheLookupObserverEvent:
 
 
 @runtime_checkable
-class _CacheLookupObserver(Protocol):
+class CacheLookupObserver(Protocol):
     def observe(self, event: _CacheLookupObserverEvent) -> None:
         ...
+
+
+_CacheLookupObserver = CacheLookupObserver
 
 
 def _finalize_diagnostics(
@@ -2022,3 +2061,422 @@ def _observe_matching_lock(
         else _LockObservationClassification.STALE
     )
     return _LockObservation(classification, path, parsed, True)
+
+
+class CacheLookupReason(str, Enum):
+    UNSAFE_PATH = "unsafe_path"
+    UNSAFE_OBJECT = "unsafe_object"
+    UNSUPPORTED_ENTRY_VERSION = "unsupported_entry_version"
+    UNSUPPORTED_MANIFEST_VERSION = "unsupported_manifest_version"
+    UNSUPPORTED_CACHE_KEY_VERSION = "unsupported_cache_key_version"
+    UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION = "unsupported_runtime_fingerprint_version"
+    UNSUPPORTED_LOCK_VERSION = "unsupported_lock_version"
+    INCOMPLETE_ENTRY = "incomplete_entry"
+    MALFORMED_COMPLETE = "malformed_complete"
+    MALFORMED_METADATA = "malformed_metadata"
+    MALFORMED_MANIFEST = "malformed_manifest"
+    MALFORMED_LOCK = "malformed_lock"
+    ENTRY_IDENTITY_CONFLICT = "entry_identity_conflict"
+    CACHE_KEY_CONFLICT = "cache_key_conflict"
+    LOCK_IDENTITY_CONFLICT = "lock_identity_conflict"
+    LOCK_TIMESTAMP_INVALID = "lock_timestamp_invalid"
+    UNEXPECTED_TOP_LEVEL_OBJECT = "unexpected_top_level_object"
+    UNEXPECTED_PAYLOAD_OBJECT = "unexpected_payload_object"
+    UNSTABLE_SNAPSHOT = "unstable_snapshot"
+    IO_FAILURE = "io_failure"
+    MANIFEST_DIGEST_MISMATCH = "manifest_digest_mismatch"
+    METADATA_DIGEST_MISMATCH = "metadata_digest_mismatch"
+    PAYLOAD_MISSING = "payload_missing"
+    PAYLOAD_SIZE_MISMATCH = "payload_size_mismatch"
+    PAYLOAD_DIGEST_MISMATCH = "payload_digest_mismatch"
+    PAYLOAD_HARDLINK_DETECTED = "payload_hardlink_detected"
+    NAMESPACE_PRODUCER_CONFLICT = "namespace_producer_conflict"
+    PRODUCER_MISMATCH = "producer_mismatch"
+    SCHEMA_MISMATCH = "schema_mismatch"
+    ARTIFACT_MISMATCH = "artifact_mismatch"
+    RUNTIME_FINGERPRINT_MISMATCH = "runtime_fingerprint_mismatch"
+
+
+_REASON_STATUS = {
+    **{reason: CacheLookupStatus.UNSAFE_PATH for reason in (
+        CacheLookupReason.UNSAFE_PATH, CacheLookupReason.UNSAFE_OBJECT)},
+    **{reason: CacheLookupStatus.UNSUPPORTED_VERSION for reason in (
+        CacheLookupReason.UNSUPPORTED_ENTRY_VERSION,
+        CacheLookupReason.UNSUPPORTED_MANIFEST_VERSION,
+        CacheLookupReason.UNSUPPORTED_CACHE_KEY_VERSION,
+        CacheLookupReason.UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION,
+        CacheLookupReason.UNSUPPORTED_LOCK_VERSION)},
+    **{reason: CacheLookupStatus.INVALID_ENTRY for reason in (
+        CacheLookupReason.INCOMPLETE_ENTRY,
+        CacheLookupReason.MALFORMED_COMPLETE,
+        CacheLookupReason.MALFORMED_METADATA,
+        CacheLookupReason.MALFORMED_MANIFEST,
+        CacheLookupReason.MALFORMED_LOCK,
+        CacheLookupReason.ENTRY_IDENTITY_CONFLICT,
+        CacheLookupReason.CACHE_KEY_CONFLICT,
+        CacheLookupReason.LOCK_IDENTITY_CONFLICT,
+        CacheLookupReason.LOCK_TIMESTAMP_INVALID,
+        CacheLookupReason.UNEXPECTED_TOP_LEVEL_OBJECT,
+        CacheLookupReason.UNEXPECTED_PAYLOAD_OBJECT,
+        CacheLookupReason.UNSTABLE_SNAPSHOT,
+        CacheLookupReason.IO_FAILURE)},
+    **{reason: CacheLookupStatus.INTEGRITY_FAILURE for reason in (
+        CacheLookupReason.MANIFEST_DIGEST_MISMATCH,
+        CacheLookupReason.METADATA_DIGEST_MISMATCH,
+        CacheLookupReason.PAYLOAD_MISSING,
+        CacheLookupReason.PAYLOAD_SIZE_MISMATCH,
+        CacheLookupReason.PAYLOAD_DIGEST_MISMATCH,
+        CacheLookupReason.PAYLOAD_HARDLINK_DETECTED)},
+    CacheLookupReason.NAMESPACE_PRODUCER_CONFLICT: CacheLookupStatus.PRODUCER_MISMATCH,
+    CacheLookupReason.PRODUCER_MISMATCH: CacheLookupStatus.PRODUCER_MISMATCH,
+    CacheLookupReason.SCHEMA_MISMATCH: CacheLookupStatus.SCHEMA_MISMATCH,
+    CacheLookupReason.ARTIFACT_MISMATCH: CacheLookupStatus.SCHEMA_MISMATCH,
+    CacheLookupReason.RUNTIME_FINGERPRINT_MISMATCH: CacheLookupStatus.RUNTIME_FINGERPRINT_MISMATCH,
+}
+_REASON_PRECEDENCE = {reason: index for index, reason in enumerate(CacheLookupReason, 1)}
+
+
+@dataclass(frozen=True)
+class ValidatedCacheEntryReference:
+    entry_path: Path
+    entry_digest: str
+    namespace: CacheNamespace
+    cache_key_reference: CacheKeyReference
+    metadata: CacheEntryMetadata
+    manifest: PayloadManifest
+    marker: CompletenessMarker
+    verification_level: CacheVerificationLevel
+
+    def __post_init__(self) -> None:
+        if self.verification_level is not CacheVerificationLevel.FULL_PAYLOAD_SHA256:
+            raise ValueError("validated entries require full payload SHA-256 verification.")
+
+
+@dataclass(frozen=True)
+class CacheLookupRequest:
+    cache_root: ValidatedCacheRoot
+    namespace: CacheNamespace
+    cache_key: CacheKey
+    expectation: CacheLookupExpectation
+    artifact_expectation: CacheArtifactExpectation | None
+    payload_expectation: ProducerPayloadExpectation
+    policy: CacheLookupVerificationPolicy
+    lock_observation_policy: LockObservationPolicy
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cache_root, ValidatedCacheRoot):
+            raise TypeError("cache_root must be a ValidatedCacheRoot.")
+        if not isinstance(self.namespace, CacheNamespace):
+            raise TypeError("namespace must be a CacheNamespace.")
+        if not isinstance(self.cache_key, CacheKey):
+            raise TypeError("cache_key must be a CacheKey.")
+        if not isinstance(self.expectation, CacheLookupExpectation):
+            raise TypeError("expectation must be a CacheLookupExpectation.")
+        if self.expectation.namespace != self.namespace:
+            raise ValueError("expectation namespace must equal request namespace.")
+        if self.artifact_expectation is not None and not isinstance(
+            self.artifact_expectation, CacheArtifactExpectation
+        ):
+            raise TypeError("artifact_expectation must be a CacheArtifactExpectation or None.")
+        if not isinstance(self.payload_expectation, ProducerPayloadExpectation):
+            raise TypeError("payload_expectation must be trusted producer semantics.")
+        if not isinstance(self.policy, CacheLookupVerificationPolicy):
+            raise TypeError("policy must be a CacheLookupVerificationPolicy.")
+        if not isinstance(self.lock_observation_policy, LockObservationPolicy):
+            raise TypeError("lock_observation_policy must be a LockObservationPolicy.")
+
+
+@dataclass(frozen=True)
+class ReadOnlyCacheLookupResult:
+    status: CacheLookupStatus
+    reason: CacheLookupReason | None
+    expected_entry_path: Path
+    validated_entry: ValidatedCacheEntryReference | None
+    entry_digest: str
+    namespace: CacheNamespace
+    cache_key_reference: CacheKeyReference
+    diagnostics: tuple[CacheLookupDiagnostic, ...]
+    verification_level: CacheVerificationLevel
+    observed_contract_version: int | None
+    payload_bytes_fully_hashed: bool
+    metadata: CacheEntryMetadata | None
+    manifest: PayloadManifest | None
+    marker: CompletenessMarker | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, CacheLookupStatus):
+            raise TypeError("status must be a CacheLookupStatus.")
+        if self.status in {CacheLookupStatus.HIT, CacheLookupStatus.MISS,
+                           CacheLookupStatus.LOCKED_OR_IN_PROGRESS}:
+            if self.reason is not None:
+                raise ValueError("HIT, MISS, and LOCKED_OR_IN_PROGRESS require reason=None.")
+        elif not isinstance(self.reason, CacheLookupReason) or _REASON_STATUS[self.reason] is not self.status:
+            raise ValueError("failure reason must map exactly to status.")
+        if (self.status is CacheLookupStatus.HIT) != (self.validated_entry is not None):
+            raise ValueError("validated_entry exists exactly for HIT.")
+        if self.payload_bytes_fully_hashed != (
+            self.status is CacheLookupStatus.HIT
+            and self.verification_level is CacheVerificationLevel.FULL_PAYLOAD_SHA256
+        ):
+            raise ValueError("fully hashed payload state exists exactly for a verified HIT.")
+
+
+# The locked Step 5B contract names its expanded result CacheLookupResult.  Keep
+# that module-level public name while the package root preserves Step 5A's
+# established CacheLookupResult and exports this type under the unambiguous name.
+CacheLookupResult = ReadOnlyCacheLookupResult
+
+
+_DOCUMENT_REASON = {
+    _CacheDocumentClassification.MALFORMED_COMPLETE: CacheLookupReason.MALFORMED_COMPLETE,
+    _CacheDocumentClassification.MALFORMED_METADATA: CacheLookupReason.MALFORMED_METADATA,
+    _CacheDocumentClassification.MALFORMED_MANIFEST: CacheLookupReason.MALFORMED_MANIFEST,
+    _CacheDocumentClassification.UNSUPPORTED_ENTRY_VERSION: CacheLookupReason.UNSUPPORTED_ENTRY_VERSION,
+    _CacheDocumentClassification.UNSUPPORTED_MANIFEST_VERSION: CacheLookupReason.UNSUPPORTED_MANIFEST_VERSION,
+    _CacheDocumentClassification.UNSUPPORTED_CACHE_KEY_VERSION: CacheLookupReason.UNSUPPORTED_CACHE_KEY_VERSION,
+    _CacheDocumentClassification.UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION: CacheLookupReason.UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION,
+}
+_INTEGRITY_REASON = {
+    _CacheDocumentIntegrityClassification.ENTRY_IDENTITY_CONFLICT: CacheLookupReason.ENTRY_IDENTITY_CONFLICT,
+    _CacheDocumentIntegrityClassification.CACHE_KEY_CONFLICT: CacheLookupReason.CACHE_KEY_CONFLICT,
+    _CacheDocumentIntegrityClassification.MANIFEST_DIGEST_MISMATCH: CacheLookupReason.MANIFEST_DIGEST_MISMATCH,
+    _CacheDocumentIntegrityClassification.METADATA_DIGEST_MISMATCH: CacheLookupReason.METADATA_DIGEST_MISMATCH,
+    _CacheDocumentIntegrityClassification.METADATA_MANIFEST_SUMMARY_MISMATCH: CacheLookupReason.MALFORMED_METADATA,
+    _CacheDocumentIntegrityClassification.NAMESPACE_PRODUCER_CONFLICT: CacheLookupReason.NAMESPACE_PRODUCER_CONFLICT,
+    _CacheDocumentIntegrityClassification.PRODUCER_MISMATCH: CacheLookupReason.PRODUCER_MISMATCH,
+    _CacheDocumentIntegrityClassification.SCHEMA_MISMATCH: CacheLookupReason.SCHEMA_MISMATCH,
+    _CacheDocumentIntegrityClassification.ARTIFACT_MISMATCH: CacheLookupReason.ARTIFACT_MISMATCH,
+    _CacheDocumentIntegrityClassification.RUNTIME_FINGERPRINT_MISMATCH: CacheLookupReason.RUNTIME_FINGERPRINT_MISMATCH,
+}
+_PAYLOAD_REASON = {
+    _PayloadValidationClassification.PAYLOAD_CARDINALITY_INVALID: CacheLookupReason.UNEXPECTED_PAYLOAD_OBJECT,
+    _PayloadValidationClassification.PAYLOAD_POLICY_LIMIT_EXCEEDED: CacheLookupReason.MALFORMED_MANIFEST,
+    _PayloadValidationClassification.UNSAFE_OBJECT: CacheLookupReason.UNSAFE_OBJECT,
+    _PayloadValidationClassification.UNEXPECTED_PAYLOAD_OBJECT: CacheLookupReason.UNEXPECTED_PAYLOAD_OBJECT,
+    _PayloadValidationClassification.PAYLOAD_MISSING: CacheLookupReason.PAYLOAD_MISSING,
+    _PayloadValidationClassification.PAYLOAD_HARDLINK_DETECTED: CacheLookupReason.PAYLOAD_HARDLINK_DETECTED,
+    _PayloadValidationClassification.PAYLOAD_SIZE_MISMATCH: CacheLookupReason.PAYLOAD_SIZE_MISMATCH,
+    _PayloadValidationClassification.PAYLOAD_DIGEST_MISMATCH: CacheLookupReason.PAYLOAD_DIGEST_MISMATCH,
+    _PayloadValidationClassification.PAYLOAD_READ_UNSTABLE: CacheLookupReason.UNSTABLE_SNAPSHOT,
+}
+
+
+def _diagnostic_for_reason(reason: CacheLookupReason) -> CacheLookupDiagnostic:
+    if reason is CacheLookupReason.UNSAFE_OBJECT:
+        code = CacheLookupDiagnosticCode.UNSAFE_OBJECT
+    elif reason.name.startswith("UNSUPPORTED_"):
+        code = CacheLookupDiagnosticCode.VERSION_UNSUPPORTED
+    elif reason is CacheLookupReason.INCOMPLETE_ENTRY:
+        code = CacheLookupDiagnosticCode.REQUIRED_OBJECT_MISSING
+    elif reason.name.startswith("MALFORMED_"):
+        code = CacheLookupDiagnosticCode.DOCUMENT_INVALID
+    elif "IDENTITY" in reason.name or reason is CacheLookupReason.CACHE_KEY_CONFLICT:
+        code = CacheLookupDiagnosticCode.IDENTITY_MISMATCH
+    elif reason in {CacheLookupReason.MANIFEST_DIGEST_MISMATCH,
+                    CacheLookupReason.METADATA_DIGEST_MISMATCH}:
+        code = CacheLookupDiagnosticCode.DIGEST_MISMATCH
+    elif reason is CacheLookupReason.PAYLOAD_MISSING:
+        code = CacheLookupDiagnosticCode.PAYLOAD_MISSING
+    elif reason is CacheLookupReason.PAYLOAD_SIZE_MISMATCH:
+        code = CacheLookupDiagnosticCode.PAYLOAD_SIZE_MISMATCH
+    elif reason is CacheLookupReason.PAYLOAD_DIGEST_MISMATCH:
+        code = CacheLookupDiagnosticCode.PAYLOAD_DIGEST_MISMATCH
+    elif reason is CacheLookupReason.PAYLOAD_HARDLINK_DETECTED:
+        code = CacheLookupDiagnosticCode.PAYLOAD_HARDLINK
+    elif reason is CacheLookupReason.UNSTABLE_SNAPSHOT:
+        code = CacheLookupDiagnosticCode.UNSTABLE
+    elif reason is CacheLookupReason.IO_FAILURE:
+        code = CacheLookupDiagnosticCode.IO_FAILURE
+    elif reason in {CacheLookupReason.UNEXPECTED_TOP_LEVEL_OBJECT,
+                    CacheLookupReason.UNEXPECTED_PAYLOAD_OBJECT}:
+        code = CacheLookupDiagnosticCode.UNEXPECTED_OBJECT
+    else:
+        code = CacheLookupDiagnosticCode.EXPECTATION_MISMATCH
+    subject = CacheLookupSubject.LOCK if "LOCK" in reason.name else CacheLookupSubject.ENTRY
+    return CacheLookupDiagnostic(code, subject)
+
+
+def lookup_cache_entry(
+    request: CacheLookupRequest,
+    *,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+    observer: CacheLookupObserver | None = None,
+) -> ReadOnlyCacheLookupResult:
+    """Perform one contract-complete, read-only Step 5B cache lookup."""
+
+    if not isinstance(request, CacheLookupRequest):
+        raise TypeError("request must be a CacheLookupRequest.")
+    if not isinstance(filesystem, ReadOnlyCacheFilesystem) or not isinstance(
+        filesystem, _PayloadReadOnlyCacheFilesystem
+    ):
+        raise TypeError("filesystem must implement the complete read-only lookup interface.")
+    if not isinstance(lock_clock, LockObservationClock):
+        raise TypeError("lock_clock must implement LockObservationClock.")
+    if observer is not None and not isinstance(observer, CacheLookupObserver):
+        raise TypeError("observer must implement CacheLookupObserver or be None.")
+
+    root = request.cache_root
+    entry_digest = derive_entry_digest(request.cache_key)
+    entry_path = derive_final_entry_path(root.resolved_path, request.namespace, request.cache_key)
+    key_reference = CacheKeyReference.from_cache_key(request.cache_key)
+    _notify_observer(observer, _CacheLookupObserverEvent("lookup_attempted", "attempted", entry_digest))
+
+    marker: CompletenessMarker | None = None
+    manifest: PayloadManifest | None = None
+    metadata: CacheEntryMetadata | None = None
+    observed_version: int | None = None
+
+    def finish(
+        status: CacheLookupStatus,
+        reason: CacheLookupReason | None,
+        level: CacheVerificationLevel,
+        *,
+        validated: ValidatedCacheEntryReference | None = None,
+        fully_hashed: bool = False,
+    ) -> ReadOnlyCacheLookupResult:
+        root_stable = False
+        try:
+            root_after = filesystem.inspect(root.resolved_path)
+            root_stable = root.identity.same_stable_object(root_after)
+        except (FileNotFoundError, CacheLookupFilesystemError):
+            pass
+        if not root_stable and (
+            reason is None
+            or _REASON_PRECEDENCE[reason]
+            > _REASON_PRECEDENCE[CacheLookupReason.UNSTABLE_SNAPSHOT]
+        ):
+            status = CacheLookupStatus.INVALID_ENTRY
+            reason = CacheLookupReason.UNSTABLE_SNAPSHOT
+            level = min(
+                level,
+                CacheVerificationLevel.DOCUMENT_INTEGRITY,
+                key=lambda item: tuple(CacheVerificationLevel).index(item),
+            )
+            validated = None
+            fully_hashed = False
+        diagnostics = () if reason is None else _finalize_diagnostics(
+            (_diagnostic_for_reason(reason),), limit=request.policy.max_diagnostics
+        )
+        event_name = {
+            CacheLookupStatus.HIT: "lookup_hit",
+            CacheLookupStatus.MISS: "lookup_absent",
+            CacheLookupStatus.UNSUPPORTED_VERSION: "lookup_unsupported",
+        }.get(status, "lookup_rejected")
+        _notify_observer(observer, _CacheLookupObserverEvent(event_name, status.value, entry_digest))
+        return CacheLookupResult(
+            status, reason, entry_path, validated, entry_digest, request.namespace,
+            key_reference, diagnostics, level, observed_version, fully_hashed,
+            metadata, manifest, marker,
+        )
+
+    def fail(
+        reason: CacheLookupReason, level: CacheVerificationLevel
+    ) -> ReadOnlyCacheLookupResult:
+        return finish(_REASON_STATUS[reason], reason, level)
+
+    try:
+        structure = _inspect_final_entry_structure(entry_path, filesystem=filesystem)
+    except UnstableFilesystemObjectError:
+        return fail(CacheLookupReason.UNSTABLE_SNAPSHOT, CacheVerificationLevel.NONE)
+    except (CacheLookupPermissionError, CacheLookupIOError):
+        return fail(CacheLookupReason.IO_FAILURE, CacheVerificationLevel.NONE)
+
+    if structure.classification is _FinalEntryStructureClassification.ENTRY_ABSENT:
+        try:
+            lock = _observe_matching_lock(
+                root, request.namespace, request.cache_key,
+                policy=request.lock_observation_policy,
+                clock=lock_clock,
+                filesystem=filesystem,
+            )
+        except FileNotFoundError:
+            return fail(CacheLookupReason.UNSTABLE_SNAPSHOT, CacheVerificationLevel.NONE)
+        except (CacheLookupPermissionError, CacheLookupIOError):
+            return fail(CacheLookupReason.IO_FAILURE, CacheVerificationLevel.NONE)
+        if lock.classification is _LockObservationClassification.ACTIVE:
+            return finish(CacheLookupStatus.LOCKED_OR_IN_PROGRESS, None, CacheVerificationLevel.NONE)
+        if lock.classification in {_LockObservationClassification.ABSENT,
+                                   _LockObservationClassification.STALE}:
+            return finish(CacheLookupStatus.MISS, None, CacheVerificationLevel.NONE)
+        lock_reason = {
+            _LockObservationClassification.UNSAFE_OBJECT: CacheLookupReason.UNSAFE_OBJECT,
+            _LockObservationClassification.UNSUPPORTED_LOCK_VERSION: CacheLookupReason.UNSUPPORTED_LOCK_VERSION,
+            _LockObservationClassification.MALFORMED_LOCK: CacheLookupReason.MALFORMED_LOCK,
+            _LockObservationClassification.LOCK_IDENTITY_CONFLICT: CacheLookupReason.LOCK_IDENTITY_CONFLICT,
+            _LockObservationClassification.LOCK_TIMESTAMP_INVALID: CacheLookupReason.LOCK_TIMESTAMP_INVALID,
+            _LockObservationClassification.IO_FAILURE: CacheLookupReason.IO_FAILURE,
+            _LockObservationClassification.UNSTABLE_SNAPSHOT: CacheLookupReason.UNSTABLE_SNAPSHOT,
+        }[lock.classification]
+        return fail(lock_reason, CacheVerificationLevel.NONE)
+
+    if structure.classification is _FinalEntryStructureClassification.UNSAFE_OBJECT:
+        return fail(CacheLookupReason.UNSAFE_OBJECT, CacheVerificationLevel.NONE)
+    if structure.classification is _FinalEntryStructureClassification.INCOMPLETE_ENTRY:
+        return fail(CacheLookupReason.INCOMPLETE_ENTRY, CacheVerificationLevel.NONE)
+    if structure.classification is _FinalEntryStructureClassification.UNEXPECTED_TOP_LEVEL_OBJECT:
+        return fail(CacheLookupReason.UNEXPECTED_TOP_LEVEL_OBJECT, CacheVerificationLevel.NONE)
+
+    try:
+        before = _capture_entry_snapshot(root, entry_path, filesystem=filesystem)
+        documents = _read_and_parse_final_entry_documents(
+            entry_path, policy=request.policy, filesystem=filesystem
+        )
+    except (FileNotFoundError, UnstableFilesystemObjectError):
+        return fail(CacheLookupReason.UNSTABLE_SNAPSHOT, CacheVerificationLevel.STRUCTURE)
+    except UnstableFilesystemObjectError:
+        return fail(CacheLookupReason.UNSTABLE_SNAPSHOT, CacheVerificationLevel.DOCUMENT_INTEGRITY)
+    except (CacheLookupPermissionError, CacheLookupIOError):
+        return fail(CacheLookupReason.IO_FAILURE, CacheVerificationLevel.STRUCTURE)
+
+    marker = documents.complete.model if isinstance(documents.complete.model, CompletenessMarker) else None
+    for document in (documents.complete, documents.metadata):
+        if document is not None and observed_version is None:
+            observed_version = dict(document.observed_versions).get("entry")
+    if documents.manifest is not None and isinstance(documents.manifest.model, PayloadManifest):
+        manifest = documents.manifest.model
+    if documents.classification is not _CacheDocumentClassification.VALID:
+        return fail(_DOCUMENT_REASON[documents.classification], CacheVerificationLevel.STRUCTURE)
+
+    integrity = _validate_final_entry_document_integrity(
+        root.resolved_path, entry_path, documents,
+        cache_key=request.cache_key,
+        namespace=request.namespace,
+        expectation=request.expectation,
+        artifact_expectation=request.artifact_expectation,
+    )
+    metadata = integrity.metadata
+    if integrity.classification is not _CacheDocumentIntegrityClassification.VALID:
+        return fail(_INTEGRITY_REASON[integrity.classification], CacheVerificationLevel.CANONICAL_DOCUMENTS)
+
+    try:
+        payload = _validate_final_entry_payload(
+            entry_path, integrity,
+            payload_expectation=request.payload_expectation,
+            policy=request.policy,
+            filesystem=filesystem,
+        )
+    except (CacheLookupPermissionError, CacheLookupIOError):
+        return fail(CacheLookupReason.IO_FAILURE, CacheVerificationLevel.DOCUMENT_INTEGRITY)
+    if payload.classification is not _PayloadValidationClassification.VALID:
+        return fail(_PAYLOAD_REASON[payload.classification], CacheVerificationLevel.DOCUMENT_INTEGRITY)
+
+    try:
+        stable = _validate_stable_entry_snapshot(
+            root, entry_path, before, documents, payload,
+            filesystem=filesystem, observer=observer,
+        )
+    except CacheLookupFilesystemError:
+        return fail(CacheLookupReason.UNSTABLE_SNAPSHOT, CacheVerificationLevel.DOCUMENT_INTEGRITY)
+    if stable.classification is not _StableSnapshotClassification.VALID:
+        return fail(CacheLookupReason.UNSTABLE_SNAPSHOT, CacheVerificationLevel.DOCUMENT_INTEGRITY)
+    if not isinstance(metadata, CacheEntryMetadata) or not isinstance(manifest, PayloadManifest) or not isinstance(marker, CompletenessMarker):
+        raise RuntimeError("successful lookup lost strict public document models.")
+    validated = ValidatedCacheEntryReference(
+        entry_path, entry_digest, request.namespace, key_reference,
+        metadata, manifest, marker, CacheVerificationLevel.FULL_PAYLOAD_SHA256,
+    )
+    return finish(
+        CacheLookupStatus.HIT, None, CacheVerificationLevel.FULL_PAYLOAD_SHA256,
+        validated=validated, fully_hashed=True,
+    )

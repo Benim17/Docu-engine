@@ -35,12 +35,12 @@ The current major workstream is the **Cache and Storage Manager**, within the
 Cache & Storage / Housekeeping Foundation phase.
 
 - **Current phase:** Cache & Storage / Housekeeping Foundation
-- **Current task:** Step 5B5 — Public lookup orchestration and regression hardening
+- **Current task:** Step 5C — Staging writer
 - **Status:** NOT STARTED — NEXT APPROVED IMPLEMENTATION STEP
-- **Next task:** Step 5C — Staging writer
+- **Next task:** Step 5D — Locking and atomic promotion
 - **Current branch:** `feature/cache-storage-foundation`
 
-Step 5B5 is the next approved implementation step. It has not begun.
+Step 5C is the next approved implementation step. It has not begun.
 
 ## Cache & Storage / Housekeeping Foundation
 
@@ -53,8 +53,9 @@ Step 5B5 is the next approved implementation step. It has not begun.
 - [x] Step 5B — Read-only lookup design
 - [x] Step 5B — Lock-lifecycle observation design
 - [x] Step 5B1 — Read-only lookup adapter and resource limits
+- [x] Step 5B — Read-only persistent cache lookup
 
-### Current: Step 5B2 — Structure and document validation
+### Completed: Step 5B — Read-only persistent cache lookup
 
 Internal implementation slices:
 
@@ -62,14 +63,14 @@ Internal implementation slices:
 - [x] Step 5B2B — Canonical document reads/parsing and unsupported-version classification
 - [x] Step 5B2C — Identity, expectations, and cross-document integrity validation
 
-Step 5B2A and Step 5B2B/5B2C helpers remain internal. Contract-complete public
-`MISS` and `LOCKED_OR_IN_PROGRESS` behavior is reserved for Step 5B5.
+Step 5B2A and Step 5B2B/5B2C helpers remain internal. Step 5B5 composes them into
+the contract-complete public read-only lookup behavior.
 
 ### Approved later Step 5B substeps
 
 - [x] Step 5B3 — Payload validation
 - [x] Step 5B4 — Stable snapshot, diagnostics, and read-only lock observation
-- [ ] Step 5B5 — Public lookup orchestration and regression hardening
+- [x] Step 5B5 — Public lookup orchestration and regression hardening
 
 ## Planned
 
