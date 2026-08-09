@@ -352,7 +352,9 @@ The required order is:
 8. Inspect every enumerated top-level name without following symlinks, including unknown names, so unsafe-object precedence is established before generic unexpected-name classification.
 9. Enforce exactly `COMPLETE`, `metadata.json`, `manifest.json`, and `payload`, and enforce their required object types.
 10. Read bounded `COMPLETE`, then metadata, then manifest using no-follow regular-file handles.
-11. Parse recognizable version fields cautiously, then parse all three with strict Step 5A canonical parsers.
+11. Parse recognizable version fields cautiously. Parse `COMPLETE` and manifest
+    with strict Step 5A canonical parsers; parse metadata through the private
+    pre-model observation boundary in section 8.1.
 12. Validate expected identity, cross-document identity, namespace/producer consistency, runtime expectation, and optional artifact expectation.
 13. Hash the exact stored metadata and manifest bytes and validate every document digest.
 14. Validate metadata count/byte totals against the manifest through Step 5A `CacheEntryContract`.
@@ -365,6 +367,73 @@ The required order is:
 21. Return the highest-precedence deterministic result.
 
 Reading `COMPLETE` first cheaply establishes intended completeness and version while conveying no trust. Documents precede payload traversal so hostile or oversized manifests cannot trigger arbitrary enumeration. Stored document digests are checked before expensive payload hashing. Post-read checks prevent a changing snapshot from being accepted silently.
+
+### 8.1 Metadata pre-model observation boundary
+
+Step 5B uses a private immutable `ObservedCacheEntryMetadataV1`-equivalent
+representation between bounded canonical parsing and strict Step 5A
+`CacheEntryMetadata` construction. The name is implementation-private; the
+normative boundary is that the observation represents exactly contract-v1
+`metadata.json`, not a second metadata schema or a public model.
+
+The pre-model observation is created only after all of the following succeed:
+
+- the complete document is read within the metadata byte limit;
+- UTF-8, no-BOM, duplicate-key rejection, canonical JSON encoding, and exact
+  supported-v1 field-set validation;
+- supported entry, cache-key, and runtime-fingerprint version validation;
+- independent scalar syntax and numeric-bound validation; and
+- strict nested construction of the existing Step 5A `CacheKeyReference`,
+  `CacheNamespace`, `CacheProducerMetadata`, `CacheRuntimeFingerprint`, and
+  `CacheArtifactMetadata` values.
+
+The observation retains the exact stored metadata bytes and the typed observed
+values for `entry_digest`, cache-key reference, namespace, producer identity and
+schema, runtime fingerprint, artifact metadata, creation timestamp, payload
+manifest digest, payload file count, and payload byte total. It performs no
+cross-field or expected-request comparisons.
+
+Step 5B2B classifies a metadata document as `MALFORMED_METADATA` when any
+independent contract-v1 representation fails: malformed or noncanonical JSON;
+BOM or whitespace violations; duplicate keys; unknown or missing fields; a
+malformed version discriminator; wrong field or nested-field type; invalid digest,
+token, timestamp, integer, namespace, cache-key-reference, runtime-fingerprint,
+producer, or artifact syntax; or any other field that cannot independently be
+represented under contract v1. A recognizable unsupported entry, cache-key, or
+runtime-fingerprint version retains its applicable `UNSUPPORTED_VERSION` reason
+and is not converted to malformed metadata.
+
+Step 5B2C consumes the private observation and applies relational checks in locked
+reason/status precedence:
+
+- `ENTRY_IDENTITY_CONFLICT` when stored metadata `entry_digest` disagrees with
+  the digest reconstructed from its observed cache-key reference, with the
+  expected/path identity, or when the marker entry digest conflicts as otherwise
+  specified by this contract;
+- `CACHE_KEY_CONFLICT` when the observed metadata cache-key reference differs
+  from the expected cache key/reference;
+- the existing `MANIFEST_DIGEST_MISMATCH` and `METADATA_DIGEST_MISMATCH`
+  comparisons using the exact stored document bytes;
+- `NAMESPACE_PRODUCER_CONFLICT` when the observed metadata namespace producer ID
+  or schema differs from the corresponding observed metadata producer field;
+- then `PRODUCER_MISMATCH`, `SCHEMA_MISMATCH` (including
+  `ARTIFACT_MISMATCH`), and `RUNTIME_FINGERPRINT_MISMATCH` in their locked
+  precedence.
+
+Only after the relational invariants required by Step 5A are satisfied may Step
+5B construct the strict `CacheEntryMetadata`. Canonical internally consistent
+metadata therefore produces the same Step 5A model as before; canonical but
+relationally inconsistent metadata remains a private typed observation long enough
+to receive its precise Step 5B classification. Step 5A model invariants remain
+unchanged. Implementations must reuse the Step 5A canonical JSON, exact field names,
+scalar validators, and nested models rather than copy them into an independent
+schema. If existing private validators are not safely reusable, a tiny pure Step 5A
+helper may expose schema-only metadata parsing to this boundary, but it must not
+expose an unsafe `CacheEntryMetadata` constructor or weaken aggregate invariants.
+
+The pre-model observation, its raw dictionary, and raw JSON are never public result
+data. Public `metadata` remains exactly `CacheEntryMetadata | None`, and a metadata
+value may be returned only after strict Step 5A construction succeeds.
 
 ## 9. Bounded reads and resource limits
 
@@ -404,8 +473,10 @@ All digests use SHA-256 and lowercase algorithm-qualified syntax where the model
 For stored `metadata.json` and `manifest.json`:
 
 1. bounded-read the exact stored bytes;
-2. parse with the Step 5A strict parser, which rejects BOMs, whitespace differences, duplicate keys, floats, non-finite numbers, unknown fields, and noncanonical encoding;
-3. reserialize the parsed model canonically;
+2. parse with the Step 5A strict parser or the section 8.1 schema-reusing metadata
+   observation boundary, rejecting BOMs, whitespace differences, duplicate keys,
+   floats, non-finite numbers, unknown fields, and noncanonical encoding;
+3. reserialize the parsed model or typed observation canonically;
 4. require reserialized bytes to equal stored bytes exactly; and
 5. hash the exact stored bytes.
 
