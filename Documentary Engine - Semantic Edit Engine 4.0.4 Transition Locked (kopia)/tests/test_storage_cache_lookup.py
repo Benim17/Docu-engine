@@ -58,12 +58,15 @@ from engine.storage.cache_lookup import (
     _CacheArtifactExpectation,
     _CacheVerificationLevel,
     _ObservedCacheEntryMetadataV1,
+    _PayloadValidationClassification,
+    _StreamedPayloadHash,
     _inspect_final_entry_structure,
     _parse_observed_cache_entry_metadata_v1,
     _payload_cardinality_is_valid,
     _read_and_parse_cache_document,
     _read_and_parse_final_entry_documents,
     _validate_final_entry_document_integrity,
+    _validate_final_entry_payload,
     _trusted_producer_payload_expectation,
 )
 
@@ -1437,6 +1440,404 @@ def test_payload_cardinality_prerequisite_adds_no_step5b3_io_or_public_lookup():
     assert not hasattr(cache_lookup, "lookup_cache_entry")
     assert not hasattr(cache_lookup, "hash_payload")
     assert not hasattr(cache_lookup, "observe_lock")
+    assert not hasattr(cache_lookup, "HIT")
+    assert not hasattr(cache_lookup, "MISS")
+    assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
+
+
+def _step5b3_fixture(tmp_path, payload_specs):
+    records = []
+    for relative_path, content, declared_size, declared_digest in payload_specs:
+        records.append(
+            {
+                "digest": declared_digest
+                or "sha256:" + hashlib.sha256(content).hexdigest(),
+                "media_type": "application/octet-stream",
+                "relative_path": relative_path,
+                "role": "primary",
+                "size_bytes": len(content) if declared_size is None else declared_size,
+            }
+        )
+    records.sort(key=lambda item: item["relative_path"])
+    manifest_data = {"files": records, "manifest_version": 1}
+    manifest_bytes = canonical_json_bytes(manifest_data)
+
+    def change_manifest(data):
+        data.clear()
+        data.update(manifest_data)
+
+    def change_metadata(data):
+        data.update(
+            payload_file_count=len(records),
+            payload_total_bytes=sum(item["size_bytes"] for item in records),
+            payload_manifest_digest=(
+                "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+            ),
+        )
+
+    fixture = _step5b2c_documents(
+        tmp_path,
+        metadata_mutator=change_metadata,
+        manifest_mutator=change_manifest,
+    )
+    for relative_path, content, _, _ in payload_specs:
+        destination = fixture[1] / "payload" / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    document_integrity = _validate_step5b2c(fixture)
+    assert document_integrity.classification is _CacheDocumentIntegrityClassification.VALID
+    return fixture[1], document_integrity
+
+
+def _validate_step5b3(
+    fixture,
+    *,
+    expectation=None,
+    policy=None,
+    filesystem=FILESYSTEM,
+):
+    entry, document_integrity = fixture
+    return _validate_final_entry_payload(
+        entry,
+        document_integrity,
+        payload_expectation=expectation or ProducerPayloadExpectation(),
+        policy=policy or CacheLookupVerificationPolicy(),
+        filesystem=filesystem,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload_specs",
+    [
+        (("one.bin", b"one", None, None),),
+        (
+            ("a.bin", b"a", None, None),
+            ("b.bin", b"bb", None, None),
+        ),
+        (("nested/deeper/value.bin", b"nested", None, None),),
+        (("empty.bin", b"", None, None),),
+    ],
+)
+def test_step5b3_accepts_exact_manifest_authoritative_payloads(
+    tmp_path, payload_specs
+):
+    result = _validate_step5b3(_step5b3_fixture(tmp_path, payload_specs))
+
+    expected_order = tuple(sorted(spec[0] for spec in payload_specs))
+    assert result.classification is _PayloadValidationClassification.VALID
+    assert result.verification_level is _CacheVerificationLevel.DOCUMENT_INTEGRITY
+    assert result.observed_regular_files == expected_order
+    assert result.hash_order == expected_order
+    assert result.payload_bytes_hashed == sum(len(spec[1]) for spec in payload_specs)
+    assert result.declared_payload_bytes_fully_verified
+
+
+def test_step5b3_hashes_in_manifest_order_not_native_listing_order(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path,
+        (
+            ("z.bin", b"z", None, None),
+            ("a.bin", b"a", None, None),
+            ("m.bin", b"m", None, None),
+        ),
+    )
+    observed_order = []
+
+    class RecordingFilesystem(LocalReadOnlyCacheFilesystem):
+        def stream_regular_file_sha256(self, path, *, declared_size, chunk_size):
+            observed_order.append(Path(path).name)
+            return super().stream_regular_file_sha256(
+                path, declared_size=declared_size, chunk_size=chunk_size
+            )
+
+    result = _validate_step5b3(fixture, filesystem=RecordingFilesystem())
+    assert result.classification is _PayloadValidationClassification.VALID
+    assert observed_order == ["a.bin", "m.bin", "z.bin"]
+
+
+def test_step5b3_applies_trusted_empty_payload_cardinality(tmp_path):
+    fixture = _step5b3_fixture(tmp_path, ())
+
+    rejected = _validate_step5b3(fixture)
+    accepted = _validate_step5b3(
+        fixture,
+        expectation=_trusted_producer_payload_expectation(
+            PayloadCardinalityExpectation.EMPTY_ALLOWED
+        ),
+    )
+    assert (
+        rejected.classification
+        is _PayloadValidationClassification.PAYLOAD_CARDINALITY_INVALID
+    )
+    assert accepted.classification is _PayloadValidationClassification.VALID
+    assert accepted.observed_regular_files == ()
+    assert accepted.hash_order == ()
+    assert accepted.payload_bytes_hashed == 0
+    assert accepted.declared_payload_bytes_fully_verified
+
+
+@pytest.mark.parametrize(
+    "unexpected_kind",
+    ["extra_file", "empty_directory", "directory_branch", "nested_descendant"],
+)
+def test_step5b3_rejects_unexpected_payload_objects(tmp_path, unexpected_kind):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"declared", None, None),)
+    )
+    payload = fixture[0] / "payload"
+    if unexpected_kind == "extra_file":
+        (payload / "extra.bin").write_bytes(b"extra")
+    elif unexpected_kind == "empty_directory":
+        (payload / "empty").mkdir()
+    elif unexpected_kind == "directory_branch":
+        (payload / "branch").mkdir()
+        (payload / "branch" / "extra.bin").write_bytes(b"extra")
+    else:
+        (payload / "nested").mkdir()
+        (payload / "nested" / "extra.bin").write_bytes(b"extra")
+
+    result = _validate_step5b3(fixture)
+    assert (
+        result.classification
+        is _PayloadValidationClassification.UNEXPECTED_PAYLOAD_OBJECT
+    )
+
+
+@pytest.mark.parametrize(
+    "unexpected_path",
+    ["a/bad.txt", "a/b/c.txt", "a2/file.txt"],
+)
+def test_step5b3_manifest_directory_prefixes_are_component_exact(
+    tmp_path, unexpected_path
+):
+    fixture = _step5b3_fixture(
+        tmp_path, (("a/b.txt", b"declared", None, None),)
+    )
+    unexpected = fixture[0] / "payload" / unexpected_path
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_bytes(b"unexpected")
+
+    result = _validate_step5b3(fixture)
+    assert (
+        result.classification
+        is _PayloadValidationClassification.UNEXPECTED_PAYLOAD_OBJECT
+    )
+
+
+def test_step5b3_rejects_missing_declared_file(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path, (("missing.bin", b"expected", None, None),)
+    )
+    (fixture[0] / "payload" / "missing.bin").unlink()
+
+    result = _validate_step5b3(fixture)
+    assert result.classification is _PayloadValidationClassification.PAYLOAD_MISSING
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "nested_symlink", "fifo", "socket"])
+def test_step5b3_rejects_unsafe_payload_objects(tmp_path, unsafe_kind):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"declared", None, None),)
+    )
+    payload = fixture[0] / "payload"
+    unsafe = payload / "unsafe"
+    server = None
+    filesystem = FILESYSTEM
+    if unsafe_kind == "symlink":
+        unsafe.symlink_to(payload / "declared.bin")
+    elif unsafe_kind == "nested_symlink":
+        unsafe.symlink_to(payload, target_is_directory=True)
+    elif unsafe_kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO creation is unavailable")
+        os.mkfifo(unsafe)
+    else:
+        unsafe.write_bytes(b"socket-fixture")
+
+        class SocketObservationFilesystem(LocalReadOnlyCacheFilesystem):
+            def inspect(self, path):
+                identity = super().inspect(path)
+                return (
+                    replace(identity, object_type=FilesystemObjectType.SOCKET)
+                    if Path(path) == unsafe
+                    else identity
+                )
+
+        filesystem = SocketObservationFilesystem()
+    try:
+        result = _validate_step5b3(fixture, filesystem=filesystem)
+    finally:
+        if server is not None:
+            server.close()
+    assert result.classification is _PayloadValidationClassification.UNSAFE_OBJECT
+
+
+def test_step5b3_rejects_symlink_at_declared_payload_path(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"declared", None, None),)
+    )
+    declared = fixture[0] / "payload" / "declared.bin"
+    target = tmp_path / "target"
+    target.write_bytes(b"declared")
+    declared.unlink()
+    declared.symlink_to(target)
+
+    result = _validate_step5b3(fixture)
+    assert result.classification is _PayloadValidationClassification.UNSAFE_OBJECT
+
+
+def test_step5b3_rejects_intermediate_directory_symlink(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path, (("nested/declared.bin", b"declared", None, None),)
+    )
+    nested = fixture[0] / "payload" / "nested"
+    target = tmp_path / "target-dir"
+    target.mkdir()
+    (target / "declared.bin").write_bytes(b"declared")
+    (nested / "declared.bin").unlink()
+    nested.rmdir()
+    nested.symlink_to(target, target_is_directory=True)
+
+    result = _validate_step5b3(fixture)
+    assert result.classification is _PayloadValidationClassification.UNSAFE_OBJECT
+
+
+def test_step5b3_detects_payload_hardlink_but_allows_unavailable_evidence(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"declared", None, None),)
+    )
+    declared = fixture[0] / "payload" / "declared.bin"
+    outside_link = tmp_path / "outside-link"
+    os.link(declared, outside_link)
+
+    detected = _validate_step5b3(fixture)
+
+    class NoLinkCountFilesystem(LocalReadOnlyCacheFilesystem):
+        def inspect(self, path):
+            identity = super().inspect(path)
+            return (
+                replace(identity, link_count=None)
+                if identity.object_type is FilesystemObjectType.REGULAR_FILE
+                else identity
+            )
+
+        def stream_regular_file_sha256(self, path, *, declared_size, chunk_size):
+            streamed = super().stream_regular_file_sha256(
+                path, declared_size=declared_size, chunk_size=chunk_size
+            )
+            return replace(
+                streamed,
+                pre_read_identity=replace(
+                    streamed.pre_read_identity, link_count=None
+                ),
+                handle_identity=replace(streamed.handle_identity, link_count=None),
+            )
+
+    unavailable = _validate_step5b3(
+        fixture, filesystem=NoLinkCountFilesystem()
+    )
+    assert (
+        detected.classification
+        is _PayloadValidationClassification.PAYLOAD_HARDLINK_DETECTED
+    )
+    assert unavailable.classification is _PayloadValidationClassification.VALID
+
+
+@pytest.mark.parametrize("actual", [b"short", b"content-too-large"])
+def test_step5b3_size_mismatch_precedes_digest_mismatch(tmp_path, actual):
+    fixture = _step5b3_fixture(
+        tmp_path,
+        (("declared.bin", actual, 7, "sha256:" + "f" * 64),),
+    )
+
+    result = _validate_step5b3(fixture)
+    assert result.classification is _PayloadValidationClassification.PAYLOAD_SIZE_MISMATCH
+    assert result.hash_order == ()
+
+
+def test_step5b3_rejects_wrong_digest_after_exact_size_stream(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path,
+        (("declared.bin", b"content", None, "sha256:" + "f" * 64),),
+    )
+
+    result = _validate_step5b3(fixture)
+    assert result.classification is _PayloadValidationClassification.PAYLOAD_DIGEST_MISMATCH
+    assert result.payload_bytes_hashed == 7
+
+
+def test_step5b3_streams_in_configured_chunks(tmp_path, monkeypatch):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"abcdefgh", None, None),)
+    )
+    original_read = os.read
+    requested_sizes = []
+
+    def recording_read(descriptor, size):
+        requested_sizes.append(size)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", recording_read)
+    result = _validate_step5b3(
+        fixture,
+        policy=replace(CacheLookupVerificationPolicy(), read_chunk_size=2),
+    )
+    assert result.classification is _PayloadValidationClassification.VALID
+    assert requested_sizes[:-1] == [2, 2, 2, 2]
+    assert requested_sizes[-1] == 1
+
+
+@pytest.mark.parametrize("stream_fault", ["early_eof", "growth"])
+def test_step5b3_rejects_stream_length_boundary_faults(tmp_path, stream_fault):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"content", None, None),)
+    )
+
+    class FaultFilesystem(LocalReadOnlyCacheFilesystem):
+        def stream_regular_file_sha256(self, path, *, declared_size, chunk_size):
+            streamed = super().stream_regular_file_sha256(
+                path, declared_size=declared_size, chunk_size=chunk_size
+            )
+            return replace(
+                streamed,
+                bytes_read=(declared_size - 1 if stream_fault == "early_eof" else declared_size),
+                has_additional_byte=stream_fault == "growth",
+            )
+
+    result = _validate_step5b3(fixture, filesystem=FaultFilesystem())
+    assert result.classification is _PayloadValidationClassification.PAYLOAD_SIZE_MISMATCH
+
+
+def test_step5b3_does_not_scan_locks_siblings_or_reenumerate_payload(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"declared", None, None),)
+    )
+    listed = []
+
+    class RecordingFilesystem(LocalReadOnlyCacheFilesystem):
+        def list_directory(self, path):
+            listed.append(Path(path))
+            return super().list_directory(path)
+
+    result = _validate_step5b3(fixture, filesystem=RecordingFilesystem())
+    assert result.classification is _PayloadValidationClassification.VALID
+    assert listed == [fixture[0] / "payload"]
+    assert not any("locks" in path.parts for path in listed)
+
+
+def test_step5b3_remains_internal_and_read_only(tmp_path):
+    import engine.storage.cache_lookup as cache_lookup
+
+    fixture = _step5b3_fixture(
+        tmp_path, (("declared.bin", b"declared", None, None),)
+    )
+    before = tuple(sorted((fixture[0] / "payload").rglob("*")))
+    result = _validate_step5b3(fixture)
+    after = tuple(sorted((fixture[0] / "payload").rglob("*")))
+
+    assert result.classification is _PayloadValidationClassification.VALID
+    assert before == after
+    assert not hasattr(cache_lookup, "lookup_cache_entry")
     assert not hasattr(cache_lookup, "HIT")
     assert not hasattr(cache_lookup, "MISS")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")

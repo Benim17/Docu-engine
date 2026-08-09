@@ -14,7 +14,7 @@ import json
 import stat
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
 
 from .persistent_cache import (
@@ -227,6 +227,15 @@ class BoundedFileRead:
             raise ValueError("A within-limit read must contain exact bytes.")
 
 
+@dataclass(frozen=True)
+class _StreamedPayloadHash:
+    digest: str
+    bytes_read: int
+    has_additional_byte: bool
+    pre_read_identity: FileIdentity
+    handle_identity: FileIdentity
+
+
 @runtime_checkable
 class ReadOnlyCacheFilesystem(Protocol):
     """Narrow filesystem surface with no mutation-capable methods."""
@@ -243,6 +252,18 @@ class ReadOnlyCacheFilesystem(Protocol):
     def read_regular_file_bounded(
         self, path: str | Path, *, max_bytes: int
     ) -> BoundedFileRead:
+        ...
+
+
+@runtime_checkable
+class _PayloadReadOnlyCacheFilesystem(ReadOnlyCacheFilesystem, Protocol):
+    def stream_regular_file_sha256(
+        self,
+        path: str | Path,
+        *,
+        declared_size: int,
+        chunk_size: int,
+    ) -> _StreamedPayloadHash:
         ...
 
 
@@ -393,6 +414,80 @@ class LocalReadOnlyCacheFilesystem:
             handle_identity=handle_identity,
             post_read_identity=post_read,
             stable_read=stable,
+        )
+
+    def stream_regular_file_sha256(
+        self,
+        path: str | Path,
+        *,
+        declared_size: int,
+        chunk_size: int,
+    ) -> _StreamedPayloadHash:
+        """Hash at most the declared payload bytes and probe for one extra byte."""
+
+        if (
+            isinstance(declared_size, bool)
+            or not isinstance(declared_size, int)
+            or declared_size < 0
+        ):
+            raise ValueError("declared_size must be a non-negative integer.")
+        chunk_limit = _positive_integer(chunk_size, "chunk_size")
+        pre_read = self.inspect(path)
+        if pre_read.object_type is FilesystemObjectType.SYMLINK:
+            raise SymlinkRejectedError("Payload streaming rejects symlinks.")
+        if pre_read.object_type is not FilesystemObjectType.REGULAR_FILE:
+            raise UnsupportedFilesystemObjectError(
+                "Payload streaming requires a regular file."
+            )
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor: int | None = None
+        digest = hashlib.sha256()
+        bytes_read = 0
+        has_additional_byte = False
+        try:
+            descriptor = os.open(path, flags)
+            handle_identity = self._inspect_handle(descriptor)
+            if handle_identity.object_type is not FilesystemObjectType.REGULAR_FILE:
+                raise UnstableFilesystemObjectError(
+                    "Payload path changed to a non-regular object before streaming."
+                )
+            if not pre_read.same_stable_object(handle_identity):
+                raise UnstableFilesystemObjectError(
+                    "Payload file changed before streaming."
+                )
+            remaining = declared_size
+            while remaining:
+                chunk = os.read(descriptor, min(chunk_limit, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                bytes_read += len(chunk)
+                remaining -= len(chunk)
+            has_additional_byte = bool(os.read(descriptor, 1))
+        except FileNotFoundError:
+            raise
+        except (SymlinkRejectedError, UnstableFilesystemObjectError):
+            raise
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ELOOP:
+                raise SymlinkRejectedError("Payload streaming rejects symlinks.") from exc
+            raise _translated_os_error(exc, "Payload streaming") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        return _StreamedPayloadHash(
+            "sha256:" + digest.hexdigest(),
+            bytes_read,
+            has_additional_byte,
+            pre_read,
+            handle_identity,
         )
 
 
@@ -605,6 +700,19 @@ class _CacheDocumentIntegrityClassification(str, Enum):
     SCHEMA_MISMATCH = "schema_mismatch"
     ARTIFACT_MISMATCH = "artifact_mismatch"
     RUNTIME_FINGERPRINT_MISMATCH = "runtime_fingerprint_mismatch"
+
+
+class _PayloadValidationClassification(str, Enum):
+    VALID = "valid"
+    PAYLOAD_CARDINALITY_INVALID = "payload_cardinality_invalid"
+    PAYLOAD_POLICY_LIMIT_EXCEEDED = "payload_policy_limit_exceeded"
+    UNSAFE_OBJECT = "unsafe_object"
+    UNEXPECTED_PAYLOAD_OBJECT = "unexpected_payload_object"
+    PAYLOAD_MISSING = "payload_missing"
+    PAYLOAD_HARDLINK_DETECTED = "payload_hardlink_detected"
+    PAYLOAD_SIZE_MISMATCH = "payload_size_mismatch"
+    PAYLOAD_DIGEST_MISMATCH = "payload_digest_mismatch"
+    PAYLOAD_READ_UNSTABLE = "payload_read_unstable"
 
 
 class _CacheVerificationLevel(str, Enum):
@@ -830,6 +938,16 @@ class _FinalEntryDocumentIntegrityObservation:
     documents: _FinalEntryDocumentsObservation
     metadata: CacheEntryMetadata | None = None
     payload_bytes_fully_hashed: bool = False
+
+
+@dataclass(frozen=True)
+class _PayloadValidationObservation:
+    classification: _PayloadValidationClassification
+    verification_level: _CacheVerificationLevel
+    observed_regular_files: tuple[str, ...] = ()
+    hash_order: tuple[str, ...] = ()
+    payload_bytes_hashed: int = 0
+    declared_payload_bytes_fully_verified: bool = False
 
 
 class _VersionProbeError(ValueError):
@@ -1171,4 +1289,213 @@ def _validate_final_entry_document_integrity(
         _CacheDocumentIntegrityClassification.VALID,
         level=_CacheVerificationLevel.DOCUMENT_INTEGRITY,
         metadata=strict_metadata,
+    )
+
+
+def _validate_final_entry_payload(
+    entry_path: str | Path,
+    document_integrity: _FinalEntryDocumentIntegrityObservation,
+    *,
+    payload_expectation: ProducerPayloadExpectation,
+    policy: CacheLookupVerificationPolicy,
+    filesystem: _PayloadReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> _PayloadValidationObservation:
+    """Validate one manifest-authoritative payload tree without public lookup state."""
+
+    if not isinstance(
+        document_integrity, _FinalEntryDocumentIntegrityObservation
+    ) or (
+        document_integrity.classification
+        is not _CacheDocumentIntegrityClassification.VALID
+        or document_integrity.verification_level
+        is not _CacheVerificationLevel.DOCUMENT_INTEGRITY
+        or not isinstance(document_integrity.metadata, CacheEntryMetadata)
+    ):
+        raise ValueError("Step 5B3 requires successful document-integrity validation.")
+    if not isinstance(payload_expectation, ProducerPayloadExpectation):
+        raise TypeError("payload_expectation must be trusted producer semantics.")
+    if not isinstance(policy, CacheLookupVerificationPolicy):
+        raise TypeError("policy must be a CacheLookupVerificationPolicy.")
+    if not isinstance(filesystem, _PayloadReadOnlyCacheFilesystem):
+        raise TypeError(
+            "filesystem must implement the read-only payload streaming interface."
+        )
+    manifest_observation = document_integrity.documents.manifest
+    if manifest_observation is None or not isinstance(
+        manifest_observation.model, PayloadManifest
+    ):
+        raise ValueError("Document-integrity result must retain its manifest model.")
+    manifest = manifest_observation.model
+    metadata = document_integrity.metadata
+
+    def result(
+        classification: _PayloadValidationClassification,
+        *,
+        observed: tuple[str, ...] = (),
+        hash_order: tuple[str, ...] = (),
+        bytes_hashed: int = 0,
+        fully_hashed: bool = False,
+    ) -> _PayloadValidationObservation:
+        return _PayloadValidationObservation(
+            classification,
+            _CacheVerificationLevel.DOCUMENT_INTEGRITY,
+            observed,
+            hash_order,
+            bytes_hashed,
+            fully_hashed,
+        )
+
+    if not _payload_cardinality_is_valid(
+        payload_expectation,
+        payload_file_count=metadata.payload_file_count,
+        payload_total_bytes=metadata.payload_total_bytes,
+        manifest=manifest,
+    ):
+        return result(_PayloadValidationClassification.PAYLOAD_CARDINALITY_INVALID)
+
+    records = manifest.files
+    declared_paths = tuple(record.relative_path for record in records)
+    if len(records) > policy.max_payload_records:
+        return result(_PayloadValidationClassification.PAYLOAD_POLICY_LIMIT_EXCEEDED)
+    if any(
+        len(path.encode("utf-8")) > policy.max_relative_path_utf8_bytes
+        or len(PurePosixPath(path).parts) > policy.max_payload_depth
+        or record.size_bytes > policy.max_individual_payload_bytes
+        for path, record in zip(declared_paths, records)
+    ) or sum(record.size_bytes for record in records) > policy.max_total_payload_bytes:
+        return result(_PayloadValidationClassification.PAYLOAD_POLICY_LIMIT_EXCEEDED)
+
+    declared_set = frozenset(declared_paths)
+    required_directories = frozenset(
+        "/".join(parts[:index])
+        for path in declared_paths
+        for parts in (PurePosixPath(path).parts,)
+        for index in range(1, len(parts))
+    )
+    payload_root = Path(entry_path) / "payload"
+    try:
+        root_identity = filesystem.inspect(payload_root)
+    except FileNotFoundError:
+        return result(_PayloadValidationClassification.PAYLOAD_MISSING)
+    if root_identity.object_type is not FilesystemObjectType.DIRECTORY:
+        return result(_PayloadValidationClassification.UNSAFE_OBJECT)
+
+    observed_identities: dict[str, FileIdentity] = {}
+
+    def enumerate_directory(
+        directory: Path, relative_directory: str | None
+    ) -> _PayloadValidationClassification | None:
+        try:
+            names = tuple(sorted(filesystem.list_directory(directory)))
+            identities = tuple(
+                (name, filesystem.inspect(directory / name)) for name in names
+            )
+        except FileNotFoundError:
+            return _PayloadValidationClassification.PAYLOAD_MISSING
+
+        unsafe = tuple(
+            name
+            for name, identity in identities
+            if identity.object_type
+            not in {FilesystemObjectType.REGULAR_FILE, FilesystemObjectType.DIRECTORY}
+        )
+        if unsafe:
+            return _PayloadValidationClassification.UNSAFE_OBJECT
+
+        child_directories: list[tuple[str, Path]] = []
+        for name, identity in identities:
+            relative = name if relative_directory is None else f"{relative_directory}/{name}"
+            if identity.object_type is FilesystemObjectType.REGULAR_FILE:
+                observed_identities[relative] = identity
+                if relative not in declared_set:
+                    return _PayloadValidationClassification.UNEXPECTED_PAYLOAD_OBJECT
+            else:
+                if relative not in required_directories:
+                    return _PayloadValidationClassification.UNEXPECTED_PAYLOAD_OBJECT
+                child_directories.append((relative, directory / name))
+        for relative, child in child_directories:
+            rejected = enumerate_directory(child, relative)
+            if rejected is not None:
+                return rejected
+        return None
+
+    rejected = enumerate_directory(payload_root, None)
+    observed_paths = tuple(sorted(observed_identities))
+    if rejected is not None:
+        return result(rejected, observed=observed_paths)
+    if observed_paths != declared_paths:
+        return result(
+            _PayloadValidationClassification.PAYLOAD_MISSING,
+            observed=observed_paths,
+        )
+
+    bytes_hashed = 0
+    hash_order: list[str] = []
+    for record in records:
+        identity = observed_identities[record.relative_path]
+        if identity.link_count is not None and identity.link_count > 1:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_HARDLINK_DETECTED,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
+        if identity.size != record.size_bytes:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_SIZE_MISMATCH,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
+        candidate = payload_root.joinpath(*PurePosixPath(record.relative_path).parts)
+        try:
+            streamed = filesystem.stream_regular_file_sha256(
+                candidate,
+                declared_size=record.size_bytes,
+                chunk_size=policy.read_chunk_size,
+            )
+        except FileNotFoundError:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_MISSING,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
+        except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+            return result(
+                _PayloadValidationClassification.UNSAFE_OBJECT,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
+        except UnstableFilesystemObjectError:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_READ_UNSTABLE,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
+        if streamed.bytes_read != record.size_bytes or streamed.has_additional_byte:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_SIZE_MISMATCH,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed + streamed.bytes_read,
+            )
+        hash_order.append(record.relative_path)
+        bytes_hashed += streamed.bytes_read
+        if streamed.digest != record.digest:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_DIGEST_MISMATCH,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
+
+    return result(
+        _PayloadValidationClassification.VALID,
+        observed=observed_paths,
+        hash_order=tuple(hash_order),
+        bytes_hashed=bytes_hashed,
+        fully_hashed=True,
     )
