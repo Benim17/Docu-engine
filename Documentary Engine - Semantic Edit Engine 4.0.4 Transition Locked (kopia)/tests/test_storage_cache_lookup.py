@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+from datetime import datetime, timezone
 
 import pytest
 
@@ -24,6 +25,7 @@ from engine.storage.persistent_cache import (
     canonical_json_bytes,
     derive_entry_digest,
     derive_final_entry_path,
+    derive_lock_path,
 )
 
 from engine.storage.cache_lookup import (
@@ -57,16 +59,28 @@ from engine.storage.cache_lookup import (
     _CacheDocumentName,
     _CacheArtifactExpectation,
     _CacheVerificationLevel,
+    _CacheLookupDiagnostic,
+    _CacheLookupDiagnosticCode,
+    _CacheLookupObserverEvent,
+    _CacheLookupSubject,
+    _LockObservationClassification,
     _ObservedCacheEntryMetadataV1,
     _PayloadValidationClassification,
     _StreamedPayloadHash,
+    _StableSnapshotClassification,
+    LockObservationPolicy,
     _inspect_final_entry_structure,
+    _capture_entry_snapshot,
+    _finalize_diagnostics,
+    _notify_observer,
+    _observe_matching_lock,
     _parse_observed_cache_entry_metadata_v1,
     _payload_cardinality_is_valid,
     _read_and_parse_cache_document,
     _read_and_parse_final_entry_documents,
     _validate_final_entry_document_integrity,
     _validate_final_entry_payload,
+    _validate_stable_entry_snapshot,
     _trusted_producer_payload_expectation,
 )
 
@@ -1841,3 +1855,449 @@ def test_step5b3_remains_internal_and_read_only(tmp_path):
     assert not hasattr(cache_lookup, "HIT")
     assert not hasattr(cache_lookup, "MISS")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
+
+
+def _step5b4_entry_fixture(tmp_path):
+    fixture = _step5b3_fixture(
+        tmp_path, (("nested/payload.bin", b"payload", None, None),)
+    )
+    root = ValidatedCacheRoot.from_path(tmp_path / "cache", filesystem=FILESYSTEM)
+    before = _capture_entry_snapshot(root, fixture[0], filesystem=FILESYSTEM)
+    payload = _validate_step5b3(fixture)
+    return fixture, root, before, payload
+
+
+def test_step5b4_stable_snapshot_promotes_only_internal_verification_level(tmp_path):
+    fixture, root, before, payload = _step5b4_entry_fixture(tmp_path)
+
+    result = _validate_stable_entry_snapshot(
+        root,
+        fixture[0],
+        before,
+        fixture[1].documents,
+        payload,
+        filesystem=FILESYSTEM,
+    )
+    assert result.classification is _StableSnapshotClassification.VALID
+    assert result.verification_level is _CacheVerificationLevel.FULL_PAYLOAD_SHA256
+    assert result.payload_bytes_fully_hashed
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "root_identity",
+        "entry_identity",
+        "top_listing",
+        "payload_listing",
+        "payload_content",
+        "document_content",
+        "disappearance",
+        "type_change",
+        "document_read",
+    ],
+)
+def test_step5b4_rejects_entry_snapshot_instability(tmp_path, change):
+    fixture, root, before, payload = _step5b4_entry_fixture(tmp_path)
+    filesystem = FILESYSTEM
+    documents = fixture[1].documents
+    entry = fixture[0]
+    payload_file = entry / "payload" / "nested" / "payload.bin"
+    if change == "root_identity":
+        before = replace(
+            before,
+            root_identity=replace(before.root_identity, modification_time_ns=-1),
+        )
+    elif change == "entry_identity":
+        before = replace(
+            before,
+            entry_identity=replace(before.entry_identity, modification_time_ns=-1),
+        )
+    elif change == "top_listing":
+        (entry / "extra").write_bytes(b"extra")
+    elif change == "payload_listing":
+        (entry / "payload" / "extra").write_bytes(b"extra")
+    elif change == "payload_content":
+        payload_file.write_bytes(b"changed")
+    elif change == "document_content":
+        metadata_path = entry / "metadata.json"
+        metadata_path.write_bytes(metadata_path.read_bytes() + b" ")
+    elif change == "disappearance":
+        payload_file.unlink()
+    elif change == "type_change":
+        payload_file.unlink()
+        payload_file.mkdir()
+    elif change == "document_read":
+        changed_metadata = replace(documents.metadata, stable_read=False)
+        documents = replace(documents, metadata=changed_metadata)
+
+    result = _validate_stable_entry_snapshot(
+        root,
+        entry,
+        before,
+        documents,
+        payload,
+        filesystem=filesystem,
+    )
+    assert result.classification is _StableSnapshotClassification.UNSTABLE_SNAPSHOT
+    assert result.verification_level is _CacheVerificationLevel.DOCUMENT_INTEGRITY
+    assert not result.payload_bytes_fully_hashed
+
+
+def test_step5b4_fails_closed_without_device_file_identity_and_never_retries(tmp_path):
+    fixture, root, before, payload = _step5b4_entry_fixture(tmp_path)
+
+    class ReducedIdentityFilesystem(LocalReadOnlyCacheFilesystem):
+        def __init__(self):
+            self.entry_listings = 0
+
+        def inspect(self, path):
+            return replace(super().inspect(path), device_id=None, file_id=None)
+
+        def list_directory(self, path):
+            if Path(path) == fixture[0]:
+                self.entry_listings += 1
+            return super().list_directory(path)
+
+    filesystem = ReducedIdentityFilesystem()
+    result = _validate_stable_entry_snapshot(
+        root,
+        fixture[0],
+        before,
+        fixture[1].documents,
+        payload,
+        filesystem=filesystem,
+    )
+    assert result.classification is _StableSnapshotClassification.UNSTABLE_SNAPSHOT
+    assert filesystem.entry_listings == 1
+
+
+def test_step5b4_diagnostics_are_deduplicated_ordered_sanitized_and_truncated():
+    unstable = _CacheLookupDiagnostic(
+        _CacheLookupDiagnosticCode.UNSTABLE,
+        _CacheLookupSubject.PAYLOAD,
+        "nested/payload.bin",
+    )
+    unsafe = _CacheLookupDiagnostic(
+        _CacheLookupDiagnosticCode.UNSAFE_OBJECT,
+        _CacheLookupSubject.PAYLOAD,
+        "unsafe",
+    )
+    unexpected = _CacheLookupDiagnostic(
+        _CacheLookupDiagnosticCode.UNEXPECTED_OBJECT,
+        _CacheLookupSubject.PAYLOAD,
+        "extra",
+    )
+    io_failure = _CacheLookupDiagnostic(
+        _CacheLookupDiagnosticCode.IO_FAILURE,
+        _CacheLookupSubject.DOCUMENT,
+        "metadata.json",
+    )
+    finalized = _finalize_diagnostics(
+        (unstable, unexpected, unsafe, io_failure, unstable), limit=3
+    )
+
+    assert finalized[0] == unsafe
+    assert finalized[1] == unexpected
+    assert finalized[2].code is _CacheLookupDiagnosticCode.TRUNCATED
+    with pytest.raises(ValueError, match="sanitized"):
+        _CacheLookupDiagnostic(
+            _CacheLookupDiagnosticCode.IO_FAILURE,
+            _CacheLookupSubject.ENTRY,
+            "/private/secret",
+        )
+    assert all("private" not in repr(item) for item in finalized)
+
+
+def test_step5b4_observer_receives_aggregates_and_failures_are_isolated(tmp_path):
+    fixture, root, before, payload = _step5b4_entry_fixture(tmp_path)
+    events = []
+
+    class Observer:
+        def observe(self, event):
+            events.append(event)
+
+    successful = _validate_stable_entry_snapshot(
+        root,
+        fixture[0],
+        before,
+        fixture[1].documents,
+        payload,
+        observer=Observer(),
+    )
+
+    class FailingObserver:
+        def observe(self, event):
+            raise RuntimeError("private observer failure")
+
+    isolated = _validate_stable_entry_snapshot(
+        root,
+        fixture[0],
+        before,
+        fixture[1].documents,
+        payload,
+        observer=FailingObserver(),
+    )
+    assert successful == isolated
+    assert events == [
+        _CacheLookupObserverEvent(
+            "payload_bytes_hashed",
+            "valid",
+            item_count=1,
+            byte_count=7,
+        )
+    ]
+
+
+def _lock_document(entry_digest, **changes):
+    data = {
+        "acquired_at_utc": "2026-07-20T09:00:00Z",
+        "entry_digest": entry_digest,
+        "heartbeat_at_utc": "2026-07-20T09:00:10Z",
+        "host_id": "host-1",
+        "lock_version": 1,
+        "owner_token": "owner-1",
+        "process_id": 123,
+    }
+    data.update(changes)
+    return canonical_json_bytes(data)
+
+
+def _lock_fixture(tmp_path, *, content=None):
+    root_path = tmp_path / "cache"
+    root_path.mkdir(parents=True)
+    namespace = CacheNamespace("audio", "transcription.whisper", 3)
+    cache_key = CacheKey("a" * 64)
+    lock_path = derive_lock_path(root_path.resolve(), namespace, cache_key)
+    if content is not None:
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_bytes(content)
+    root = ValidatedCacheRoot.from_path(root_path, filesystem=FILESYSTEM)
+    return root, namespace, cache_key, lock_path
+
+
+class _FixedLockClock:
+    def __init__(self, value):
+        self.value = value
+
+    def now_utc(self):
+        return self.value
+
+
+def _observe_lock_fixture(fixture, *, freshness=10, clock_second=20, filesystem=FILESYSTEM):
+    root, namespace, cache_key, _ = fixture
+    return _observe_matching_lock(
+        root,
+        namespace,
+        cache_key,
+        policy=LockObservationPolicy(freshness),
+        clock=_FixedLockClock(
+            datetime(2026, 7, 20, 9, 0, clock_second, tzinfo=timezone.utc)
+        ),
+        filesystem=filesystem,
+    )
+
+
+def test_step5b4_lock_policy_is_explicit_bounded_and_fixed_size():
+    assert LockObservationPolicy(1).max_lock_document_bytes == 16 * 1024
+    assert LockObservationPolicy(2_592_000).active_freshness_seconds == 2_592_000
+    for invalid in (0, -1, True, 2_592_001, None):
+        with pytest.raises(ValueError):
+            LockObservationPolicy(invalid)
+    with pytest.raises(ValueError, match="16384"):
+        LockObservationPolicy(10, max_lock_document_bytes=1)
+
+
+def test_step5b4_matching_lock_absence_is_internal(tmp_path):
+    result = _observe_lock_fixture(_lock_fixture(tmp_path))
+    assert result.classification is _LockObservationClassification.ABSENT
+    assert result.parsed_lock is None
+
+
+@pytest.mark.parametrize(
+    ("freshness", "clock_second", "classification"),
+    [
+        (10, 19, _LockObservationClassification.ACTIVE),
+        (10, 20, _LockObservationClassification.ACTIVE),
+        (10, 21, _LockObservationClassification.STALE),
+    ],
+)
+def test_step5b4_matching_lock_active_threshold_and_stale(
+    tmp_path, freshness, clock_second, classification
+):
+    key = CacheKey("a" * 64)
+    fixture = _lock_fixture(
+        tmp_path, content=_lock_document(derive_entry_digest(key))
+    )
+    result = _observe_lock_fixture(
+        fixture, freshness=freshness, clock_second=clock_second
+    )
+    assert result.classification is classification
+    assert result.stable_read
+
+
+@pytest.mark.parametrize(
+    ("content_factory", "classification"),
+    [
+        (lambda digest: b"not-json", _LockObservationClassification.MALFORMED_LOCK),
+        (
+            lambda digest: canonical_json_bytes({"lock_version": 2, "future": True}),
+            _LockObservationClassification.UNSUPPORTED_LOCK_VERSION,
+        ),
+        (
+            lambda digest: _lock_document(digest) + b"\n",
+            _LockObservationClassification.MALFORMED_LOCK,
+        ),
+        (
+            lambda digest: _lock_document(digest, future=True),
+            _LockObservationClassification.MALFORMED_LOCK,
+        ),
+        (
+            lambda digest: _lock_document("b" * 64),
+            _LockObservationClassification.LOCK_IDENTITY_CONFLICT,
+        ),
+        (
+            lambda digest: _lock_document(
+                digest, acquired_at_utc="2026-07-20T09:00:21Z"
+            ),
+            _LockObservationClassification.LOCK_TIMESTAMP_INVALID,
+        ),
+        (
+            lambda digest: _lock_document(
+                digest, heartbeat_at_utc="2026-07-20T09:00:21Z"
+            ),
+            _LockObservationClassification.LOCK_TIMESTAMP_INVALID,
+        ),
+        (
+            lambda digest: _lock_document(
+                digest,
+                acquired_at_utc="2026-07-20T09:00:11Z",
+                heartbeat_at_utc="2026-07-20T09:00:10Z",
+            ),
+            _LockObservationClassification.LOCK_TIMESTAMP_INVALID,
+        ),
+    ],
+)
+def test_step5b4_lock_document_classifications(
+    tmp_path, content_factory, classification
+):
+    key = CacheKey("a" * 64)
+    fixture = _lock_fixture(
+        tmp_path, content=content_factory(derive_entry_digest(key))
+    )
+    assert _observe_lock_fixture(fixture).classification is classification
+
+
+def test_step5b4_duplicate_key_and_oversized_lock_are_malformed(tmp_path):
+    key = CacheKey("a" * 64)
+    valid = _lock_document(derive_entry_digest(key))
+    duplicate = b'{"lock_version":1,' + valid[1:]
+    duplicate_result = _observe_lock_fixture(
+        _lock_fixture(tmp_path / "duplicate", content=duplicate)
+    )
+    oversized_fixture = _lock_fixture(
+        tmp_path / "oversized", content=b"x" * (16 * 1024 + 1)
+    )
+    assert duplicate_result.classification is _LockObservationClassification.MALFORMED_LOCK
+    assert (
+        _observe_lock_fixture(oversized_fixture).classification
+        is _LockObservationClassification.MALFORMED_LOCK
+    )
+
+
+def test_step5b4_symlink_lock_is_unsafe_and_unrelated_locks_are_never_listed(tmp_path):
+    fixture = _lock_fixture(tmp_path)
+    target = tmp_path / "target"
+    target.write_bytes(b"target")
+    fixture[3].parent.mkdir(parents=True)
+    fixture[3].symlink_to(target)
+    listed = []
+
+    class RecordingFilesystem(LocalReadOnlyCacheFilesystem):
+        def list_directory(self, path):
+            listed.append(Path(path))
+            return super().list_directory(path)
+
+    result = _observe_lock_fixture(fixture, filesystem=RecordingFilesystem())
+    assert result.classification is _LockObservationClassification.UNSAFE_OBJECT
+    assert listed == []
+
+
+def test_step5b4_special_object_lock_is_unsafe(tmp_path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable")
+    fixture = _lock_fixture(tmp_path)
+    fixture[3].parent.mkdir(parents=True)
+    os.mkfifo(fixture[3])
+
+    assert (
+        _observe_lock_fixture(fixture).classification
+        is _LockObservationClassification.UNSAFE_OBJECT
+    )
+
+
+def test_step5b4_lock_io_and_instability_are_not_absence(tmp_path):
+    key = CacheKey("a" * 64)
+    fixture = _lock_fixture(
+        tmp_path, content=_lock_document(derive_entry_digest(key))
+    )
+
+    class IOFilesystem(LocalReadOnlyCacheFilesystem):
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            raise CacheLookupIOError("private")
+
+    class PermissionFilesystem(LocalReadOnlyCacheFilesystem):
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            raise CacheLookupPermissionError("private")
+
+    class UnstableFilesystem(LocalReadOnlyCacheFilesystem):
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            return replace(
+                super().read_regular_file_bounded(path, max_bytes=max_bytes),
+                stable_read=False,
+            )
+
+    assert (
+        _observe_lock_fixture(fixture, filesystem=IOFilesystem()).classification
+        is _LockObservationClassification.IO_FAILURE
+    )
+    assert (
+        _observe_lock_fixture(
+            fixture, filesystem=PermissionFilesystem()
+        ).classification
+        is _LockObservationClassification.IO_FAILURE
+    )
+    assert (
+        _observe_lock_fixture(fixture, filesystem=UnstableFilesystem()).classification
+        is _LockObservationClassification.UNSTABLE_SNAPSHOT
+    )
+
+
+def test_step5b4_invalid_clock_is_dependency_error(tmp_path):
+    fixture = _lock_fixture(tmp_path)
+    root, namespace, cache_key, _ = fixture
+    with pytest.raises(ValueError, match="UTC whole-second"):
+        _observe_matching_lock(
+            root,
+            namespace,
+            cache_key,
+            policy=LockObservationPolicy(10),
+            clock=_FixedLockClock(datetime(2026, 7, 20, 9, 0, 20)),
+        )
+
+
+def test_step5b4_adds_no_public_lookup_or_mutation_surface():
+    import engine.storage.cache_lookup as cache_lookup
+
+    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert not hasattr(cache_lookup, "ValidatedCacheEntryReference")
+    assert not hasattr(cache_lookup, "HIT")
+    assert not hasattr(cache_lookup, "MISS")
+    assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
+    public = {name for name in dir(ReadOnlyCacheFilesystem) if not name.startswith("_")}
+    assert public == {
+        "inspect",
+        "list_directory",
+        "read_regular_file_bounded",
+        "resolve",
+    }

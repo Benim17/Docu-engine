@@ -11,8 +11,10 @@ import os
 import errno
 import hashlib
 import json
+import re
 import stat
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
@@ -41,6 +43,7 @@ from .persistent_cache import (
     canonical_json_bytes,
     derive_entry_digest,
     derive_final_entry_path,
+    derive_lock_path,
     parse_canonical_json,
 )
 from .cache_keys import CacheKey
@@ -234,6 +237,9 @@ class _StreamedPayloadHash:
     has_additional_byte: bool
     pre_read_identity: FileIdentity
     handle_identity: FileIdentity
+    post_read_handle_identity: FileIdentity
+    post_read_path_identity: FileIdentity
+    stable_read: bool
 
 
 @runtime_checkable
@@ -468,6 +474,7 @@ class LocalReadOnlyCacheFilesystem:
                 bytes_read += len(chunk)
                 remaining -= len(chunk)
             has_additional_byte = bool(os.read(descriptor, 1))
+            handle_after = self._inspect_handle(descriptor)
         except FileNotFoundError:
             raise
         except (SymlinkRejectedError, UnstableFilesystemObjectError):
@@ -482,12 +489,26 @@ class LocalReadOnlyCacheFilesystem:
                     os.close(descriptor)
                 except OSError:
                     pass
+        try:
+            path_after = self.inspect(path)
+        except FileNotFoundError as exc:
+            raise UnstableFilesystemObjectError(
+                "Payload file disappeared during streaming."
+            ) from exc
+        stable = (
+            pre_read.same_stable_object(handle_identity)
+            and handle_identity.same_stable_object(handle_after)
+            and handle_after.same_stable_object(path_after)
+        )
         return _StreamedPayloadHash(
             "sha256:" + digest.hexdigest(),
             bytes_read,
             has_additional_byte,
             pre_read,
             handle_identity,
+            handle_after,
+            path_after,
+            stable,
         )
 
 
@@ -948,6 +969,187 @@ class _PayloadValidationObservation:
     hash_order: tuple[str, ...] = ()
     payload_bytes_hashed: int = 0
     declared_payload_bytes_fully_verified: bool = False
+
+
+class _StableSnapshotClassification(str, Enum):
+    VALID = "valid"
+    UNSTABLE_SNAPSHOT = "unstable_snapshot"
+
+
+class _LockObservationClassification(str, Enum):
+    ABSENT = "absent"
+    ACTIVE = "active"
+    STALE = "stale"
+    UNSAFE_OBJECT = "unsafe_object"
+    UNSUPPORTED_LOCK_VERSION = "unsupported_lock_version"
+    MALFORMED_LOCK = "malformed_lock"
+    LOCK_IDENTITY_CONFLICT = "lock_identity_conflict"
+    LOCK_TIMESTAMP_INVALID = "lock_timestamp_invalid"
+    IO_FAILURE = "io_failure"
+    UNSTABLE_SNAPSHOT = "unstable_snapshot"
+
+
+@dataclass(frozen=True)
+class LockObservationPolicy:
+    active_freshness_seconds: int
+    max_lock_document_bytes: int = 16 * 1024
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.active_freshness_seconds, bool)
+            or not isinstance(self.active_freshness_seconds, int)
+            or not 1 <= self.active_freshness_seconds <= 2_592_000
+        ):
+            raise ValueError("active_freshness_seconds must be in 1..2592000.")
+        if self.max_lock_document_bytes != 16 * 1024:
+            raise ValueError("max_lock_document_bytes is locked to 16384.")
+
+
+@runtime_checkable
+class LockObservationClock(Protocol):
+    def now_utc(self) -> datetime:
+        ...
+
+
+class _SystemLockObservationClock:
+    def now_utc(self) -> datetime:
+        return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+SYSTEM_LOCK_OBSERVATION_CLOCK = _SystemLockObservationClock()
+
+
+@dataclass(frozen=True)
+class _ParsedLockV1:
+    entry_digest: str
+    acquired_at_utc: datetime
+    heartbeat_at_utc: datetime
+    owner_token: str
+    host_id: str
+    process_id: int
+    lock_version: int = 1
+
+
+@dataclass(frozen=True)
+class _LockObservation:
+    classification: _LockObservationClassification
+    lock_path: Path
+    parsed_lock: _ParsedLockV1 | None = None
+    stable_read: bool = False
+
+
+@dataclass(frozen=True)
+class _EntrySnapshot:
+    root_identity: FileIdentity
+    entry_identity: FileIdentity
+    top_level_objects: tuple[tuple[str, FileIdentity], ...]
+    payload_objects: tuple[tuple[str, FileIdentity], ...]
+
+
+@dataclass(frozen=True)
+class _StableSnapshotObservation:
+    classification: _StableSnapshotClassification
+    verification_level: _CacheVerificationLevel
+    payload_bytes_fully_hashed: bool
+
+
+class _CacheLookupDiagnosticCode(str, Enum):
+    UNSAFE_OBJECT = "object.unsupported_type"
+    UNEXPECTED_OBJECT = "entry.unexpected_payload_object"
+    UNSTABLE = "snapshot.changed"
+    IO_FAILURE = "io.read_failed"
+    PERMISSION_DENIED = "io.permission_denied"
+    REDUCED_IDENTITY = "snapshot.reduced_identity_evidence"
+    TRUNCATED = "diagnostics.truncated"
+
+
+class _CacheLookupSubject(str, Enum):
+    ROOT = "root"
+    ENTRY = "entry"
+    DOCUMENT = "document"
+    PAYLOAD = "payload"
+    LOCK = "lock"
+
+
+_DIAGNOSTIC_PRECEDENCE = {
+    _CacheLookupDiagnosticCode.UNSAFE_OBJECT: (1, 2),
+    _CacheLookupDiagnosticCode.UNEXPECTED_OBJECT: (3, 18),
+    _CacheLookupDiagnosticCode.UNSTABLE: (3, 19),
+    _CacheLookupDiagnosticCode.IO_FAILURE: (3, 20),
+    _CacheLookupDiagnosticCode.PERMISSION_DENIED: (3, 20),
+    _CacheLookupDiagnosticCode.REDUCED_IDENTITY: (3, 19),
+    _CacheLookupDiagnosticCode.TRUNCATED: (99, 99),
+}
+
+
+@dataclass(frozen=True)
+class _CacheLookupDiagnostic:
+    code: _CacheLookupDiagnosticCode
+    subject: _CacheLookupSubject
+    relative_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, _CacheLookupDiagnosticCode):
+            raise TypeError("diagnostic code must be internal stable enum data.")
+        if not isinstance(self.subject, _CacheLookupSubject):
+            raise TypeError("diagnostic subject must be internal stable enum data.")
+        if self.relative_path is not None:
+            if not isinstance(self.relative_path, str) or not self.relative_path:
+                raise ValueError("diagnostic relative_path must be non-empty or None.")
+            path = PurePosixPath(self.relative_path)
+            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError("diagnostic paths must be sanitized relative paths.")
+
+
+@dataclass(frozen=True)
+class _CacheLookupObserverEvent:
+    name: str
+    classification: str
+    entry_digest: str | None = None
+    item_count: int | None = None
+    byte_count: int | None = None
+
+
+@runtime_checkable
+class _CacheLookupObserver(Protocol):
+    def observe(self, event: _CacheLookupObserverEvent) -> None:
+        ...
+
+
+def _finalize_diagnostics(
+    diagnostics: tuple[_CacheLookupDiagnostic, ...], *, limit: int
+) -> tuple[_CacheLookupDiagnostic, ...]:
+    _positive_integer(limit, "limit")
+    ordered = tuple(
+        sorted(
+            set(diagnostics),
+            key=lambda item: (
+                *_DIAGNOSTIC_PRECEDENCE[item.code],
+                item.code.value,
+                item.subject.value,
+                item.relative_path or "",
+            ),
+        )
+    )
+    if len(ordered) <= limit:
+        return ordered
+    truncated = _CacheLookupDiagnostic(
+        _CacheLookupDiagnosticCode.TRUNCATED,
+        _CacheLookupSubject.ENTRY,
+    )
+    return (truncated,) if limit == 1 else ordered[: limit - 1] + (truncated,)
+
+
+def _notify_observer(
+    observer: _CacheLookupObserver | None,
+    event: _CacheLookupObserverEvent,
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer.observe(event)
+    except Exception:
+        return
 
 
 class _VersionProbeError(ValueError):
@@ -1475,6 +1677,13 @@ def _validate_final_entry_payload(
                 hash_order=tuple(hash_order),
                 bytes_hashed=bytes_hashed,
             )
+        if not streamed.stable_read:
+            return result(
+                _PayloadValidationClassification.PAYLOAD_READ_UNSTABLE,
+                observed=observed_paths,
+                hash_order=tuple(hash_order),
+                bytes_hashed=bytes_hashed,
+            )
         if streamed.bytes_read != record.size_bytes or streamed.has_additional_byte:
             return result(
                 _PayloadValidationClassification.PAYLOAD_SIZE_MISMATCH,
@@ -1499,3 +1708,317 @@ def _validate_final_entry_payload(
         bytes_hashed=bytes_hashed,
         fully_hashed=True,
     )
+
+
+def _capture_entry_snapshot(
+    cache_root: ValidatedCacheRoot,
+    entry_path: str | Path,
+    *,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> _EntrySnapshot:
+    """Capture one deterministic root/entry/payload identity snapshot."""
+
+    if not isinstance(cache_root, ValidatedCacheRoot):
+        raise TypeError("cache_root must be a ValidatedCacheRoot.")
+    root_identity = filesystem.inspect(cache_root.resolved_path)
+    entry = Path(entry_path)
+    entry_identity = filesystem.inspect(entry)
+    top_level_objects = tuple(
+        (name, filesystem.inspect(entry / name))
+        for name in tuple(sorted(filesystem.list_directory(entry)))
+    )
+    payload_root = entry / "payload"
+    payload_objects: list[tuple[str, FileIdentity]] = []
+
+    def walk(directory: Path, prefix: str | None) -> None:
+        for name in tuple(sorted(filesystem.list_directory(directory))):
+            candidate = directory / name
+            identity = filesystem.inspect(candidate)
+            relative = name if prefix is None else f"{prefix}/{name}"
+            payload_objects.append((relative, identity))
+            if identity.object_type is FilesystemObjectType.DIRECTORY:
+                walk(candidate, relative)
+
+    walk(payload_root, None)
+    return _EntrySnapshot(
+        root_identity,
+        entry_identity,
+        top_level_objects,
+        tuple(payload_objects),
+    )
+
+
+def _validate_stable_entry_snapshot(
+    cache_root: ValidatedCacheRoot,
+    entry_path: str | Path,
+    before: _EntrySnapshot,
+    documents: _FinalEntryDocumentsObservation,
+    payload: _PayloadValidationObservation,
+    *,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+    observer: _CacheLookupObserver | None = None,
+) -> _StableSnapshotObservation:
+    """Perform the Step 5B4 final re-enumeration and identity comparison once."""
+
+    if not isinstance(before, _EntrySnapshot):
+        raise TypeError("before must be an _EntrySnapshot.")
+    document_reads_stable = all(
+        observation is not None and observation.stable_read is True
+        for observation in (documents.complete, documents.metadata, documents.manifest)
+    )
+    payload_valid = (
+        payload.classification is _PayloadValidationClassification.VALID
+        and payload.declared_payload_bytes_fully_verified
+    )
+    try:
+        after = _capture_entry_snapshot(
+            cache_root,
+            entry_path,
+            filesystem=filesystem,
+        )
+    except (FileNotFoundError, CacheLookupFilesystemError):
+        stable = False
+    else:
+        stable = (
+            cache_root.identity.same_stable_object(before.root_identity)
+            and before.root_identity.same_stable_object(after.root_identity)
+            and before.entry_identity.same_stable_object(after.entry_identity)
+            and before.top_level_objects == after.top_level_objects
+            and before.payload_objects == after.payload_objects
+            and document_reads_stable
+            and payload_valid
+        )
+    if not stable:
+        observation = _StableSnapshotObservation(
+            _StableSnapshotClassification.UNSTABLE_SNAPSHOT,
+            _CacheVerificationLevel.DOCUMENT_INTEGRITY,
+            False,
+        )
+        _notify_observer(
+            observer,
+            _CacheLookupObserverEvent("lookup_unstable", observation.classification.value),
+        )
+        return observation
+    observation = _StableSnapshotObservation(
+        _StableSnapshotClassification.VALID,
+        _CacheVerificationLevel.FULL_PAYLOAD_SHA256,
+        True,
+    )
+    _notify_observer(
+        observer,
+        _CacheLookupObserverEvent(
+            "payload_bytes_hashed",
+            observation.classification.value,
+            item_count=len(payload.observed_regular_files),
+            byte_count=payload.payload_bytes_hashed,
+        ),
+    )
+    return observation
+
+
+_LOCK_TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+_LOCK_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$")
+
+
+def _lock_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or not _LOCK_TIMESTAMP_PATTERN.fullmatch(value):
+        raise ValueError("lock timestamp must use canonical UTC whole seconds.")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise ValueError("lock timestamp is not calendar-valid.") from exc
+    if parsed.year < 1970:
+        raise ValueError("lock timestamp predates contract range.")
+    return parsed
+
+
+def _validated_clock_now(clock: LockObservationClock) -> datetime:
+    if not isinstance(clock, LockObservationClock):
+        raise TypeError("clock must implement LockObservationClock.")
+    now = clock.now_utc()
+    if (
+        not isinstance(now, datetime)
+        or now.tzinfo is None
+        or now.utcoffset() is None
+        or now.utcoffset().total_seconds() != 0
+        or now.microsecond != 0
+        or now.year < 1970
+    ):
+        raise ValueError("clock must return valid UTC whole-second time.")
+    return now.astimezone(timezone.utc)
+
+
+def _parse_lock_v1(stored_bytes: bytes) -> tuple[_ParsedLockV1 | None, bool]:
+    """Return parsed v1 data or an unsupported-version marker."""
+
+    value = _object(parse_canonical_json(stored_bytes), "lock")
+    if "lock_version" not in value:
+        raise CacheEntryContractError("lock_version is required.")
+    version = value["lock_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise CacheEntryContractError("lock_version must be a positive integer.")
+    if version != 1:
+        return None, True
+    _fields(
+        value,
+        frozenset(
+            {
+                "acquired_at_utc",
+                "entry_digest",
+                "heartbeat_at_utc",
+                "host_id",
+                "lock_version",
+                "owner_token",
+                "process_id",
+            }
+        ),
+        "lock",
+    )
+    _digest(value["entry_digest"], "lock.entry_digest", qualified=False)
+    for field in ("owner_token", "host_id"):
+        token = value[field]
+        if not isinstance(token, str) or not _LOCK_TOKEN_PATTERN.fullmatch(token):
+            raise CacheEntryContractError(f"lock.{field} is not a canonical token.")
+    process_id = value["process_id"]
+    if (
+        isinstance(process_id, bool)
+        or not isinstance(process_id, int)
+        or not 1 <= process_id <= 2**63 - 1
+    ):
+        raise CacheEntryContractError("lock.process_id is out of range.")
+    try:
+        acquired = _lock_timestamp(value["acquired_at_utc"])
+        heartbeat = _lock_timestamp(value["heartbeat_at_utc"])
+    except ValueError as exc:
+        raise CacheEntryContractError("lock timestamp is invalid.") from exc
+    return (
+        _ParsedLockV1(
+            value["entry_digest"],
+            acquired,
+            heartbeat,
+            value["owner_token"],
+            value["host_id"],
+            process_id,
+        ),
+        False,
+    )
+
+
+def _observe_matching_lock(
+    cache_root: ValidatedCacheRoot,
+    namespace: CacheNamespace,
+    cache_key: CacheKey,
+    *,
+    policy: LockObservationPolicy,
+    clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> _LockObservation:
+    """Observe exactly one derived matching lock without public state translation."""
+
+    if not isinstance(cache_root, ValidatedCacheRoot):
+        raise TypeError("cache_root must be a ValidatedCacheRoot.")
+    if not isinstance(namespace, CacheNamespace) or not isinstance(cache_key, CacheKey):
+        raise TypeError("namespace and cache_key must be validated models.")
+    if not isinstance(policy, LockObservationPolicy):
+        raise TypeError("policy must be a LockObservationPolicy.")
+    now = _validated_clock_now(clock)
+    path = derive_lock_path(cache_root.resolved_path, namespace, cache_key)
+    relative_parts = path.relative_to(cache_root.resolved_path).parts
+    current = cache_root.resolved_path
+    try:
+        for part in relative_parts[:-1]:
+            current = current / part
+            identity = filesystem.inspect(current)
+            if identity.object_type is not FilesystemObjectType.DIRECTORY:
+                return _LockObservation(
+                    _LockObservationClassification.UNSAFE_OBJECT, path
+                )
+        try:
+            candidate_identity = filesystem.inspect(path)
+        except FileNotFoundError:
+            root_after = filesystem.inspect(cache_root.resolved_path)
+            classification = (
+                _LockObservationClassification.ABSENT
+                if cache_root.identity.same_stable_object(root_after)
+                else _LockObservationClassification.UNSTABLE_SNAPSHOT
+            )
+            return _LockObservation(classification, path)
+    except FileNotFoundError:
+        root_after = filesystem.inspect(cache_root.resolved_path)
+        classification = (
+            _LockObservationClassification.ABSENT
+            if cache_root.identity.same_stable_object(root_after)
+            else _LockObservationClassification.UNSTABLE_SNAPSHOT
+        )
+        return _LockObservation(classification, path)
+    except (CacheLookupPermissionError, CacheLookupIOError):
+        return _LockObservation(_LockObservationClassification.IO_FAILURE, path)
+
+    if candidate_identity.object_type is not FilesystemObjectType.REGULAR_FILE:
+        return _LockObservation(_LockObservationClassification.UNSAFE_OBJECT, path)
+    try:
+        read = filesystem.read_regular_file_bounded(
+            path, max_bytes=policy.max_lock_document_bytes
+        )
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+        return _LockObservation(_LockObservationClassification.UNSAFE_OBJECT, path)
+    except UnstableFilesystemObjectError:
+        return _LockObservation(
+            _LockObservationClassification.UNSTABLE_SNAPSHOT, path
+        )
+    except (CacheLookupPermissionError, CacheLookupIOError):
+        return _LockObservation(_LockObservationClassification.IO_FAILURE, path)
+    if read.limit_exceeded:
+        return _LockObservation(_LockObservationClassification.MALFORMED_LOCK, path)
+    if not read.stable_read or read.data is None:
+        return _LockObservation(
+            _LockObservationClassification.UNSTABLE_SNAPSHOT, path
+        )
+    try:
+        root_after = filesystem.inspect(cache_root.resolved_path)
+    except (FileNotFoundError, CacheLookupFilesystemError):
+        return _LockObservation(
+            _LockObservationClassification.UNSTABLE_SNAPSHOT, path
+        )
+    if not cache_root.identity.same_stable_object(root_after):
+        return _LockObservation(
+            _LockObservationClassification.UNSTABLE_SNAPSHOT, path
+        )
+    try:
+        parsed, unsupported = _parse_lock_v1(read.data)
+    except CacheEntryContractError:
+        return _LockObservation(_LockObservationClassification.MALFORMED_LOCK, path)
+    if unsupported:
+        return _LockObservation(
+            _LockObservationClassification.UNSUPPORTED_LOCK_VERSION,
+            path,
+            stable_read=True,
+        )
+    assert parsed is not None
+    if parsed.entry_digest != derive_entry_digest(cache_key):
+        return _LockObservation(
+            _LockObservationClassification.LOCK_IDENTITY_CONFLICT,
+            path,
+            parsed,
+            True,
+        )
+    if (
+        parsed.acquired_at_utc > parsed.heartbeat_at_utc
+        or parsed.acquired_at_utc > now
+        or parsed.heartbeat_at_utc > now
+    ):
+        return _LockObservation(
+            _LockObservationClassification.LOCK_TIMESTAMP_INVALID,
+            path,
+            parsed,
+            True,
+        )
+    age = int((now - parsed.heartbeat_at_utc).total_seconds())
+    classification = (
+        _LockObservationClassification.ACTIVE
+        if age <= policy.active_freshness_seconds
+        else _LockObservationClassification.STALE
+    )
+    return _LockObservation(classification, path, parsed, True)
