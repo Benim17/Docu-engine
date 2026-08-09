@@ -6,14 +6,29 @@ locking, enumeration, and reconciliation belong to later H1 slices.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from functools import total_ordering
-from typing import Any, Mapping
+from pathlib import Path as _Path
+from typing import Any, Mapping, Protocol, runtime_checkable
 
-from .cache_lookup import CacheLookupReason
+from .cache_lookup import (
+    BoundedFileRead,
+    CacheLookupFilesystemError,
+    CacheLookupIOError,
+    CacheLookupPermissionError,
+    CacheLookupReason,
+    FileIdentity,
+    FilesystemObjectType,
+    LocalReadOnlyCacheFilesystem,
+    SymlinkRejectedError,
+    UnstableFilesystemObjectError,
+    UnsupportedFilesystemObjectError,
+    ValidatedCacheRoot,
+)
 from .cache_recovery import (
     CacheRecoveryReason,
     CacheRecoveryStatus,
@@ -668,3 +683,307 @@ def catalog_identity_sort_key(
     if not isinstance(identity, CacheCatalogIdentity):
         raise CacheCatalogContractError("identity must be CacheCatalogIdentity.")
     return identity.sort_key
+
+
+class CacheCatalogLookupStatus(str, Enum):
+    RECORD_FOUND = "record_found"
+    RECORD_ABSENT = "record_absent"
+    CATALOG_UNAVAILABLE = "catalog_unavailable"
+    CATALOG_CORRUPT = "catalog_corrupt"
+    CATALOG_UNSUPPORTED = "catalog_unsupported"
+    CATALOG_UNSAFE = "catalog_unsafe"
+    CATALOG_UNSTABLE = "catalog_unstable"
+    CATALOG_IO_FAILURE = "catalog_io_failure"
+
+
+class CacheCatalogSubject(str, Enum):
+    CATALOG_ROOT = "catalog_root"
+    RECORD = "record"
+
+
+@dataclass(frozen=True, order=True)
+class CacheCatalogDiagnostic:
+    subject: CacheCatalogSubject
+    identity: tuple[str, str, int, str]
+    code: str
+    relative_path: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subject, CacheCatalogSubject):
+            raise TypeError("subject must be CacheCatalogSubject.")
+        if (
+            not isinstance(self.identity, tuple)
+            or len(self.identity) != 4
+            or not isinstance(self.identity[0], str)
+            or not isinstance(self.identity[1], str)
+            or isinstance(self.identity[2], bool)
+            or not isinstance(self.identity[2], int)
+            or not isinstance(self.identity[3], str)
+        ):
+            raise TypeError("identity must be one canonical catalog sort key.")
+        if not isinstance(self.code, str) or re.fullmatch(r"[a-z0-9_]+", self.code) is None:
+            raise ValueError("code must be stable lowercase identifier data.")
+        if (
+            not isinstance(self.relative_path, str)
+            or self.relative_path.startswith(("/", "\\"))
+            or ".." in _Path(self.relative_path).parts
+            or "\x00" in self.relative_path
+        ):
+            raise ValueError("relative_path must be sanitized catalog-relative text.")
+
+
+@dataclass(frozen=True)
+class CacheCatalogLookupResult:
+    status: CacheCatalogLookupStatus
+    record: CacheCatalogLiveRecord | None = None
+    tombstone_revision: int | None = None
+    diagnostics: tuple[CacheCatalogDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, CacheCatalogLookupStatus):
+            raise TypeError("status must be CacheCatalogLookupStatus.")
+        if (self.status is CacheCatalogLookupStatus.RECORD_FOUND) != isinstance(
+            self.record, CacheCatalogLiveRecord
+        ):
+            raise ValueError("Only RECORD_FOUND carries one live catalog record.")
+        if self.tombstone_revision is not None:
+            _positive_int(
+                self.tombstone_revision,
+                "tombstone_revision",
+                maximum=MAX_CATALOG_RECORD_REVISION,
+            )
+            if self.status is not CacheCatalogLookupStatus.RECORD_ABSENT:
+                raise ValueError("Tombstone revision requires RECORD_ABSENT.")
+        if (
+            not isinstance(self.diagnostics, tuple)
+            or any(not isinstance(item, CacheCatalogDiagnostic) for item in self.diagnostics)
+            or len(self.diagnostics) > MAX_CATALOG_OPERATION_DIAGNOSTICS
+            or self.diagnostics
+            != tuple(
+                sorted(
+                    set(self.diagnostics),
+                    key=lambda item: (
+                        item.subject.value,
+                        item.identity,
+                        item.code,
+                        item.relative_path,
+                    ),
+                )
+            )
+        ):
+            raise ValueError("diagnostics must be bounded, unique, and deterministic.")
+
+
+@runtime_checkable
+class CacheCatalogReadOnlyBackend(Protocol):
+    """Catalog-only read surface bound to one previously validated cache root."""
+
+    @property
+    def cache_root(self) -> ValidatedCacheRoot: ...
+
+    def inspect_root(self) -> FileIdentity: ...
+
+    def inspect_catalog_relative(self, relative_path: _Path) -> FileIdentity: ...
+
+    def read_record_bounded(self, identity: CacheCatalogIdentity) -> BoundedFileRead: ...
+
+
+@dataclass(frozen=True)
+class LocalCacheCatalogReadOnlyBackend:
+    cache_root: ValidatedCacheRoot
+    _filesystem: LocalReadOnlyCacheFilesystem = LocalReadOnlyCacheFilesystem()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cache_root, ValidatedCacheRoot):
+            raise TypeError("cache_root must be ValidatedCacheRoot.")
+        if not isinstance(self._filesystem, LocalReadOnlyCacheFilesystem):
+            raise TypeError("_filesystem must be LocalReadOnlyCacheFilesystem.")
+
+    @classmethod
+    def from_root(cls, path: str | _Path) -> "LocalCacheCatalogReadOnlyBackend":
+        filesystem = LocalReadOnlyCacheFilesystem()
+        return cls(ValidatedCacheRoot.from_path(path, filesystem=filesystem), filesystem)
+
+    def _catalog_path(self, relative_path: _Path) -> _Path:
+        if not isinstance(relative_path, _Path) or relative_path.is_absolute():
+            raise TypeError("relative_path must be a relative Path.")
+        if (
+            not relative_path.parts
+            or relative_path.parts[0] != "catalog"
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+            or len(relative_path.parts) > MAX_CATALOG_TRAVERSAL_DEPTH
+            or len(relative_path.as_posix().encode("utf-8"))
+            > MAX_CATALOG_RELATIVE_PATH_UTF8_BYTES
+        ):
+            raise CacheCatalogContractError("Path is outside the canonical catalog namespace.")
+        return self.cache_root.resolved_path / relative_path
+
+    def inspect_root(self) -> FileIdentity:
+        return self._filesystem.inspect(self.cache_root.resolved_path)
+
+    def inspect_catalog_relative(self, relative_path: _Path) -> FileIdentity:
+        return self._filesystem.inspect(self._catalog_path(relative_path))
+
+    def read_record_bounded(self, identity: CacheCatalogIdentity) -> BoundedFileRead:
+        return self._filesystem.read_regular_file_bounded(
+            self._catalog_path(derive_catalog_record_relative_path(identity)),
+            max_bytes=MAX_CATALOG_RECORD_BYTES,
+        )
+
+
+def derive_catalog_record_relative_path(identity: CacheCatalogIdentity) -> _Path:
+    """Derive the only locked v1 path for one trusted catalog identity."""
+
+    if not isinstance(identity, CacheCatalogIdentity):
+        raise CacheCatalogContractError("identity must be CacheCatalogIdentity.")
+    digest = identity.entry_digest
+    relative = _Path(
+        "catalog",
+        f"v{CACHE_CATALOG_LAYOUT_VERSION}",
+        "records",
+        identity.namespace.domain,
+        identity.namespace.producer_id,
+        str(identity.namespace.producer_schema_version),
+        digest[:2],
+        digest[2:4],
+        f"{digest}.json",
+    )
+    if len(relative.parts) > MAX_CATALOG_TRAVERSAL_DEPTH:
+        raise CacheCatalogContractError("Catalog path exceeds traversal depth limit.")
+    if len(relative.as_posix().encode("utf-8")) > MAX_CATALOG_RELATIVE_PATH_UTF8_BYTES:
+        raise CacheCatalogContractError("Catalog path exceeds UTF-8 byte limit.")
+    if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in relative.parts):
+        raise CacheCatalogContractError("Catalog path contains a noncanonical component.")
+    return relative
+
+
+def _diagnostic(
+    status: CacheCatalogLookupStatus,
+    identity: CacheCatalogIdentity,
+    relative: _Path,
+) -> tuple[CacheCatalogDiagnostic, ...]:
+    return (
+        CacheCatalogDiagnostic(
+            CacheCatalogSubject.CATALOG_ROOT
+            if status is CacheCatalogLookupStatus.CATALOG_UNAVAILABLE
+            else CacheCatalogSubject.RECORD,
+            identity.sort_key,
+            status.value,
+            relative.as_posix(),
+        ),
+    )
+
+
+def _lookup_result(
+    status: CacheCatalogLookupStatus,
+    identity: CacheCatalogIdentity,
+    relative: _Path,
+    *,
+    record: CacheCatalogLiveRecord | None = None,
+    tombstone_revision: int | None = None,
+) -> CacheCatalogLookupResult:
+    diagnostics = () if status in {
+        CacheCatalogLookupStatus.RECORD_FOUND,
+        CacheCatalogLookupStatus.RECORD_ABSENT,
+    } else _diagnostic(status, identity, relative)
+    return CacheCatalogLookupResult(status, record, tombstone_revision, diagnostics)
+
+
+def _safe_parent_chain(
+    backend: CacheCatalogReadOnlyBackend,
+    relative: _Path,
+) -> tuple[tuple[tuple[_Path, FileIdentity], ...], CacheCatalogLookupStatus | None]:
+    observed: list[tuple[_Path, FileIdentity]] = []
+    for index, component in enumerate(relative.parts[:-1]):
+        current = _Path(*relative.parts[: index + 1])
+        try:
+            item = backend.inspect_catalog_relative(current)
+        except FileNotFoundError:
+            return tuple(observed), (
+                CacheCatalogLookupStatus.CATALOG_UNAVAILABLE
+                if index <= 1
+                else CacheCatalogLookupStatus.RECORD_ABSENT
+            )
+        if item.object_type is not FilesystemObjectType.DIRECTORY:
+            return tuple(observed), CacheCatalogLookupStatus.CATALOG_UNSAFE
+        observed.append((current, item))
+    return tuple(observed), None
+
+
+def _chain_remains_stable(
+    backend: CacheCatalogReadOnlyBackend,
+    parents: tuple[tuple[_Path, FileIdentity], ...],
+) -> bool:
+    return all(
+        before.same_stable_object(backend.inspect_catalog_relative(path))
+        for path, before in parents
+    )
+
+
+def lookup_catalog_record(
+    identity: CacheCatalogIdentity,
+    *,
+    backend: CacheCatalogReadOnlyBackend,
+) -> CacheCatalogLookupResult:
+    """Read exactly one catalog identity without cache or catalog mutation."""
+
+    if not isinstance(identity, CacheCatalogIdentity):
+        raise TypeError("identity must be CacheCatalogIdentity.")
+    if not isinstance(backend, CacheCatalogReadOnlyBackend):
+        raise TypeError("backend must implement CacheCatalogReadOnlyBackend.")
+    relative = derive_catalog_record_relative_path(identity)
+    try:
+        root_before = backend.inspect_root()
+        if root_before.object_type is not FilesystemObjectType.DIRECTORY:
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSAFE, identity, relative)
+        if not backend.cache_root.identity.same_stable_object(root_before):
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+        parents, parent_status = _safe_parent_chain(backend, relative)
+        if parent_status is not None:
+            if not _chain_remains_stable(backend, parents):
+                return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+            if not backend.cache_root.identity.same_stable_object(backend.inspect_root()):
+                return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+            return _lookup_result(parent_status, identity, relative)
+        try:
+            target_before = backend.inspect_catalog_relative(relative)
+        except FileNotFoundError:
+            if not _chain_remains_stable(backend, parents):
+                return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+            if not backend.cache_root.identity.same_stable_object(backend.inspect_root()):
+                return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+            return _lookup_result(CacheCatalogLookupStatus.RECORD_ABSENT, identity, relative)
+        if target_before.object_type is not FilesystemObjectType.REGULAR_FILE:
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSAFE, identity, relative)
+        read = backend.read_record_bounded(identity)
+        if not read.stable_read or not target_before.same_stable_object(read.pre_read_identity):
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+        if read.limit_exceeded or read.data is None:
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_CORRUPT, identity, relative)
+        if not _chain_remains_stable(backend, parents):
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+        if not backend.cache_root.identity.same_stable_object(backend.inspect_root()):
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+        record = parse_cache_catalog_record(read.data)
+        if record.identity != identity:
+            return _lookup_result(CacheCatalogLookupStatus.CATALOG_CORRUPT, identity, relative)
+        if isinstance(record, CacheCatalogTombstone):
+            return _lookup_result(
+                CacheCatalogLookupStatus.RECORD_ABSENT,
+                identity,
+                relative,
+                tombstone_revision=record.record_revision,
+            )
+        return _lookup_result(
+            CacheCatalogLookupStatus.RECORD_FOUND, identity, relative, record=record
+        )
+    except CacheCatalogUnsupportedVersionError:
+        return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSUPPORTED, identity, relative)
+    except CacheCatalogContractError:
+        return _lookup_result(CacheCatalogLookupStatus.CATALOG_CORRUPT, identity, relative)
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+        return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSAFE, identity, relative)
+    except (FileNotFoundError, UnstableFilesystemObjectError):
+        return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
+    except (CacheLookupPermissionError, CacheLookupIOError, CacheLookupFilesystemError, OSError):
+        return _lookup_result(CacheCatalogLookupStatus.CATALOG_IO_FAILURE, identity, relative)

@@ -1,4 +1,6 @@
 import hashlib
+import os
+from pathlib import Path
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -17,7 +19,10 @@ from engine.storage.cache_catalog import (
     CacheCatalogFinalProvenance,
     CacheCatalogFinalSummary,
     CacheCatalogIdentity,
+    CacheCatalogLookupResult,
+    CacheCatalogLookupStatus,
     CacheCatalogLiveRecord,
+    CacheCatalogReadOnlyBackend,
     CacheCatalogRecord,
     CacheCatalogRecordState,
     CacheCatalogRecoveryProvenance,
@@ -25,12 +30,15 @@ from engine.storage.cache_catalog import (
     CacheCatalogTombstone,
     CacheCatalogUnsupportedVersionError,
     CacheCatalogVerificationLevel,
+    LocalCacheCatalogReadOnlyBackend,
     catalog_identity_sort_key,
+    derive_catalog_record_relative_path,
+    lookup_catalog_record,
     parse_cache_catalog_record,
     serialize_cache_catalog_record,
 )
 from engine.storage.cache_keys import CacheKey
-from engine.storage.cache_lookup import CacheLookupReason
+from engine.storage.cache_lookup import CacheLookupPermissionError, CacheLookupReason
 from engine.storage.cache_recovery import (
     CacheRecoveryReason,
     CacheRecoveryStatus,
@@ -408,14 +416,13 @@ def test_h1a_base_record_and_wrong_serializer_types_are_rejected():
         catalog_identity_sort_key(object())
 
 
-def test_h1a_module_has_no_filesystem_or_backend_surface():
+def test_h1b_module_has_only_the_approved_read_only_backend_surface():
     import engine.storage.cache_catalog as catalog
 
     public = {name for name in dir(catalog) if not name.startswith("_")}
     forbidden = {
         "Path",
         "open",
-        "lookup_catalog_record",
         "enumerate_catalog_namespace",
         "write_lock",
         "publish",
@@ -425,3 +432,260 @@ def test_h1a_module_has_no_filesystem_or_backend_surface():
         "fsync",
     }
     assert forbidden.isdisjoint(public)
+    assert {"lookup_catalog_record", "CacheCatalogReadOnlyBackend"} <= public
+
+
+def _initialized_backend(tmp_path, record=None):
+    relative = derive_catalog_record_relative_path(identity())
+    target = tmp_path / relative
+    (tmp_path / "catalog" / "v1" / "records").mkdir(parents=True)
+    if record is not None:
+        target.parent.mkdir(parents=True)
+        target.write_bytes(
+            record if isinstance(record, bytes) else serialize_cache_catalog_record(record)
+        )
+    backend = LocalCacheCatalogReadOnlyBackend.from_root(tmp_path)
+    return backend, target, relative
+
+
+def test_h1b_exact_path_derivation_is_locked_and_contained(tmp_path):
+    value = identity()
+    relative = derive_catalog_record_relative_path(value)
+    assert relative == Path(
+        "catalog/v1/records/audio/transcription.whisper/3/"
+        f"{value.entry_digest[:2]}/{value.entry_digest[2:4]}/{value.entry_digest}.json"
+    )
+    assert not relative.is_absolute()
+    assert ".." not in relative.parts
+    assert len(relative.parts) == 9
+    assert len(relative.as_posix().encode()) <= MAX_CATALOG_RELATIVE_PATH_UTF8_BYTES
+
+
+def test_h1b_supported_live_record_is_found(tmp_path):
+    expected = live_record()
+    backend, _, _ = _initialized_backend(tmp_path, expected)
+    result = lookup_catalog_record(expected.identity, backend=backend)
+    assert result == CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, expected)
+    assert result.record is expected or result.record == expected
+
+
+def test_h1b_supported_tombstone_is_absent_with_revision(tmp_path):
+    expected = tombstone(record_revision=7)
+    backend, _, _ = _initialized_backend(tmp_path, expected)
+    result = lookup_catalog_record(expected.identity, backend=backend)
+    assert result.status is CacheCatalogLookupStatus.RECORD_ABSENT
+    assert result.record is None and result.tombstone_revision == 7
+
+
+def test_h1b_initialized_catalog_missing_exact_record_is_absent(tmp_path):
+    backend, _, _ = _initialized_backend(tmp_path)
+    result = lookup_catalog_record(identity(), backend=backend)
+    assert result.status is CacheCatalogLookupStatus.RECORD_ABSENT
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_h1b_missing_catalog_or_v1_is_unavailable(tmp_path, initialized):
+    if initialized:
+        (tmp_path / "catalog").mkdir()
+    backend = LocalCacheCatalogReadOnlyBackend.from_root(tmp_path)
+    result = lookup_catalog_record(identity(), backend=backend)
+    assert result.status is CacheCatalogLookupStatus.CATALOG_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"{",
+        b'{"catalog_record_version":1}',
+        b'{"catalog_record_version":1,"catalog_record_version":1}',
+        b'{"catalog_record_version":1, "record_state":"live"}',
+    ],
+)
+def test_h1b_malformed_duplicate_or_noncanonical_record_is_corrupt(tmp_path, data):
+    backend, _, _ = _initialized_backend(tmp_path, data)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+def test_h1b_future_record_version_is_unsupported(tmp_path):
+    data = live_record().canonical_bytes().replace(
+        b'"catalog_record_version":1', b'"catalog_record_version":2'
+    )
+    backend, _, _ = _initialized_backend(tmp_path, data)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_UNSUPPORTED
+
+
+def test_h1b_record_for_another_identity_at_exact_path_is_corrupt(tmp_path):
+    expected = identity()
+    other = live_record(identity=identity(key_text="d" * 64))
+    backend, target, _ = _initialized_backend(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(other.canonical_bytes())
+    assert lookup_catalog_record(expected, backend=backend).status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+@pytest.mark.parametrize("conflict", ["namespace", "entry_digest", "cache_key_reference", "unknown"])
+def test_h1b_internal_identity_conflicts_and_unknown_fields_are_corrupt(tmp_path, conflict):
+    data = live_record().to_dict()
+    if conflict == "namespace":
+        data["namespace"] = {**data["namespace"], "domain": "video"}
+    elif conflict == "entry_digest":
+        data["entry_digest"] = "f" * 64
+    elif conflict == "cache_key_reference":
+        data["cache_key_reference"] = identity(key_text="d" * 64).cache_key_reference.to_dict()
+    else:
+        data["unexpected"] = True
+    backend, _, _ = _initialized_backend(tmp_path, canonical_json_bytes(data))
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+def test_h1b_oversized_record_is_corrupt(tmp_path):
+    backend, _, _ = _initialized_backend(tmp_path, b"x" * (MAX_CATALOG_RECORD_BYTES + 1))
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_CORRUPT
+
+
+def test_h1b_exact_65536_byte_supported_record_is_accepted(tmp_path):
+    base = live_record()
+    initial = base.canonical_bytes()
+    desired = MAX_CATALOG_RECORD_BYTES - len(initial) + len(base.last_validated_final.producer_version)
+    summary = replace(base.last_validated_final, producer_version="x" * desired)
+    exact = replace(base, last_validated_final=summary)
+    assert len(exact.canonical_bytes()) == MAX_CATALOG_RECORD_BYTES
+    backend, _, _ = _initialized_backend(tmp_path, exact)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.RECORD_FOUND
+
+
+@pytest.mark.parametrize("component", ["record", "ancestor"])
+def test_h1b_symlinks_are_unsafe(tmp_path, component):
+    _, target, _ = _initialized_backend(tmp_path)
+    target.parent.mkdir(parents=True)
+    if component == "record":
+        os.symlink(tmp_path / "elsewhere", target)
+    else:
+        shard = target.parent
+        shard.rmdir()
+        os.symlink(tmp_path / "elsewhere", shard)
+    backend = LocalCacheCatalogReadOnlyBackend.from_root(tmp_path)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_UNSAFE
+
+
+def test_h1b_wrong_type_layout_or_record_is_unsafe(tmp_path):
+    (tmp_path / "catalog").write_bytes(b"not a directory")
+    backend = LocalCacheCatalogReadOnlyBackend.from_root(tmp_path)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_UNSAFE
+
+
+def test_h1b_fifo_at_record_path_is_unsafe_without_opening_it(tmp_path):
+    _, target, _ = _initialized_backend(tmp_path)
+    target.parent.mkdir(parents=True)
+    os.mkfifo(target)
+    backend = LocalCacheCatalogReadOnlyBackend.from_root(tmp_path)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_UNSAFE
+
+
+class _DelegatingBackend:
+    def __init__(self, delegate, *, alter_path=None, alter_on=2, read=None, failure=None):
+        self.delegate = delegate
+        self.alter_path = alter_path
+        self.alter_on = alter_on
+        self.read_override = read
+        self.failure = failure
+        self.counts = {}
+
+    @property
+    def cache_root(self):
+        return self.delegate.cache_root
+
+    def inspect_root(self):
+        path = self.cache_root.resolved_path
+        self.counts[path] = self.counts.get(path, 0) + 1
+        if self.failure is not None and self.counts[path] == 1:
+            raise self.failure
+        observed = self.delegate.inspect_root()
+        if path == self.alter_path and self.counts[path] >= self.alter_on:
+            return replace(observed, file_id=None)
+        return observed
+
+    def inspect_catalog_relative(self, relative_path):
+        path = self.cache_root.resolved_path / relative_path
+        self.counts[path] = self.counts.get(path, 0) + 1
+        if self.failure is not None and self.counts[path] == 1:
+            raise self.failure
+        observed = self.delegate.inspect_catalog_relative(relative_path)
+        if path == self.alter_path and self.counts[path] >= self.alter_on:
+            return replace(observed, file_id=None)
+        return observed
+
+    def read_record_bounded(self, identity):
+        if self.read_override is not None:
+            return self.read_override(self.delegate.read_record_bounded(identity))
+        return self.delegate.read_record_bounded(identity)
+
+
+@pytest.mark.parametrize("subject", ["root", "parent"])
+def test_h1b_reduced_root_or_parent_identity_is_unstable(tmp_path, subject):
+    local, target, _ = _initialized_backend(tmp_path, live_record())
+    altered = tmp_path if subject == "root" else target.parent
+    backend = _DelegatingBackend(local, alter_path=altered, alter_on=2)
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.CATALOG_UNSTABLE
+
+
+def test_h1b_unstable_record_read_is_unstable_without_retry(tmp_path):
+    local, _, _ = _initialized_backend(tmp_path, live_record())
+    calls = 0
+
+    def unstable(read):
+        nonlocal calls
+        calls += 1
+        return replace(read, stable_read=False)
+
+    result = lookup_catalog_record(identity(), backend=_DelegatingBackend(local, read=unstable))
+    assert result.status is CacheCatalogLookupStatus.CATALOG_UNSTABLE
+    assert calls == 1
+
+
+def test_h1b_replacement_before_open_is_unstable(tmp_path):
+    local, _, _ = _initialized_backend(tmp_path, live_record())
+
+    def replaced(read):
+        return replace(read, pre_read_identity=replace(read.pre_read_identity, file_id=None))
+
+    result = lookup_catalog_record(identity(), backend=_DelegatingBackend(local, read=replaced))
+    assert result.status is CacheCatalogLookupStatus.CATALOG_UNSTABLE
+
+
+def test_h1b_disappearance_during_read_is_unstable_without_retry(tmp_path):
+    local, _, _ = _initialized_backend(tmp_path, live_record())
+
+    class DisappearingBackend(_DelegatingBackend):
+        calls = 0
+
+        def read_record_bounded(self, identity):
+            self.calls += 1
+            raise FileNotFoundError
+
+    backend = DisappearingBackend(local)
+    result = lookup_catalog_record(identity(), backend=backend)
+    assert result.status is CacheCatalogLookupStatus.CATALOG_UNSTABLE
+    assert backend.calls == 1
+
+
+def test_h1b_permission_failure_is_structured_and_sanitized(tmp_path):
+    local, _, relative = _initialized_backend(tmp_path, live_record())
+    backend = _DelegatingBackend(local, failure=CacheLookupPermissionError("secret /absolute/path"))
+    result = lookup_catalog_record(identity(), backend=backend)
+    assert result.status is CacheCatalogLookupStatus.CATALOG_IO_FAILURE
+    assert len(result.diagnostics) == 1
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.relative_path == relative.as_posix()
+    assert "/absolute/path" not in repr(result)
+
+
+def test_h1b_authority_boundary_and_read_only_protocol_are_explicit(tmp_path):
+    backend, _, _ = _initialized_backend(tmp_path, live_record())
+    result = lookup_catalog_record(identity(), backend=backend)
+    assert result.status.value != "hit"
+    assert CacheCatalogLookupStatus.RECORD_ABSENT.value != "miss"
+    assert not hasattr(result, "validated_entry")
+    assert isinstance(backend, CacheCatalogReadOnlyBackend)
+    forbidden = {"write", "mkdir", "rename", "replace", "unlink", "fsync", "acquire_lock", "publish"}
+    assert forbidden.isdisjoint(dir(backend))
