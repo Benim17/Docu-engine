@@ -1,4 +1,4 @@
-"""Internal H2A read-only cache and catalog identity discovery."""
+"""Internal H2 cache catalog discovery, comparison, and action execution."""
 
 from __future__ import annotations
 
@@ -22,12 +22,18 @@ from .cache_catalog import (
     CacheCatalogLookupResult,
     CacheCatalogLookupStatus,
     CacheCatalogReadOnlyBackend,
+    CacheCatalogBackend,
     CacheCatalogRecord,
     CacheCatalogRecoverySummary,
     CacheCatalogTombstone,
     CacheCatalogUnsupportedVersionError,
+    CacheCatalogWriteResult,
+    CacheCatalogWriteStatus,
     parse_cache_catalog_record,
     lookup_catalog_record,
+    tombstone_catalog_empty,
+    upsert_catalog_from_lookup,
+    upsert_catalog_from_recovery,
     _final_summary_from_reference,
     _recovery_summary_from_observation,
 )
@@ -988,6 +994,8 @@ class CacheCatalogReconciliationActionReason(str, Enum):
     RECOVERY_SUMMARY_STALE = "recovery_summary_stale"
     EXACT_EMPTY = "exact_empty"
     TOMBSTONE_MATCHES_EMPTY = "tombstone_matches_empty"
+    EMPTY_CATALOG_ABSENT = "empty_catalog_absent"
+    EMPTY_CATALOG_UNAVAILABLE = "empty_catalog_unavailable"
     EXPECTATIONS_UNAVAILABLE = "expectations_unavailable"
     AUTHORITATIVE_INCOMPLETE = "authoritative_incomplete"
     AUTHORITATIVE_UNSUPPORTED = "authoritative_unsupported"
@@ -1042,6 +1050,7 @@ class CacheCatalogReconciliationObservation:
     lookup: ReadOnlyCacheLookupResult | None
     recovery: CacheRecoveryObservation | None
     catalog: CacheCatalogLookupResult | None
+    recovery_request: CacheRecoveryInspectionRequest | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, CacheCatalogIdentity):
@@ -1054,6 +1063,12 @@ class CacheCatalogReconciliationObservation:
             raise TypeError("recovery must be a Step 5E observation or None.")
         if self.catalog is not None and not isinstance(self.catalog, CacheCatalogLookupResult):
             raise TypeError("catalog must be an H1 lookup result or None.")
+        if self.recovery_request is not None and not isinstance(
+            self.recovery_request, CacheRecoveryInspectionRequest
+        ):
+            raise TypeError("recovery_request must be a Step 5E request or None.")
+        if self.recovery_request is not None and self.recovery is None:
+            raise ValueError("a retained Step 5E request requires its observation.")
 
 
 @dataclass(frozen=True)
@@ -1088,6 +1103,10 @@ class CacheCatalogReconciliationAction:
                 raise ValueError("UPSERT_RECOVERY carries only a recovery summary.")
         elif self.final_summary is not None or self.recovery_summary is not None:
             raise ValueError("non-upsert actions carry no proposed summary.")
+        if self.kind is CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY and (
+            self.expected_catalog_revision is None
+        ):
+            raise ValueError("TOMBSTONE_EMPTY requires a positive supported revision.")
 
 
 def _catalog_revision(result: CacheCatalogLookupResult) -> int | None:
@@ -1131,10 +1150,22 @@ def compare_reconciliation_observation(
         return _action(observation, CacheCatalogReconciliationActionKind.DEFER,
                        CacheCatalogReconciliationActionReason.EXPECTATIONS_UNAVAILABLE)
     catalog = observation.catalog
+    lookup = observation.lookup
+    recovery = observation.recovery
+    if (
+        catalog.status is CacheCatalogLookupStatus.CATALOG_UNAVAILABLE
+        and lookup.status is not CacheLookupStatus.HIT
+        and recovery is not None
+        and recovery.status is CacheRecoveryStatus.EMPTY
+    ):
+        return _action(
+            observation,
+            CacheCatalogReconciliationActionKind.NOOP,
+            CacheCatalogReconciliationActionReason.EMPTY_CATALOG_UNAVAILABLE,
+        )
     if catalog.status in _CATALOG_FAILURE_ACTION:
         return _action(observation, *_CATALOG_FAILURE_ACTION[catalog.status])
 
-    lookup = observation.lookup
     if lookup.status not in {
         CacheLookupStatus.HIT,
         CacheLookupStatus.MISS,
@@ -1161,7 +1192,6 @@ def compare_reconciliation_observation(
         )
 
     recovery_summary = None
-    recovery = observation.recovery
     if recovery is not None and recovery.status is not None:
         if recovery.status is CacheRecoveryStatus.RECOVERY_UNSTABLE:
             return _action(observation, CacheCatalogReconciliationActionKind.DEFER,
@@ -1177,13 +1207,15 @@ def compare_reconciliation_observation(
         recovery_summary = _recovery_summary_from_observation(recovery)
 
     record = catalog.record
-    tombstone = catalog.status is CacheCatalogLookupStatus.RECORD_ABSENT and catalog.tombstone_revision is not None
     if lookup.status is not CacheLookupStatus.HIT and recovery is not None and recovery.status is CacheRecoveryStatus.EMPTY:
-        if tombstone:
+        if catalog.status is CacheCatalogLookupStatus.RECORD_ABSENT:
             return _action(observation, CacheCatalogReconciliationActionKind.NOOP,
-                           CacheCatalogReconciliationActionReason.TOMBSTONE_MATCHES_EMPTY)
-        return _action(observation, CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY,
-                       CacheCatalogReconciliationActionReason.EXACT_EMPTY)
+                           (CacheCatalogReconciliationActionReason.TOMBSTONE_MATCHES_EMPTY
+                            if catalog.tombstone_revision is not None
+                            else CacheCatalogReconciliationActionReason.EMPTY_CATALOG_ABSENT))
+        if catalog.status is CacheCatalogLookupStatus.RECORD_FOUND:
+            return _action(observation, CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY,
+                           CacheCatalogReconciliationActionReason.EXACT_EMPTY)
 
     if final_summary is not None and (
         record is None or record.last_validated_final != final_summary
@@ -1278,22 +1310,197 @@ def observe_and_compare_reconciliation_identity(
             or lookup.cache_key_reference != identity.cache_key_reference):
         raise ValueError("Step 5B result identity does not match discovered identity.")
     recovery = None
+    recovery_request = None
     needs_recovery = (
         observation_scope is CacheCatalogReconciliationObservationScope.FINAL_AND_RECOVERY
         or bool(discovered.sources & ReconciliationSourceFlags.STAGING)
         or (lookup.status is not CacheLookupStatus.HIT and bool(discovered.sources & ReconciliationSourceFlags.CATALOG))
     )
     if needs_recovery:
-        request = CacheRecoveryInspectionRequest(
+        recovery_request = CacheRecoveryInspectionRequest(
             cache_root, identity.namespace, cache_key, resolved.expectation,
             resolved.artifact_expectation, resolved.payload_expectation,
             resolved.lookup_policy, resolved.lock_observation_policy,
             resolved.recovery_policy,
         )
-        recovery = recovery_operation(request, filesystem=recovery_filesystem, lock_clock=lock_clock)
+        recovery = recovery_operation(
+            recovery_request, filesystem=recovery_filesystem, lock_clock=lock_clock
+        )
         if recovery.entry_digest != identity.entry_digest:
             raise ValueError("Step 5E result identity does not match discovered identity.")
     catalog = catalog_operation(identity, backend=catalog_backend)
     return compare_reconciliation_observation(
-        CacheCatalogReconciliationObservation(identity, discovered.sources, lookup, recovery, catalog)
+        CacheCatalogReconciliationObservation(
+            identity, discovered.sources, lookup, recovery, catalog, recovery_request
+        )
     )
+
+
+class ReconciliationActionExecutionStatus(str, Enum):
+    APPLIED = "applied"
+    WOULD_APPLY = "would_apply"
+    NO_CHANGE = "no_change"
+    DEFERRED = "deferred"
+    REPORT_ONLY = "report_only"
+    REVISION_CONFLICT = "revision_conflict"
+    CATALOG_FAILURE = "catalog_failure"
+
+
+@dataclass(frozen=True)
+class ReconciliationActionExecutionResult:
+    action: CacheCatalogReconciliationAction
+    status: ReconciliationActionExecutionStatus
+    catalog_write_status: CacheCatalogWriteStatus | None = None
+    applied_revision: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, CacheCatalogReconciliationAction):
+            raise TypeError("action must be CacheCatalogReconciliationAction.")
+        if not isinstance(self.status, ReconciliationActionExecutionStatus):
+            raise TypeError("status must be ReconciliationActionExecutionStatus.")
+        if self.status is ReconciliationActionExecutionStatus.APPLIED:
+            if (
+                self.catalog_write_status is not CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED
+                or isinstance(self.applied_revision, bool)
+                or not isinstance(self.applied_revision, int)
+                or self.applied_revision <= 0
+            ):
+                raise ValueError("APPLIED requires H1's positive applied revision.")
+        elif self.applied_revision is not None:
+            raise ValueError("only APPLIED carries an applied revision.")
+        if self.status in {
+            ReconciliationActionExecutionStatus.NO_CHANGE,
+            ReconciliationActionExecutionStatus.DEFERRED,
+            ReconciliationActionExecutionStatus.REPORT_ONLY,
+            ReconciliationActionExecutionStatus.WOULD_APPLY,
+        } and self.catalog_write_status is not None:
+            raise ValueError("no-write execution statuses carry no H1 write status.")
+
+
+def _validate_executable_action(action: CacheCatalogReconciliationAction) -> None:
+    observation = action.observation
+    if action.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL:
+        lookup = observation.lookup
+        if (
+            lookup is None
+            or lookup.status is not CacheLookupStatus.HIT
+            or lookup.validated_entry is None
+            or action.final_summary
+            != _final_summary_from_reference(
+                lookup.validated_entry, CacheCatalogFinalProvenance.STEP5B_HIT
+            )
+        ):
+            raise ValueError("UPSERT_FINAL requires its exact trusted Step 5B HIT.")
+    elif action.kind is CacheCatalogReconciliationActionKind.UPSERT_RECOVERY:
+        if (
+            observation.recovery_request is None
+            or observation.recovery is None
+            or observation.recovery.status is None
+            or action.recovery_summary
+            != _recovery_summary_from_observation(observation.recovery)
+        ):
+            raise ValueError("UPSERT_RECOVERY requires its exact completed Step 5E evidence.")
+    elif action.kind is CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY:
+        catalog = observation.catalog
+        if (
+            observation.recovery_request is None
+            or observation.recovery is None
+            or observation.recovery.status is not CacheRecoveryStatus.EMPTY
+            or (observation.lookup is not None and observation.lookup.status is CacheLookupStatus.HIT)
+            or catalog is None
+            or catalog.status is not CacheCatalogLookupStatus.RECORD_FOUND
+            or catalog.record is None
+            or action.expected_catalog_revision != catalog.record.record_revision
+            or action.expected_catalog_revision is None
+        ):
+            raise ValueError(
+                "TOMBSTONE_EMPTY requires exact EMPTY, no HIT, and one supported live revision."
+            )
+
+
+_WRITE_EXECUTION_STATUS = {
+    CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED: ReconciliationActionExecutionStatus.APPLIED,
+    CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT: ReconciliationActionExecutionStatus.REVISION_CONFLICT,
+    CacheCatalogWriteStatus.CATALOG_WRITE_UNAVAILABLE: ReconciliationActionExecutionStatus.CATALOG_FAILURE,
+    CacheCatalogWriteStatus.CATALOG_WRITE_CORRUPT: ReconciliationActionExecutionStatus.CATALOG_FAILURE,
+    CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED: ReconciliationActionExecutionStatus.CATALOG_FAILURE,
+    CacheCatalogWriteStatus.CATALOG_WRITE_UNSAFE: ReconciliationActionExecutionStatus.CATALOG_FAILURE,
+    CacheCatalogWriteStatus.CATALOG_WRITE_UNSTABLE: ReconciliationActionExecutionStatus.CATALOG_FAILURE,
+    CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE: ReconciliationActionExecutionStatus.CATALOG_FAILURE,
+}
+
+
+def _execution_from_write(
+    action: CacheCatalogReconciliationAction,
+    write: CacheCatalogWriteResult,
+) -> ReconciliationActionExecutionResult:
+    if not isinstance(write, CacheCatalogWriteResult):
+        raise TypeError("typed H1 operation must return CacheCatalogWriteResult.")
+    status = _WRITE_EXECUTION_STATUS[write.status]
+    return ReconciliationActionExecutionResult(
+        action,
+        status,
+        write.status,
+        write.record_revision if status is ReconciliationActionExecutionStatus.APPLIED else None,
+    )
+
+
+def execute_reconciliation_action(
+    action: CacheCatalogReconciliationAction,
+    *,
+    backend: CacheCatalogBackend | None,
+    dry_run: bool = False,
+    final_operation: Callable[..., CacheCatalogWriteResult] = upsert_catalog_from_lookup,
+    recovery_operation: Callable[..., CacheCatalogWriteResult] = upsert_catalog_from_recovery,
+    tombstone_operation: Callable[..., CacheCatalogWriteResult] = tombstone_catalog_empty,
+) -> ReconciliationActionExecutionResult:
+    """Execute at most one typed H1 catalog mutation; never observe or replan."""
+
+    if not isinstance(action, CacheCatalogReconciliationAction):
+        raise TypeError("action must be CacheCatalogReconciliationAction.")
+    if not isinstance(dry_run, bool):
+        raise TypeError("dry_run must be bool.")
+    _validate_executable_action(action)
+    no_write_status = {
+        CacheCatalogReconciliationActionKind.NOOP: ReconciliationActionExecutionStatus.NO_CHANGE,
+        CacheCatalogReconciliationActionKind.DEFER: ReconciliationActionExecutionStatus.DEFERRED,
+        CacheCatalogReconciliationActionKind.REPORT_ONLY: ReconciliationActionExecutionStatus.REPORT_ONLY,
+    }.get(action.kind)
+    if no_write_status is not None:
+        return ReconciliationActionExecutionResult(action, no_write_status)
+    if dry_run:
+        return ReconciliationActionExecutionResult(
+            action, ReconciliationActionExecutionStatus.WOULD_APPLY
+        )
+    if backend is None:
+        raise TypeError("a CacheCatalogBackend is required for catalog mutation.")
+    observation = action.observation
+    if action.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL:
+        assert observation.lookup is not None
+        write = final_operation(
+            action.identity,
+            observation.lookup,
+            expected_revision=action.expected_catalog_revision,
+            backend=backend,
+        )
+    elif action.kind is CacheCatalogReconciliationActionKind.UPSERT_RECOVERY:
+        assert observation.recovery_request is not None and observation.recovery is not None
+        write = recovery_operation(
+            action.identity,
+            observation.recovery_request,
+            observation.recovery,
+            expected_revision=action.expected_catalog_revision,
+            backend=backend,
+        )
+    else:
+        assert action.kind is CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY
+        assert observation.recovery_request is not None and observation.recovery is not None
+        assert action.expected_catalog_revision is not None
+        write = tombstone_operation(
+            action.identity,
+            observation.recovery_request,
+            observation.recovery,
+            expected_revision=action.expected_catalog_revision,
+            backend=backend,
+        )
+    return _execution_from_write(action, write)

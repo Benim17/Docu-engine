@@ -9,6 +9,8 @@ from engine.storage.cache_catalog import (
     CacheCatalogFinalProvenance,
     CacheCatalogLookupResult,
     CacheCatalogLookupStatus,
+    CacheCatalogWriteResult,
+    CacheCatalogWriteStatus,
     CacheCatalogLiveRecord,
     CacheCatalogRecoverySummary,
     CacheCatalogTombstone,
@@ -16,6 +18,7 @@ from engine.storage.cache_catalog import (
     LocalCacheCatalogBackend,
     LocalCacheCatalogReadOnlyBackend,
     derive_catalog_record_relative_path,
+    lookup_catalog_record,
 )
 from engine.storage.cache_keys import CacheKey
 from engine.storage.cache_lookup import FilesystemObjectType
@@ -45,6 +48,7 @@ from engine.storage.cache_reconciliation import (
     ReconciliationDiscoveryPolicy,
     ReconciliationSourceFlags,
     ReconciliationResolvedExpectations,
+    ReconciliationActionExecutionStatus,
     _DiscoveryBudget,
     _merged_identities,
     _validate_relative,
@@ -56,8 +60,10 @@ from engine.storage.cache_reconciliation import (
     compare_reconciliation_observation,
     compare_reconciliation_observations,
     observe_and_compare_reconciliation_identity,
+    execute_reconciliation_action,
 )
 from engine.storage.cache_recovery import (
+    CacheRecoveryInspectionRequest,
     CacheRecoveryObservation,
     CacheRecoveryReason,
     CacheRecoveryStatus,
@@ -498,8 +504,30 @@ def _recovery(identity, status=CacheRecoveryStatus.EMPTY, reason=None):
     )
 
 
-def _observation(identity, lookup, catalog, recovery=None, sources=ReconciliationSourceFlags.FINAL):
-    return CacheCatalogReconciliationObservation(identity, sources, lookup, recovery, catalog)
+def _observation(
+    identity, lookup, catalog, recovery=None,
+    sources=ReconciliationSourceFlags.FINAL, recovery_request=None,
+):
+    return CacheCatalogReconciliationObservation(
+        identity, sources, lookup, recovery, catalog, recovery_request
+    )
+
+
+def _recovery_request(root, identity):
+    return CacheRecoveryInspectionRequest(
+        LocalReconciliationReadOnlyFilesystem.from_root(root).cache_root,
+        identity.namespace,
+        identity.cache_key_reference.to_cache_key(),
+        CacheLookupExpectation(
+            identity.namespace, identity.namespace.producer_id,
+            identity.namespace.producer_schema_version,
+            CacheRuntimeFingerprint(1, {"model": "test"}),
+        ),
+        None,
+        ProducerPayloadExpectation(),
+        CacheLookupVerificationPolicy(),
+        LockObservationPolicy(60),
+    )
 
 
 def test_h2b_absent_hit_upserts_final_and_equal_summary_noops(tmp_path):
@@ -543,10 +571,19 @@ def test_h2b_exact_empty_tombstones_or_matches_tombstone(tmp_path):
     empty = _recovery(identity)
     absent = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
     action = compare_reconciliation_observation(_observation(identity, _nonhit(identity), absent, empty))
+    assert action.kind is CacheCatalogReconciliationActionKind.NOOP
+    live = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, _live(identity))
+    action = compare_reconciliation_observation(_observation(identity, _nonhit(identity), live, empty))
     assert action.kind is CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY
+    assert action.expected_catalog_revision == 1
     existing = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT, tombstone_revision=7)
     noop = compare_reconciliation_observation(_observation(identity, _nonhit(identity), existing, empty))
     assert noop.kind is CacheCatalogReconciliationActionKind.NOOP
+    unavailable = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity),
+        CacheCatalogLookupResult(CacheCatalogLookupStatus.CATALOG_UNAVAILABLE), empty,
+    ))
+    assert unavailable.kind is CacheCatalogReconciliationActionKind.NOOP
 
 
 @pytest.mark.parametrize("status,kind", [
@@ -643,3 +680,184 @@ def test_h2b_missing_expectations_defers_without_any_dependency_call(tmp_path):
         expectation_resolver=Resolver(), lookup_filesystem=object(), recovery_filesystem=object(), catalog_backend=object(),
     )
     assert action.kind is CacheCatalogReconciliationActionKind.DEFER
+
+
+def test_h2c_no_write_actions_preserve_reason_and_never_touch_backend(tmp_path):
+    root, identity, _, lookup = _h2b_evidence(tmp_path)
+    empty = _recovery(identity)
+    request = _recovery_request(root, identity)
+    noop = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT),
+        empty, recovery_request=request,
+    ))
+    deferred = compare_reconciliation_observation(
+        CacheCatalogReconciliationObservation(
+            identity, ReconciliationSourceFlags.FINAL, None, None, None
+        )
+    )
+    report = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.CATALOG_CORRUPT)
+    ))
+    results = [execute_reconciliation_action(item, backend=None) for item in (noop, deferred, report)]
+    assert [item.status for item in results] == [
+        ReconciliationActionExecutionStatus.NO_CHANGE,
+        ReconciliationActionExecutionStatus.DEFERRED,
+        ReconciliationActionExecutionStatus.REPORT_ONLY,
+    ]
+    assert [item.action.reason for item in results] == [item.reason for item in (noop, deferred, report)]
+
+
+def test_h2c_upsert_final_absent_creates_revision_one(tmp_path):
+    root, identity, _, lookup = _h2b_evidence(tmp_path)
+    backend = LocalCacheCatalogBackend.from_root(root)
+    action = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    ))
+    result = execute_reconciliation_action(action, backend=backend)
+    assert (result.status, result.applied_revision) == (
+        ReconciliationActionExecutionStatus.APPLIED, 1
+    )
+    stored = lookup_catalog_record(identity, backend=backend)
+    assert stored.record is not None and stored.record.last_validated_final == action.final_summary
+
+
+def test_h2c_upsert_recovery_create_update_and_preserve_final(tmp_path):
+    root, identity, _, lookup = _h2b_evidence(tmp_path)
+    backend = LocalCacheCatalogBackend.from_root(root)
+    final_action = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    ))
+    execute_reconciliation_action(final_action, backend=backend)
+    current = lookup_catalog_record(identity, backend=backend)
+    recovery = _recovery(identity, CacheRecoveryStatus.FINAL_PUBLISHED)
+    request = _recovery_request(root, identity)
+    recovery_action = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), current, recovery, recovery_request=request,
+    ))
+    result = execute_reconciliation_action(recovery_action, backend=backend)
+    assert (result.status, result.applied_revision) == (
+        ReconciliationActionExecutionStatus.APPLIED, 2
+    )
+    stored = lookup_catalog_record(identity, backend=backend)
+    assert stored.record is not None
+    assert stored.record.last_validated_final == final_action.final_summary
+    assert stored.record.last_recovery_observation == recovery_action.recovery_summary
+
+
+def test_h2c_empty_live_tombstones_with_positive_revision_only(tmp_path):
+    root, identity, _, _ = _h2b_evidence(tmp_path)
+    backend = LocalCacheCatalogBackend.from_root(root)
+    request = _recovery_request(root, identity)
+    published = _recovery(identity, CacheRecoveryStatus.FINAL_PUBLISHED)
+    create = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT),
+        published, recovery_request=request,
+    ))
+    execute_reconciliation_action(create, backend=backend)
+    current = lookup_catalog_record(identity, backend=backend)
+    empty = _recovery(identity)
+    tombstone = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), current, empty, recovery_request=request,
+    ))
+    assert tombstone.expected_catalog_revision == 1
+    result = execute_reconciliation_action(tombstone, backend=backend)
+    assert (result.status, result.applied_revision) == (
+        ReconciliationActionExecutionStatus.APPLIED, 2
+    )
+    stored = lookup_catalog_record(identity, backend=backend)
+    assert stored.status is CacheCatalogLookupStatus.RECORD_ABSENT
+    assert stored.tombstone_revision == 2
+
+
+@pytest.mark.parametrize("write_status,execution_status", [
+    (CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, ReconciliationActionExecutionStatus.REVISION_CONFLICT),
+    (CacheCatalogWriteStatus.CATALOG_WRITE_UNAVAILABLE, ReconciliationActionExecutionStatus.CATALOG_FAILURE),
+    (CacheCatalogWriteStatus.CATALOG_WRITE_CORRUPT, ReconciliationActionExecutionStatus.CATALOG_FAILURE),
+    (CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED, ReconciliationActionExecutionStatus.CATALOG_FAILURE),
+    (CacheCatalogWriteStatus.CATALOG_WRITE_UNSAFE, ReconciliationActionExecutionStatus.CATALOG_FAILURE),
+    (CacheCatalogWriteStatus.CATALOG_WRITE_UNSTABLE, ReconciliationActionExecutionStatus.CATALOG_FAILURE),
+    (CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE, ReconciliationActionExecutionStatus.CATALOG_FAILURE),
+])
+def test_h2c_maps_h1_write_failures_once_without_retry(tmp_path, write_status, execution_status):
+    _, identity, _, lookup = _h2b_evidence(tmp_path)
+    action = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    ))
+    calls = []
+    def operation(*args, **kwargs):
+        calls.append((args, kwargs))
+        return CacheCatalogWriteResult(write_status)
+    result = execute_reconciliation_action(action, backend=object(), final_operation=operation)
+    assert result.status is execution_status
+    assert result.catalog_write_status is write_status
+    assert len(calls) == 1
+
+
+def test_h2c_dry_run_validates_but_performs_no_typed_operation(tmp_path):
+    root, identity, _, lookup = _h2b_evidence(tmp_path)
+    request = _recovery_request(root, identity)
+    recovery = _recovery(identity, CacheRecoveryStatus.FINAL_PUBLISHED)
+    final = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    ))
+    recovery_action = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT),
+        recovery, recovery_request=request,
+    ))
+    live = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, _live(identity))
+    tombstone = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), live, _recovery(identity), recovery_request=request,
+    ))
+    def forbidden(*args, **kwargs):
+        raise AssertionError("typed mutation must not run during dry-run")
+    for action in (final, recovery_action, tombstone):
+        result = execute_reconciliation_action(
+            action, backend=None, dry_run=True, final_operation=forbidden,
+            recovery_operation=forbidden, tombstone_operation=forbidden,
+        )
+        assert result.status is ReconciliationActionExecutionStatus.WOULD_APPLY
+
+
+def test_h2c_tombstone_invariants_fail_before_mutation(tmp_path):
+    root, identity, _, lookup = _h2b_evidence(tmp_path)
+    request = _recovery_request(root, identity)
+    live = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, _live(identity))
+    valid = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), live, _recovery(identity), recovery_request=request,
+    ))
+    with pytest.raises(ValueError, match="positive supported revision"):
+        replace(valid, expected_catalog_revision=None)
+    contradictory = replace(valid, observation=_observation(
+        identity, lookup, live, _recovery(identity), recovery_request=request,
+    ))
+    with pytest.raises(ValueError, match="no HIT"):
+        execute_reconciliation_action(contradictory, backend=object())
+    nonempty = replace(valid, observation=_observation(
+        identity, _nonhit(identity), live,
+        _recovery(identity, CacheRecoveryStatus.FINAL_PUBLISHED), recovery_request=request,
+    ))
+    with pytest.raises(ValueError, match="exact EMPTY"):
+        execute_reconciliation_action(nonempty, backend=object())
+
+
+def test_h2c_final_precedence_executes_exactly_one_mutation(tmp_path):
+    root, identity, _, lookup = _h2b_evidence(tmp_path)
+    request = _recovery_request(root, identity)
+    observation = _observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, _live(identity)),
+        _recovery(identity, CacheRecoveryStatus.FINAL_PUBLISHED), recovery_request=request,
+    )
+    action = compare_reconciliation_observation(observation)
+    assert action.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL
+    calls = []
+    def final_once(*args, **kwargs):
+        calls.append("final")
+        return CacheCatalogWriteResult(CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED, 2)
+    def recovery_forbidden(*args, **kwargs):
+        raise AssertionError("hidden recovery mutation")
+    result = execute_reconciliation_action(
+        action, backend=object(), final_operation=final_once,
+        recovery_operation=recovery_forbidden,
+    )
+    assert result.status is ReconciliationActionExecutionStatus.APPLIED
+    assert calls == ["final"]
