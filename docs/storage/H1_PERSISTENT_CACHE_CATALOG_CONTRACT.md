@@ -164,15 +164,40 @@ validation or promotion evidence; it is never a claim of current presence.
 provenance: "step5e_observation"
 status: supported CacheRecoveryStatus value
 reason: supported CacheRecoveryReason or CacheLookupReason value | null
-staging_candidate_count: integer from 0 through 64
-final_state: supported FinalRecoveryState value
-lock_state: supported LockRecoveryState value
+staging_candidate_count: integer from 0 through 64 | null
+final_state: supported FinalRecoveryState value | "final_unobserved"
+lock_state: supported LockRecoveryState value | "lock_unobserved"
 ```
 
 For lifecycle statuses, `reason` is null. Failure statuses retain the precise trusted
-Step 5E reason. Staging paths, diagnostics, tokens, and individual candidate details
-are not persisted in H1. This summary is descriptive, may become stale immediately,
-and is not cleanup eligibility or mutation authority.
+Step 5E reason. The two explicit H1-only sentinel values are strict canonical summary
+values, not additions to the Step 5E component enums:
+
+- `"final_unobserved"` means Step 5E completed but final-component observation did
+  not occur because inspection terminated at an earlier root or traversal failure;
+  it does not mean final absent, invalid, or unsafe and carries no filesystem claim.
+- `"lock_unobserved"` means Step 5E completed but lock-component observation did not
+  occur for the same reason; it does not mean lock absent, unlocked, active, or stale
+  and carries no liveness claim.
+
+The typed Step 5E mapping must use a concrete `FinalRecoveryState` or
+`LockRecoveryState` exactly when the source observation supplies that classification.
+It may use the corresponding H1 sentinel only when the source component
+classification is null. It must never replace an observed concrete state with an
+unobserved sentinel or infer a concrete state from a null classification.
+
+`staging_candidate_count` is null exactly when staging discovery did not occur and
+the Step 5E result contains only an unclassified staging placeholder. Null means
+unobserved, not zero candidates. After completed staging discovery, a sole concrete
+`STAGING_ABSENT` observation maps to `0`; otherwise the field is the number of
+concrete discovered candidate observations, from 1 through 64. A mixture of null and
+concrete staging classifications is not valid typed source evidence.
+
+Staging paths, diagnostics, tokens, and individual candidate details are not
+persisted in H1. This summary is descriptive, may become stale immediately, and is
+not cleanup eligibility or mutation authority. Unknown strings and every other
+out-of-domain value remain malformed under the existing strict record schema;
+recognizable future record versions retain the existing unsupported-version rules.
 
 ### 4.3 Field decision table
 
@@ -184,6 +209,7 @@ and is not cleanup eligibility or mutation authority.
 | CacheKeyReference | **REQUIRED** | Reconstructable redundant digest integrity |
 | Final validated summary | **OPTIONAL** | Present only with Step 5B/5D trusted evidence |
 | Recovery summary | **OPTIONAL** | Present only with Step 5E trusted evidence |
+| Unobserved recovery components | **EXPLICIT in recovery summary when applicable** | Preserves lack of component evidence without inventing absence |
 | Cache-entry contract version | **REQUIRED in final summary** | Identifies strict source model version |
 | Producer ID/version/schema | **REQUIRED in final summary** | Supported by validated metadata |
 | Artifact kind/contract version | **REQUIRED in final summary** | Useful generic metadata without logical ID |
@@ -449,6 +475,21 @@ H1 exposes three typed builders/update operations:
 3. **Step 5E observation upsert** — accepts the exact request identity and completed
    immutable `CacheRecoveryObservation`; derives the recovery summary.
 
+The Step 5E upsert accepts every completed Step 5E observation, including root-level
+failures that terminate before component observation. Its mapping is exact:
+
+- a concrete Step 5E component classification becomes the same concrete H1 summary
+  value;
+- a null final or lock classification becomes only the corresponding H1
+  `"final_unobserved"` or `"lock_unobserved"` sentinel;
+- unperformed staging discovery becomes null `staging_candidate_count`; and
+- `status` and `reason` are preserved exactly and are never changed by the sentinel
+  mapping.
+
+Typed mapping rejects use of an unobserved sentinel when the source observation
+contains a concrete component classification. No caller may supply these summary
+fields independently of completed Step 5E evidence.
+
 Each validates cross-model identity before acquiring mutation authority. An update
 preserves the other existing supported summary unless trusted new evidence explicitly
 supersedes it. Step 5E evidence that says final is absent does not erase historical
@@ -515,9 +556,15 @@ promotion retry, or cleanup planning. In particular:
 ```text
 cataloged Step 5E summary != current recovery truth
 cataloged Step 5E summary != cleanup eligibility
+H1 unobserved             != filesystem absence
+H1 unobserved             != cleanup eligibility
+H1 unobserved             != cache miss
+H1 unobserved             != lock absence
 ```
 
-A consumer needing current recovery state must invoke Step 5E again.
+A consumer needing current recovery state or component truth must invoke Step 5E
+again. In particular, H1 unobserved evidence cannot be converted into an absence,
+lock-liveness, retention, or mutation decision.
 
 ## 16. Enumeration, resource limits, and ordering
 
@@ -711,6 +758,18 @@ write, generic delete, or cache mutation API is approved.
 - namespace/key-reference/digest/path conflicts;
 - live record requires at least one summary;
 - strict provenance, recovery reason/status, and verification-level combinations;
+- canonical recovery-summary round trips for `"final_unobserved"` and
+  `"lock_unobserved"`;
+- root failure before final observation maps to `"final_unobserved"`, distinct from
+  concrete `FINAL_ABSENT`;
+- root failure before lock observation maps to `"lock_unobserved"`, distinct from
+  concrete `LOCK_ABSENT`;
+- unperformed staging discovery maps to null `staging_candidate_count`, while a
+  completed discovery of zero candidates maps to integer `0`;
+- typed mapping rejects an unobserved sentinel when Step 5E supplied a concrete
+  component state; and
+- cataloged recovery summaries, including unobserved evidence, remain descriptive
+  only and never become cleanup eligibility;
 - record revision bounds and exact increment behavior; and
 - record-size boundary at 65,536 bytes and one over.
 
@@ -831,7 +890,6 @@ Status:
 
 Exact next action:
 
-**Implement H1 according to the locked contract, beginning with H1A — catalog
-identity, models, canonical serialization, and limits.**
+**Resume H1E typed integrations against the reconciled recovery-summary model.**
 
 H2 implementation remains unapproved.
