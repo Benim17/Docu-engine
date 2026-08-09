@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -103,6 +103,29 @@ class RecoverySubject(str, Enum):
     STAGING = "staging"
     FINAL = "final"
     LOCK = "lock"
+
+
+@dataclass(frozen=True)
+class CacheRecoveryDiagnostic:
+    code: str
+    subject: RecoverySubject
+    relative_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.code, str)
+            or not self.code
+            or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._" for character in self.code)
+        ):
+            raise ValueError("diagnostic code must be stable lowercase identifier data.")
+        if not isinstance(self.subject, RecoverySubject):
+            raise TypeError("diagnostic subject must be RecoverySubject.")
+        if self.relative_path is not None:
+            if not isinstance(self.relative_path, str) or not self.relative_path:
+                raise ValueError("diagnostic relative_path must be non-empty or None.")
+            path = Path(self.relative_path)
+            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError("diagnostic paths must be sanitized relative paths.")
 
 
 class StagingRecoveryState(str, Enum):
@@ -260,6 +283,7 @@ class CacheRecoveryObservation:
     lock: LockRecoveryObservation
     status: CacheRecoveryStatus | None = None
     reason: CacheRecoveryReason | CacheLookupReason | None = None
+    diagnostics: tuple[CacheRecoveryDiagnostic, ...] = ()
 
     def __post_init__(self) -> None:
         if self.status is None and self.reason is not None:
@@ -278,6 +302,12 @@ class CacheRecoveryObservation:
             range(len(self.staging))
         ):
             raise ValueError("staging observations must use deterministic indexes.")
+        if not isinstance(self.diagnostics, tuple) or any(
+            not isinstance(item, CacheRecoveryDiagnostic) for item in self.diagnostics
+        ):
+            raise TypeError("diagnostics must be immutable recovery diagnostics.")
+        if len(self.diagnostics) > RecoveryInspectionPolicy().max_diagnostics:
+            raise ValueError("diagnostics exceed the locked Step 5E limit.")
 
 
 @dataclass(frozen=True)
@@ -394,6 +424,7 @@ class _RecoveryTraversalFoundation:
     lock_path: Path
     staging_namespace_path: Path
     staging_candidate_paths: tuple[Path, ...]
+    staging_namespace_identity: FileIdentity | None
     observation: CacheRecoveryObservation
 
 
@@ -436,11 +467,16 @@ def _validate_existing_directory_chain(
             raise RecoveryTraversalError("Recovery traversal encountered an unsafe ancestor.")
 
 
-def _sanitized_staging_relative(request: CacheRecoveryInspectionRequest) -> str:
+def _sanitized_staging_relative(
+    request: CacheRecoveryInspectionRequest, candidate_index: int = 0
+) -> str:
     directory = _staging_namespace_path(request).relative_to(
         request.cache_root.resolved_path
     )
-    return (directory / f"{derive_entry_digest(request.cache_key)}.<writer-token>").as_posix()
+    return (
+        directory
+        / f"{derive_entry_digest(request.cache_key)}.<writer-token-{candidate_index:04d}>"
+    ).as_posix()
 
 
 def _prepare_recovery_inspection(
@@ -469,6 +505,7 @@ def _prepare_recovery_inspection(
         _relative_path(root, path, request.recovery_policy)
 
     candidates: tuple[Path, ...]
+    staging_namespace_identity: FileIdentity | None = None
     if request.known_writer_token is not None:
         candidate = derive_staging_entry_path(
             root, request.namespace, request.cache_key, request.known_writer_token
@@ -487,6 +524,7 @@ def _prepare_recovery_inspection(
         if listing is None:
             candidates = ()
         else:
+            staging_namespace_identity = listing.identity
             if listing.limit_exceeded or listing.names is None:
                 raise RecoveryTraversalLimitError(
                     "Staging namespace enumeration exceeds the entry limit."
@@ -522,7 +560,7 @@ def _prepare_recovery_inspection(
         raise RecoveryTraversalError("Validated cache root changed during traversal.")
 
     staging_observations = tuple(
-        StagingRecoveryObservation(index, _sanitized_staging_relative(request))
+        StagingRecoveryObservation(index, _sanitized_staging_relative(request, index))
         for index, _ in enumerate(candidates)
     )
     observation = CacheRecoveryObservation(
@@ -541,6 +579,7 @@ def _prepare_recovery_inspection(
         lock_path,
         staging_namespace,
         candidates,
+        staging_namespace_identity,
         observation,
     )
 
@@ -641,7 +680,7 @@ def _observe_staging_candidate(
     absence_is_stable: bool,
     filesystem: RecoveryReadOnlyFilesystem,
 ) -> StagingRecoveryObservation:
-    relative = _sanitized_staging_relative(request)
+    relative = _sanitized_staging_relative(request, candidate_index)
     try:
         identity = filesystem.inspect(path)
     except FileNotFoundError:
@@ -898,6 +937,157 @@ def _compose_recovery_observation(
     return status, None
 
 
+_FAILURE_FAMILY_RANK = {
+    CacheRecoveryStatus.RECOVERY_UNSAFE: 0,
+    CacheRecoveryStatus.RECOVERY_UNSUPPORTED: 1,
+    CacheRecoveryStatus.RECOVERY_UNSTABLE: 2,
+    CacheRecoveryStatus.RECOVERY_INVALID: 3,
+}
+
+_SUBJECT_RANK = {
+    RecoverySubject.FINAL: 0,
+    RecoverySubject.STAGING: 1,
+    RecoverySubject.LOCK: 2,
+    RecoverySubject.ROOT: 3,
+}
+
+
+def _component_diagnostic(
+    subject: RecoverySubject,
+    relative_path: str,
+    classification: Enum | None,
+    reason: CacheRecoveryReason | CacheLookupReason | None,
+) -> CacheRecoveryDiagnostic:
+    code = reason.value if reason is not None else (
+        classification.value if classification is not None else "unclassified"
+    )
+    return CacheRecoveryDiagnostic(f"{subject.value}.{code}", subject, relative_path)
+
+
+def _diagnostic_family(classification: Enum | None) -> int:
+    if classification in {
+        FinalRecoveryState.FINAL_UNSAFE,
+        StagingRecoveryState.STAGING_UNSAFE,
+        LockRecoveryState.LOCK_UNSAFE,
+    }:
+        return 0
+    if classification in {
+        FinalRecoveryState.FINAL_UNSUPPORTED,
+        StagingRecoveryState.STAGING_UNSUPPORTED,
+        LockRecoveryState.LOCK_UNSUPPORTED,
+    }:
+        return 1
+    if classification in {
+        FinalRecoveryState.FINAL_UNSTABLE,
+        StagingRecoveryState.STAGING_UNSTABLE,
+        LockRecoveryState.LOCK_UNSTABLE,
+    }:
+        return 2
+    if classification in {
+        FinalRecoveryState.FINAL_INVALID,
+        StagingRecoveryState.STAGING_INVALID,
+        StagingRecoveryState.STAGING_IO_FAILURE,
+        LockRecoveryState.LOCK_MALFORMED,
+        LockRecoveryState.LOCK_IO_FAILURE,
+        LockRecoveryState.LOCK_IDENTITY_CONFLICT,
+        LockRecoveryState.LOCK_TIMESTAMP_INVALID,
+    }:
+        return 3
+    return 4
+
+
+def _recovery_diagnostics(
+    observation: CacheRecoveryObservation, *, limit: int
+) -> tuple[CacheRecoveryDiagnostic, ...]:
+    """Derive bounded diagnostics without observing any additional state."""
+
+    findings: list[tuple[int, int, int, CacheRecoveryDiagnostic]] = []
+    final_diagnostic = _component_diagnostic(
+        RecoverySubject.FINAL,
+        observation.final.relative_contract_path,
+        observation.final.classification,
+        observation.final.reason,
+    )
+    findings.append((
+        _diagnostic_family(observation.final.classification),
+        _SUBJECT_RANK[RecoverySubject.FINAL],
+        0,
+        final_diagnostic,
+    ))
+    for staging in observation.staging:
+        diagnostic = _component_diagnostic(
+            RecoverySubject.STAGING,
+            staging.relative_contract_path,
+            staging.classification,
+            staging.reason,
+        )
+        findings.append((
+            _diagnostic_family(staging.classification),
+            _SUBJECT_RANK[RecoverySubject.STAGING],
+            staging.candidate_index,
+            diagnostic,
+        ))
+    lock_diagnostic = _component_diagnostic(
+        RecoverySubject.LOCK,
+        observation.lock.relative_contract_path,
+        observation.lock.classification,
+        observation.lock.reason,
+    )
+    findings.append((
+        _diagnostic_family(observation.lock.classification),
+        _SUBJECT_RANK[RecoverySubject.LOCK],
+        0,
+        lock_diagnostic,
+    ))
+    ordered = sorted(
+        findings,
+        key=lambda finding: (
+            finding[0],
+            finding[1],
+            finding[2],
+            finding[3].relative_path or "",
+            finding[3].code,
+        ),
+    )
+    deduplicated: list[CacheRecoveryDiagnostic] = []
+    seen: set[tuple[str, RecoverySubject, str | None]] = set()
+    for *_, diagnostic in ordered:
+        key = (diagnostic.code, diagnostic.subject, diagnostic.relative_path)
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(diagnostic)
+    if len(deduplicated) <= limit:
+        return tuple(deduplicated)
+    truncated = CacheRecoveryDiagnostic(
+        "DIAGNOSTICS_TRUNCATED", RecoverySubject.ROOT
+    )
+    if limit == 1:
+        return (truncated,)
+    return tuple(deduplicated[: limit - 1]) + (truncated,)
+
+
+def _root_failure_observation(
+    request: CacheRecoveryInspectionRequest,
+    *,
+    status: CacheRecoveryStatus,
+    reason: CacheRecoveryReason,
+) -> CacheRecoveryObservation:
+    root = request.cache_root.resolved_path
+    final_path = derive_final_entry_path(root, request.namespace, request.cache_key)
+    lock_path = derive_lock_path(root, request.namespace, request.cache_key)
+    staging = StagingRecoveryObservation(0, _sanitized_staging_relative(request))
+    observation = CacheRecoveryObservation(
+        derive_entry_digest(request.cache_key),
+        (staging,),
+        FinalRecoveryObservation(final_path.relative_to(root).as_posix()),
+        LockRecoveryObservation(lock_path.relative_to(root).as_posix()),
+        status,
+        reason,
+    )
+    diagnostic = CacheRecoveryDiagnostic(reason.value, RecoverySubject.ROOT)
+    return replace(observation, diagnostics=(diagnostic,))
+
+
 def _observe_recovery_components(
     request: CacheRecoveryInspectionRequest,
     *,
@@ -908,16 +1098,46 @@ def _observe_recovery_components(
 
     traversal = _prepare_recovery_inspection(request, filesystem=filesystem)
     if traversal.staging_candidate_paths:
-        staging = tuple(
-            _observe_staging_candidate(
-                request,
-                path,
-                candidate_index=index,
-                absence_is_stable=request.known_writer_token is not None,
-                filesystem=filesystem,
-            )
-            for index, path in enumerate(traversal.staging_candidate_paths)
-        )
+        staging_items: list[StagingRecoveryObservation] = []
+        enumeration_unstable = False
+        for index, path in enumerate(traversal.staging_candidate_paths):
+            if enumeration_unstable:
+                observed = StagingRecoveryObservation(
+                    index,
+                    _sanitized_staging_relative(request, index),
+                    StagingRecoveryState.STAGING_UNSTABLE,
+                    CacheRecoveryReason.UNSTABLE_STAGING,
+                )
+            else:
+                observed = _observe_staging_candidate(
+                    request,
+                    path,
+                    candidate_index=index,
+                    absence_is_stable=request.known_writer_token is not None,
+                    filesystem=filesystem,
+                )
+            if traversal.staging_namespace_identity is not None:
+                try:
+                    namespace_now = filesystem.inspect(
+                        traversal.staging_namespace_path
+                    )
+                    enumeration_unstable = not traversal.staging_namespace_identity.same_stable_object(
+                        namespace_now
+                    )
+                except (FileNotFoundError, CacheLookupFilesystemError, OSError):
+                    enumeration_unstable = True
+                if enumeration_unstable and observed.classification in {
+                    StagingRecoveryState.STAGING_ABSENT,
+                    StagingRecoveryState.STAGING_COMPLETE_VALID,
+                    StagingRecoveryState.STAGING_INCOMPLETE,
+                }:
+                    observed = replace(
+                        observed,
+                        classification=StagingRecoveryState.STAGING_UNSTABLE,
+                        reason=CacheRecoveryReason.UNSTABLE_STAGING,
+                    )
+            staging_items.append(observed)
+        staging = tuple(staging_items)
     else:
         staging = (
             StagingRecoveryObservation(
@@ -939,3 +1159,82 @@ def _observe_recovery_components(
         status,
         reason,
     )
+
+
+def inspect_cache_recovery_state(
+    request: CacheRecoveryInspectionRequest,
+    *,
+    filesystem: RecoveryReadOnlyFilesystem = DEFAULT_RECOVERY_READ_ONLY_FILESYSTEM,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+) -> CacheRecoveryObservation:
+    """Return one bounded, deterministic, mutation-free recovery observation."""
+
+    if not isinstance(request, CacheRecoveryInspectionRequest):
+        raise TypeError("request must be CacheRecoveryInspectionRequest.")
+    if not isinstance(filesystem, RecoveryReadOnlyFilesystem):
+        raise TypeError("filesystem must implement RecoveryReadOnlyFilesystem.")
+    if not isinstance(lock_clock, LockObservationClock):
+        raise TypeError("lock_clock must implement LockObservationClock.")
+    try:
+        observation = _observe_recovery_components(
+            request, filesystem=filesystem, lock_clock=lock_clock
+        )
+    except RecoveryTraversalLimitError:
+        return _root_failure_observation(
+            request,
+            status=CacheRecoveryStatus.RECOVERY_INVALID,
+            reason=CacheRecoveryReason.TRAVERSAL_LIMIT_EXCEEDED,
+        )
+    except RecoveryTraversalError as exc:
+        message = str(exc)
+        if "unsafe" in message or "escaped" in message:
+            status = CacheRecoveryStatus.RECOVERY_UNSAFE
+            reason = CacheRecoveryReason.UNSAFE_ROOT
+        elif "root" in message:
+            status = CacheRecoveryStatus.RECOVERY_UNSTABLE
+            reason = CacheRecoveryReason.UNSTABLE_ROOT
+        else:
+            status = CacheRecoveryStatus.RECOVERY_INVALID
+            reason = CacheRecoveryReason.INVALID_STAGING
+        return _root_failure_observation(
+            request, status=status, reason=reason
+        )
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+        return _root_failure_observation(
+            request,
+            status=CacheRecoveryStatus.RECOVERY_UNSAFE,
+            reason=CacheRecoveryReason.UNSAFE_ROOT,
+        )
+    except (FileNotFoundError, UnstableFilesystemObjectError, CacheLookupFilesystemError, OSError):
+        return _root_failure_observation(
+            request,
+            status=CacheRecoveryStatus.RECOVERY_UNSTABLE,
+            reason=CacheRecoveryReason.UNSTABLE_ROOT,
+        )
+
+    diagnostics = _recovery_diagnostics(
+        observation, limit=request.recovery_policy.max_diagnostics
+    )
+    try:
+        root_after = filesystem.inspect(request.cache_root.resolved_path)
+        root_stable = request.cache_root.identity.same_stable_object(root_after)
+    except (FileNotFoundError, CacheLookupFilesystemError, OSError):
+        root_stable = False
+    if not root_stable:
+        root_diagnostic = CacheRecoveryDiagnostic(
+            CacheRecoveryReason.UNSTABLE_ROOT.value, RecoverySubject.ROOT
+        )
+        existing_rank = _FAILURE_FAMILY_RANK.get(observation.status, 4)
+        if existing_rank > _FAILURE_FAMILY_RANK[CacheRecoveryStatus.RECOVERY_UNSTABLE]:
+            observation = replace(
+                observation,
+                status=CacheRecoveryStatus.RECOVERY_UNSTABLE,
+                reason=CacheRecoveryReason.UNSTABLE_ROOT,
+            )
+        if root_diagnostic not in diagnostics:
+            diagnostics = (
+                diagnostics + (root_diagnostic,)
+                if existing_rank < 2
+                else (root_diagnostic,) + diagnostics
+            )[: request.recovery_policy.max_diagnostics]
+    return replace(observation, diagnostics=diagnostics)

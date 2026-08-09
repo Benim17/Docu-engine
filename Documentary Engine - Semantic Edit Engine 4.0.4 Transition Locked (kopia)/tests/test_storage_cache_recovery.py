@@ -18,6 +18,7 @@ from engine.storage.cache_lookup import (
     ValidatedCacheRoot,
 )
 from engine.storage.cache_recovery import (
+    CacheRecoveryDiagnostic,
     CacheRecoveryInspectionRequest,
     CacheRecoveryObservation,
     CacheRecoveryReason,
@@ -25,6 +26,7 @@ from engine.storage.cache_recovery import (
     LocalRecoveryReadOnlyFilesystem,
     RecoveryInspectionPolicy,
     RecoveryReadOnlyFilesystem,
+    RecoverySubject,
     RecoveryTraversalError,
     RecoveryTraversalLimitError,
     FinalRecoveryObservation,
@@ -34,6 +36,8 @@ from engine.storage.cache_recovery import (
     StagingRecoveryObservation,
     StagingRecoveryState,
     _compose_recovery_observation,
+    _recovery_diagnostics,
+    inspect_cache_recovery_state,
     _observe_recovery_components,
     _prepare_recovery_inspection,
 )
@@ -719,3 +723,209 @@ def test_step5e3_composition_has_no_external_observation_or_mutation_dependencie
         "rename", "replace", "write", "mkdir", "promote", "cleanup",
     }
     assert forbidden.isdisjoint(_compose_recovery_observation.__code__.co_names)
+
+
+@pytest.mark.parametrize(
+    ("staging_kind", "final_present", "lock_kind", "expected"),
+    [
+        ("absent", False, "absent", CacheRecoveryStatus.EMPTY),
+        ("complete", False, "absent", CacheRecoveryStatus.UNPUBLISHED_COMPLETE_STAGING),
+        ("incomplete", False, "absent", CacheRecoveryStatus.INCOMPLETE_STAGING),
+        ("complete", False, "active", CacheRecoveryStatus.COMPLETE_STAGING_WITH_ACTIVE_LOCK),
+        ("complete", False, "stale", CacheRecoveryStatus.COMPLETE_STAGING_WITH_STALE_LOCK),
+        ("incomplete", False, "active", CacheRecoveryStatus.INCOMPLETE_STAGING_WITH_ACTIVE_LOCK),
+        ("incomplete", False, "stale", CacheRecoveryStatus.INCOMPLETE_STAGING_WITH_STALE_LOCK),
+        ("absent", True, "absent", CacheRecoveryStatus.FINAL_PUBLISHED),
+        ("absent", True, "active", CacheRecoveryStatus.FINAL_PUBLISHED_LOCK_RETAINED),
+        ("complete", True, "absent", CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING),
+        ("incomplete", True, "stale", CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING_AND_LOCK),
+        ("absent", False, "active", CacheRecoveryStatus.ACTIVE_LOCK_WITHOUT_ENTRY),
+        ("absent", False, "stale", CacheRecoveryStatus.STALE_LOCK_WITHOUT_ENTRY),
+    ],
+)
+def test_step5e_final_public_api_covers_every_lifecycle_row(
+    tmp_path, staging_kind, final_present, lock_kind, expected
+):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    if final_present:
+        staged = _write_staging(request)
+        final = derive_final_entry_path(
+            request.cache_root.resolved_path, request.namespace, request.cache_key
+        )
+        final.parent.mkdir(parents=True)
+        os.rename(staged.staging_path, final)
+    if staging_kind != "absent":
+        staged = _write_staging(_refresh_root(request))
+        if staging_kind == "incomplete":
+            (staged.staging_path / "COMPLETE").unlink()
+    if lock_kind != "absent":
+        _write_lock(request)
+    request = _refresh_root(request)
+    clock = _FixedClock(
+        datetime(2026, 7, 20, 9, 1, tzinfo=timezone.utc)
+        + (timedelta(seconds=1) if lock_kind == "stale" else timedelta())
+    )
+    observation = inspect_cache_recovery_state(request, lock_clock=clock)
+    assert observation.status is expected
+    assert observation.reason is None
+    assert observation.diagnostics
+
+
+@pytest.mark.parametrize(
+    ("subject", "kind", "expected_status"),
+    [
+        ("final", "unsafe", CacheRecoveryStatus.RECOVERY_UNSAFE),
+        ("staging", "unsafe", CacheRecoveryStatus.RECOVERY_UNSAFE),
+        ("lock", "unsafe", CacheRecoveryStatus.RECOVERY_UNSAFE),
+        ("final", "unsupported", CacheRecoveryStatus.RECOVERY_UNSUPPORTED),
+        ("staging", "unsupported", CacheRecoveryStatus.RECOVERY_UNSUPPORTED),
+        ("lock", "unsupported", CacheRecoveryStatus.RECOVERY_UNSUPPORTED),
+        ("final", "invalid", CacheRecoveryStatus.RECOVERY_INVALID),
+        ("staging", "invalid", CacheRecoveryStatus.RECOVERY_INVALID),
+        ("lock", "invalid", CacheRecoveryStatus.RECOVERY_INVALID),
+    ],
+)
+def test_step5e_final_public_api_structures_component_failures(
+    tmp_path, subject, kind, expected_status
+):
+    request = _request(tmp_path, known_writer_token="writer-1")
+    if subject in {"final", "staging"}:
+        staged = _write_staging(request)
+        target = staged.staging_path
+        if subject == "final":
+            target = derive_final_entry_path(
+                request.cache_root.resolved_path, request.namespace, request.cache_key
+            )
+            target.parent.mkdir(parents=True)
+            os.rename(staged.staging_path, target)
+        if kind == "unsafe":
+            for child in sorted(target.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            target.rmdir()
+            target.symlink_to(tmp_path / "outside", target_is_directory=True)
+        elif kind == "unsupported":
+            (target / "COMPLETE").write_bytes(canonical_json_bytes({
+                "cache_entry_contract_version": 2,
+                "entry_digest": derive_entry_digest(request.cache_key),
+                "manifest_digest": "sha256:" + "0" * 64,
+                "metadata_digest": "sha256:" + "0" * 64,
+            }))
+        else:
+            (target / "COMPLETE").write_bytes(b"{")
+    else:
+        lock = _write_lock(request, version=2 if kind == "unsupported" else 1)
+        if kind == "unsafe":
+            lock.unlink()
+            lock.symlink_to(tmp_path / "outside")
+        elif kind == "invalid":
+            lock.write_bytes(b"{")
+    request = _refresh_root(request)
+    observation = inspect_cache_recovery_state(request, lock_clock=_FixedClock())
+    assert observation.status is expected_status
+    assert observation.reason is not None
+    assert observation.diagnostics[0].subject.value == subject
+
+
+def test_step5e_final_diagnostics_are_ordered_deduplicated_bounded_and_sanitized(tmp_path):
+    request = _request(tmp_path)
+    staging = tuple(
+        StagingRecoveryObservation(
+            index,
+            _staging_namespace(request).relative_to(request.cache_root.resolved_path).as_posix()
+            + f"/{derive_entry_digest(request.cache_key)}.<writer-token-{index:04d}>",
+            StagingRecoveryState.STAGING_INVALID,
+            CacheRecoveryReason.INVALID_STAGING,
+        )
+        for index in range(40)
+    )
+    observation = CacheRecoveryObservation(
+        derive_entry_digest(request.cache_key),
+        staging,
+        FinalRecoveryObservation("entries/final", FinalRecoveryState.FINAL_VALID),
+        LockRecoveryObservation("locks/entry.lock", LockRecoveryState.LOCK_ABSENT),
+        CacheRecoveryStatus.RECOVERY_INVALID,
+        CacheRecoveryReason.INVALID_STAGING,
+    )
+    diagnostics = _recovery_diagnostics(observation, limit=32)
+    assert len(diagnostics) == 32
+    assert diagnostics[-1] == CacheRecoveryDiagnostic(
+        "DIAGNOSTICS_TRUNCATED", RecoverySubject.ROOT
+    )
+    assert len(set(diagnostics)) == len(diagnostics)
+    serialized = repr(diagnostics)
+    assert str(tmp_path) not in serialized
+    assert "owner-token" not in serialized and "host-1" not in serialized
+    assert diagnostics == _recovery_diagnostics(observation, limit=32)
+
+
+def test_step5e_final_public_api_converts_resource_limit_and_root_instability(tmp_path):
+    request = _request(tmp_path)
+    directory = _staging_namespace(request)
+    directory.mkdir(parents=True)
+
+    class LimitFilesystem(LocalRecoveryReadOnlyFilesystem):
+        def list_directory_bounded(self, path, *, max_entries):
+            listing = super().list_directory_bounded(path, max_entries=max_entries)
+            return replace(listing, names=None, limit_exceeded=True)
+
+    limited = inspect_cache_recovery_state(
+        _refresh_root(request), filesystem=LimitFilesystem(), lock_clock=_FixedClock()
+    )
+    assert limited.status is CacheRecoveryStatus.RECOVERY_INVALID
+    assert limited.reason is CacheRecoveryReason.TRAVERSAL_LIMIT_EXCEEDED
+
+    class RootReplacementFilesystem(LocalRecoveryReadOnlyFilesystem):
+        root_observations = 0
+
+        def inspect(self, path):
+            identity = super().inspect(path)
+            if Path(path) == request.cache_root.resolved_path:
+                self.root_observations += 1
+                if self.root_observations >= 3:
+                    return replace(identity, device_id=identity.device_id + 1)
+            return identity
+
+    unstable = inspect_cache_recovery_state(
+        _refresh_root(request),
+        filesystem=RootReplacementFilesystem(),
+        lock_clock=_FixedClock(),
+    )
+    assert unstable.status is CacheRecoveryStatus.RECOVERY_UNSTABLE
+    assert unstable.reason in {
+        CacheRecoveryReason.UNSTABLE_ROOT,
+        CacheLookupReason.UNSTABLE_SNAPSHOT,
+    }
+    assert any(
+        diagnostic.code == CacheRecoveryReason.UNSTABLE_ROOT.value
+        for diagnostic in unstable.diagnostics
+    )
+
+
+def test_step5e_final_package_exports_and_read_only_surface():
+    import engine.storage as storage
+
+    for name in {
+        "CacheRecoveryDiagnostic",
+        "CacheRecoveryInspectionRequest",
+        "CacheRecoveryObservation",
+        "CacheRecoveryReason",
+        "CacheRecoveryStatus",
+        "RecoveryInspectionPolicy",
+        "RecoveryReadOnlyFilesystem",
+        "RecoverySubject",
+        "inspect_cache_recovery_state",
+    }:
+        assert name in storage.__all__
+        assert getattr(storage, name) is not None
+    forbidden = {
+        "write", "create", "mkdir", "fsync", "rename", "replace", "unlink",
+        "chmod", "acquire", "refresh", "release", "promote", "cleanup", "delete",
+        "repair",
+    }
+    assert forbidden.isdisjoint(dir(RecoveryReadOnlyFilesystem))
+    model_fields = {field.name for field in fields(CacheRecoveryObservation)}
+    assert model_fields.isdisjoint({
+        "safe_to_delete", "delete_candidate", "cleanup_priority", "retry_promotion",
+        "break_lock", "eviction_priority", "retention_age", "reclaimable_bytes",
+        "recommended_action",
+    })

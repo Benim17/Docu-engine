@@ -120,6 +120,17 @@ from .cache_promotion import (
     release_owned_writer_lock,
     verify_owned_writer_lock,
 )
+from .cache_recovery import (
+    CacheRecoveryDiagnostic,
+    CacheRecoveryInspectionRequest,
+    CacheRecoveryObservation,
+    CacheRecoveryReason,
+    CacheRecoveryStatus,
+    RecoveryInspectionPolicy,
+    RecoveryReadOnlyFilesystem,
+    RecoverySubject,
+    inspect_cache_recovery_state,
+)
 
 __all__ = [
     "ARTIFACT_CONTRACT_VERSION",
@@ -228,4 +239,13 @@ __all__ = [
     "refresh_owned_lock",
     "release_owned_writer_lock",
     "verify_owned_writer_lock",
+    "CacheRecoveryDiagnostic",
+    "CacheRecoveryInspectionRequest",
+    "CacheRecoveryObservation",
+    "CacheRecoveryReason",
+    "CacheRecoveryStatus",
+    "RecoveryInspectionPolicy",
+    "RecoveryReadOnlyFilesystem",
+    "RecoverySubject",
+    "inspect_cache_recovery_state",
 ]

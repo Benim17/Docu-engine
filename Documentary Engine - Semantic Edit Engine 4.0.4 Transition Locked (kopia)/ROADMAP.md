@@ -35,13 +35,14 @@ The current major workstream is the **Cache and Storage Manager**, within the
 Cache & Storage / Housekeeping Foundation phase.
 
 - **Current phase:** Cache & Storage / Housekeeping Foundation
-- **Current task:** Step 5E — Read-only recovery inspection
-- **Status:** NOT STARTED — NEXT APPROVED IMPLEMENTATION STEP
-- **Next task:** Post-5E housekeeping design / contract phase — not yet implementation-approved
+- **Current task:** Post-5E housekeeping design / contract phase
+- **Status:** DESIGN PHASE — IMPLEMENTATION NOT YET APPROVED
+- **Next task:** Define and lock post-5E housekeeping contracts — no implementation task approved
 - **Current branch:** `feature/cache-storage-foundation`
 
-Step 5D is complete. Step 5E is the next approved implementation step and has not
-begun.
+The persistent-cache construction sequence is complete through Step 5E. Post-5E
+housekeeping remains a design and contract phase; no housekeeping implementation is
+approved.
 
 ## Cache & Storage / Housekeeping Foundation
 
@@ -79,7 +80,7 @@ the contract-complete public read-only lookup behavior.
 
 - [x] Step 5C — Staging writer
 - [x] Step 5D — Locking and atomic promotion
-- [ ] Step 5E — Read-only recovery inspection
+- [x] Step 5E — Read-only recovery inspection
 
 These items require their applicable design and implementation approvals. Checked
 status here records sequence and progress; it does not replace a locked contract.
