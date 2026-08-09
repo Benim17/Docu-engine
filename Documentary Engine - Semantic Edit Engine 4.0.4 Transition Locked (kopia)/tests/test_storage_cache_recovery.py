@@ -9,6 +9,7 @@ import pytest
 from engine.storage.cache_keys import CacheKey
 from engine.storage.cache_lookup import (
     CacheLookupExpectation,
+    CacheLookupReason,
     CacheLookupIOError,
     CacheLookupVerificationPolicy,
     LockObservationPolicy,
@@ -19,14 +20,20 @@ from engine.storage.cache_lookup import (
 from engine.storage.cache_recovery import (
     CacheRecoveryInspectionRequest,
     CacheRecoveryObservation,
+    CacheRecoveryReason,
+    CacheRecoveryStatus,
     LocalRecoveryReadOnlyFilesystem,
     RecoveryInspectionPolicy,
     RecoveryReadOnlyFilesystem,
     RecoveryTraversalError,
     RecoveryTraversalLimitError,
+    FinalRecoveryObservation,
     FinalRecoveryState,
+    LockRecoveryObservation,
     LockRecoveryState,
+    StagingRecoveryObservation,
     StagingRecoveryState,
+    _compose_recovery_observation,
     _observe_recovery_components,
     _prepare_recovery_inspection,
 )
@@ -295,7 +302,8 @@ def test_step5e2_component_observation_absent_states(tmp_path):
     assert observed.staging[0].classification is StagingRecoveryState.STAGING_ABSENT
     assert observed.final.classification is FinalRecoveryState.FINAL_ABSENT
     assert observed.lock.classification is LockRecoveryState.LOCK_ABSENT
-    assert observed.status is None and observed.reason is None
+    assert observed.status is CacheRecoveryStatus.EMPTY
+    assert observed.reason is None
 
 
 def test_step5e2_valid_staging_and_final_reuse_full_lookup_semantics(tmp_path):
@@ -575,9 +583,139 @@ def test_step5e2_lock_io_and_instability_mapping(tmp_path):
     ).lock.classification is LockRecoveryState.LOCK_UNSTABLE
 
 
-def test_step5e2_component_pipeline_remains_uncomposed_and_read_only(tmp_path):
+def test_step5e3_component_pipeline_composes_and_remains_read_only(tmp_path):
     request = _request(tmp_path, known_writer_token="writer-1")
     observed = _observe_recovery_components(request, lock_clock=_FixedClock())
-    assert observed.status is None and observed.reason is None
+    assert observed.status is CacheRecoveryStatus.EMPTY
+    assert observed.reason is None
     public = {name for name in dir(RecoveryReadOnlyFilesystem) if not name.startswith("_")}
     assert not public & {"write", "create", "mkdir", "fsync", "rename", "replace", "unlink", "chmod", "promote", "cleanup"}
+
+
+def _staging_observation(state, index=0, reason=None):
+    return StagingRecoveryObservation(index, f"staging/candidate-{index}", state, reason)
+
+
+def _final_observation(state, reason=None):
+    return FinalRecoveryObservation("entries/final", state, reason)
+
+
+def _lock_observation(state, reason=None):
+    return LockRecoveryObservation("locks/entry.lock", state, reason)
+
+
+@pytest.mark.parametrize(
+    ("staging_state", "final_state", "lock_state", "expected"),
+    [
+        (StagingRecoveryState.STAGING_ABSENT, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ABSENT, CacheRecoveryStatus.EMPTY),
+        (StagingRecoveryState.STAGING_COMPLETE_VALID, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ABSENT, CacheRecoveryStatus.UNPUBLISHED_COMPLETE_STAGING),
+        (StagingRecoveryState.STAGING_INCOMPLETE, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ABSENT, CacheRecoveryStatus.INCOMPLETE_STAGING),
+        (StagingRecoveryState.STAGING_COMPLETE_VALID, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ACTIVE, CacheRecoveryStatus.COMPLETE_STAGING_WITH_ACTIVE_LOCK),
+        (StagingRecoveryState.STAGING_COMPLETE_VALID, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_STALE, CacheRecoveryStatus.COMPLETE_STAGING_WITH_STALE_LOCK),
+        (StagingRecoveryState.STAGING_INCOMPLETE, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ACTIVE, CacheRecoveryStatus.INCOMPLETE_STAGING_WITH_ACTIVE_LOCK),
+        (StagingRecoveryState.STAGING_INCOMPLETE, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_STALE, CacheRecoveryStatus.INCOMPLETE_STAGING_WITH_STALE_LOCK),
+        (StagingRecoveryState.STAGING_ABSENT, FinalRecoveryState.FINAL_VALID, LockRecoveryState.LOCK_ABSENT, CacheRecoveryStatus.FINAL_PUBLISHED),
+        (StagingRecoveryState.STAGING_ABSENT, FinalRecoveryState.FINAL_VALID, LockRecoveryState.LOCK_ACTIVE, CacheRecoveryStatus.FINAL_PUBLISHED_LOCK_RETAINED),
+        (StagingRecoveryState.STAGING_COMPLETE_VALID, FinalRecoveryState.FINAL_VALID, LockRecoveryState.LOCK_ABSENT, CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING),
+        (StagingRecoveryState.STAGING_INCOMPLETE, FinalRecoveryState.FINAL_VALID, LockRecoveryState.LOCK_STALE, CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING_AND_LOCK),
+        (StagingRecoveryState.STAGING_ABSENT, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ACTIVE, CacheRecoveryStatus.ACTIVE_LOCK_WITHOUT_ENTRY),
+        (StagingRecoveryState.STAGING_ABSENT, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_STALE, CacheRecoveryStatus.STALE_LOCK_WITHOUT_ENTRY),
+    ],
+)
+def test_step5e3_exact_lifecycle_table(staging_state, final_state, lock_state, expected):
+    status, reason = _compose_recovery_observation(
+        (_staging_observation(staging_state),),
+        _final_observation(final_state),
+        _lock_observation(lock_state),
+    )
+    assert status is expected
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        ((StagingRecoveryState.STAGING_COMPLETE_VALID,) * 2, CacheRecoveryStatus.UNPUBLISHED_COMPLETE_STAGING),
+        ((StagingRecoveryState.STAGING_INCOMPLETE,) * 2, CacheRecoveryStatus.INCOMPLETE_STAGING),
+        ((StagingRecoveryState.STAGING_COMPLETE_VALID, StagingRecoveryState.STAGING_INCOMPLETE), CacheRecoveryStatus.INCOMPLETE_STAGING),
+    ],
+)
+def test_step5e3_staging_aggregation(states, expected):
+    staging = tuple(_staging_observation(state, index) for index, state in enumerate(states))
+    assert _compose_recovery_observation(
+        staging,
+        _final_observation(FinalRecoveryState.FINAL_ABSENT),
+        _lock_observation(LockRecoveryState.LOCK_ABSENT),
+    ) == (expected, None)
+
+
+@pytest.mark.parametrize("lock_state", [LockRecoveryState.LOCK_ACTIVE, LockRecoveryState.LOCK_STALE])
+def test_step5e3_retained_lock_is_narrow_to_published_final_without_staging(lock_state):
+    assert _compose_recovery_observation(
+        (_staging_observation(StagingRecoveryState.STAGING_ABSENT),),
+        _final_observation(FinalRecoveryState.FINAL_VALID),
+        _lock_observation(lock_state),
+    ) == (CacheRecoveryStatus.FINAL_PUBLISHED_LOCK_RETAINED, None)
+    assert _compose_recovery_observation(
+        (_staging_observation(StagingRecoveryState.STAGING_COMPLETE_VALID),),
+        _final_observation(FinalRecoveryState.FINAL_VALID),
+        _lock_observation(lock_state),
+    ) == (CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING_AND_LOCK, None)
+
+
+@pytest.mark.parametrize(
+    ("staging", "final", "lock", "expected_status", "expected_reason"),
+    [
+        (StagingRecoveryState.STAGING_UNSAFE, FinalRecoveryState.FINAL_UNSUPPORTED, LockRecoveryState.LOCK_UNSTABLE, CacheRecoveryStatus.RECOVERY_UNSAFE, CacheRecoveryReason.UNSAFE_STAGING_PATH),
+        (StagingRecoveryState.STAGING_UNSTABLE, FinalRecoveryState.FINAL_INVALID, LockRecoveryState.LOCK_UNSUPPORTED, CacheRecoveryStatus.RECOVERY_UNSUPPORTED, CacheLookupReason.UNSUPPORTED_LOCK_VERSION),
+        (StagingRecoveryState.STAGING_INVALID, FinalRecoveryState.FINAL_INVALID, LockRecoveryState.LOCK_UNSTABLE, CacheRecoveryStatus.RECOVERY_UNSTABLE, CacheLookupReason.UNSTABLE_SNAPSHOT),
+        (StagingRecoveryState.STAGING_INVALID, FinalRecoveryState.FINAL_ABSENT, LockRecoveryState.LOCK_ABSENT, CacheRecoveryStatus.RECOVERY_INVALID, CacheRecoveryReason.INVALID_STAGING),
+    ],
+)
+def test_step5e3_failure_family_precedence(staging, final, lock, expected_status, expected_reason):
+    reasons = {
+        StagingRecoveryState.STAGING_UNSAFE: CacheRecoveryReason.UNSAFE_STAGING_PATH,
+        StagingRecoveryState.STAGING_UNSTABLE: CacheRecoveryReason.UNSTABLE_STAGING,
+        StagingRecoveryState.STAGING_INVALID: CacheRecoveryReason.INVALID_STAGING,
+        FinalRecoveryState.FINAL_UNSUPPORTED: CacheLookupReason.UNSUPPORTED_ENTRY_VERSION,
+        FinalRecoveryState.FINAL_INVALID: CacheLookupReason.MALFORMED_METADATA,
+        LockRecoveryState.LOCK_UNSUPPORTED: CacheLookupReason.UNSUPPORTED_LOCK_VERSION,
+        LockRecoveryState.LOCK_UNSTABLE: CacheLookupReason.UNSTABLE_SNAPSHOT,
+    }
+    status, reason = _compose_recovery_observation(
+        (_staging_observation(staging, reason=reasons.get(staging)),),
+        _final_observation(final, reasons.get(final)),
+        _lock_observation(lock, reasons.get(lock)),
+    )
+    assert (status, reason) == (expected_status, expected_reason)
+    assert reason is not None
+
+
+def test_step5e3_failure_subject_and_staging_ordinal_ties_are_deterministic():
+    status, reason = _compose_recovery_observation(
+        (
+            _staging_observation(StagingRecoveryState.STAGING_IO_FAILURE, 1, CacheRecoveryReason.STAGING_IO_FAILURE),
+            _staging_observation(StagingRecoveryState.STAGING_INVALID, 0, CacheRecoveryReason.INVALID_STAGING),
+        ),
+        _final_observation(FinalRecoveryState.FINAL_INVALID, CacheLookupReason.MALFORMED_METADATA),
+        _lock_observation(LockRecoveryState.LOCK_MALFORMED, CacheLookupReason.MALFORMED_LOCK),
+    )
+    assert (status, reason) == (CacheRecoveryStatus.RECOVERY_INVALID, CacheLookupReason.MALFORMED_METADATA)
+
+    status, reason = _compose_recovery_observation(
+        (
+            _staging_observation(StagingRecoveryState.STAGING_IO_FAILURE, 1, CacheRecoveryReason.STAGING_IO_FAILURE),
+            _staging_observation(StagingRecoveryState.STAGING_INVALID, 0, CacheRecoveryReason.INVALID_STAGING),
+        ),
+        _final_observation(FinalRecoveryState.FINAL_ABSENT),
+        _lock_observation(LockRecoveryState.LOCK_MALFORMED, CacheLookupReason.MALFORMED_LOCK),
+    )
+    assert (status, reason) == (CacheRecoveryStatus.RECOVERY_INVALID, CacheRecoveryReason.INVALID_STAGING)
+
+
+def test_step5e3_composition_has_no_external_observation_or_mutation_dependencies():
+    forbidden = {
+        "filesystem", "clock", "hash", "lookup_cache_entry", "open", "unlink",
+        "rename", "replace", "write", "mkdir", "promote", "cleanup",
+    }
+    assert forbidden.isdisjoint(_compose_recovery_observation.__code__.co_names)

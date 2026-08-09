@@ -1,8 +1,4 @@
-"""Internal Step 5E1 read-only recovery traversal foundations.
-
-This module deliberately performs no cache-content validation or lifecycle
-classification.  It derives and discovers only contract-scoped paths.
-"""
+"""Internal read-only Step 5E recovery inspection foundations."""
 
 from __future__ import annotations
 
@@ -98,6 +94,7 @@ class CacheRecoveryReason(str, Enum):
     INVALID_STAGING = "invalid_staging"
     INVALID_FINAL = "invalid_final"
     INVALID_LOCK = "invalid_lock"
+    STAGING_IO_FAILURE = "staging_io_failure"
     TRAVERSAL_LIMIT_EXCEEDED = "traversal_limit_exceeded"
 
 
@@ -212,6 +209,7 @@ class StagingRecoveryObservation:
     candidate_index: int
     relative_contract_path: str
     classification: StagingRecoveryState | None = None
+    reason: CacheRecoveryReason | CacheLookupReason | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.candidate_index, bool) or self.candidate_index < 0:
@@ -228,6 +226,7 @@ class StagingRecoveryObservation:
 class FinalRecoveryObservation:
     relative_contract_path: str
     classification: FinalRecoveryState | None = None
+    reason: CacheRecoveryReason | CacheLookupReason | None = None
 
     def __post_init__(self) -> None:
         if not self.relative_contract_path or Path(self.relative_contract_path).is_absolute():
@@ -242,6 +241,7 @@ class FinalRecoveryObservation:
 class LockRecoveryObservation:
     relative_contract_path: str
     classification: LockRecoveryState | None = None
+    reason: CacheRecoveryReason | CacheLookupReason | None = None
 
     def __post_init__(self) -> None:
         if not self.relative_contract_path or Path(self.relative_contract_path).is_absolute():
@@ -259,11 +259,21 @@ class CacheRecoveryObservation:
     final: FinalRecoveryObservation
     lock: LockRecoveryObservation
     status: CacheRecoveryStatus | None = None
-    reason: CacheRecoveryReason | None = None
+    reason: CacheRecoveryReason | CacheLookupReason | None = None
 
     def __post_init__(self) -> None:
-        if self.status is not None or self.reason is not None:
-            raise ValueError("Step 5E1 does not compose recovery classifications.")
+        if self.status is None and self.reason is not None:
+            raise ValueError("an uncomposed observation cannot have a reason.")
+        failure_statuses = {
+            CacheRecoveryStatus.RECOVERY_UNSAFE,
+            CacheRecoveryStatus.RECOVERY_UNSUPPORTED,
+            CacheRecoveryStatus.RECOVERY_UNSTABLE,
+            CacheRecoveryStatus.RECOVERY_INVALID,
+        }
+        if self.status in failure_statuses and self.reason is None:
+            raise ValueError("a recovery failure must have a reason.")
+        if self.status is not None and self.status not in failure_statuses and self.reason is not None:
+            raise ValueError("a lifecycle observation cannot have a failure reason.")
         if tuple(item.candidate_index for item in self.staging) != tuple(
             range(len(self.staging))
         ):
@@ -580,7 +590,11 @@ def _observe_final_component(
         result.expected_entry_path,
         request.recovery_policy,
     )
-    return FinalRecoveryObservation(relative, state)
+    reason = None if state in {
+        FinalRecoveryState.FINAL_ABSENT,
+        FinalRecoveryState.FINAL_VALID,
+    } else result.reason
+    return FinalRecoveryObservation(relative, state, reason)
 
 
 def _incomplete_staging_state(
@@ -636,14 +650,25 @@ def _observe_staging_candidate(
             if absence_is_stable
             else StagingRecoveryState.STAGING_UNSTABLE
         )
-        return StagingRecoveryObservation(candidate_index, relative, state)
+        reason = (
+            None
+            if state is StagingRecoveryState.STAGING_ABSENT
+            else CacheRecoveryReason.UNSTABLE_STAGING
+        )
+        return StagingRecoveryObservation(candidate_index, relative, state, reason)
     except (CacheLookupPermissionError, CacheLookupIOError, OSError):
         return StagingRecoveryObservation(
-            candidate_index, relative, StagingRecoveryState.STAGING_IO_FAILURE
+            candidate_index,
+            relative,
+            StagingRecoveryState.STAGING_IO_FAILURE,
+            CacheRecoveryReason.STAGING_IO_FAILURE,
         )
     if identity.object_type is not FilesystemObjectType.DIRECTORY:
         return StagingRecoveryObservation(
-            candidate_index, relative, StagingRecoveryState.STAGING_UNSAFE
+            candidate_index,
+            relative,
+            StagingRecoveryState.STAGING_UNSAFE,
+            CacheRecoveryReason.UNSAFE_STAGING_PATH,
         )
     try:
         structure = _inspect_final_entry_structure(path, filesystem=filesystem)
@@ -717,7 +742,14 @@ def _observe_staging_candidate(
         state = StagingRecoveryState.STAGING_UNSTABLE
     except (CacheLookupPermissionError, CacheLookupIOError, OSError):
         state = StagingRecoveryState.STAGING_IO_FAILURE
-    return StagingRecoveryObservation(candidate_index, relative, state)
+    reason = {
+        StagingRecoveryState.STAGING_INVALID: CacheRecoveryReason.INVALID_STAGING,
+        StagingRecoveryState.STAGING_UNSUPPORTED: CacheRecoveryReason.UNSUPPORTED_STAGING,
+        StagingRecoveryState.STAGING_UNSAFE: CacheRecoveryReason.UNSAFE_STAGING_PATH,
+        StagingRecoveryState.STAGING_UNSTABLE: CacheRecoveryReason.UNSTABLE_STAGING,
+        StagingRecoveryState.STAGING_IO_FAILURE: CacheRecoveryReason.STAGING_IO_FAILURE,
+    }.get(state)
+    return StagingRecoveryObservation(candidate_index, relative, state, reason)
 
 
 _LOCK_STATE_MAP = {
@@ -731,6 +763,16 @@ _LOCK_STATE_MAP = {
     _LockObservationClassification.IO_FAILURE: LockRecoveryState.LOCK_IO_FAILURE,
     _LockObservationClassification.LOCK_IDENTITY_CONFLICT: LockRecoveryState.LOCK_IDENTITY_CONFLICT,
     _LockObservationClassification.LOCK_TIMESTAMP_INVALID: LockRecoveryState.LOCK_TIMESTAMP_INVALID,
+}
+
+_LOCK_REASON_MAP = {
+    LockRecoveryState.LOCK_MALFORMED: CacheLookupReason.MALFORMED_LOCK,
+    LockRecoveryState.LOCK_UNSUPPORTED: CacheLookupReason.UNSUPPORTED_LOCK_VERSION,
+    LockRecoveryState.LOCK_UNSAFE: CacheLookupReason.UNSAFE_OBJECT,
+    LockRecoveryState.LOCK_UNSTABLE: CacheLookupReason.UNSTABLE_SNAPSHOT,
+    LockRecoveryState.LOCK_IO_FAILURE: CacheLookupReason.IO_FAILURE,
+    LockRecoveryState.LOCK_IDENTITY_CONFLICT: CacheLookupReason.LOCK_IDENTITY_CONFLICT,
+    LockRecoveryState.LOCK_TIMESTAMP_INVALID: CacheLookupReason.LOCK_TIMESTAMP_INVALID,
 }
 
 
@@ -753,7 +795,107 @@ def _observe_lock_component(
         lock.lock_path,
         request.recovery_policy,
     )
-    return LockRecoveryObservation(relative, _LOCK_STATE_MAP[lock.classification])
+    state = _LOCK_STATE_MAP[lock.classification]
+    return LockRecoveryObservation(relative, state, _LOCK_REASON_MAP.get(state))
+
+
+def _compose_recovery_observation(
+    staging: tuple[StagingRecoveryObservation, ...],
+    final: FinalRecoveryObservation,
+    lock: LockRecoveryObservation,
+) -> tuple[CacheRecoveryStatus, CacheRecoveryReason | CacheLookupReason | None]:
+    """Purely compose already-observed components using locked Step 5E precedence."""
+
+    failure_families = {
+        FinalRecoveryState.FINAL_UNSAFE: (0, CacheRecoveryStatus.RECOVERY_UNSAFE),
+        StagingRecoveryState.STAGING_UNSAFE: (0, CacheRecoveryStatus.RECOVERY_UNSAFE),
+        LockRecoveryState.LOCK_UNSAFE: (0, CacheRecoveryStatus.RECOVERY_UNSAFE),
+        FinalRecoveryState.FINAL_UNSUPPORTED: (1, CacheRecoveryStatus.RECOVERY_UNSUPPORTED),
+        StagingRecoveryState.STAGING_UNSUPPORTED: (1, CacheRecoveryStatus.RECOVERY_UNSUPPORTED),
+        LockRecoveryState.LOCK_UNSUPPORTED: (1, CacheRecoveryStatus.RECOVERY_UNSUPPORTED),
+        FinalRecoveryState.FINAL_UNSTABLE: (2, CacheRecoveryStatus.RECOVERY_UNSTABLE),
+        StagingRecoveryState.STAGING_UNSTABLE: (2, CacheRecoveryStatus.RECOVERY_UNSTABLE),
+        LockRecoveryState.LOCK_UNSTABLE: (2, CacheRecoveryStatus.RECOVERY_UNSTABLE),
+        FinalRecoveryState.FINAL_INVALID: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+        StagingRecoveryState.STAGING_INVALID: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+        StagingRecoveryState.STAGING_IO_FAILURE: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+        LockRecoveryState.LOCK_MALFORMED: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+        LockRecoveryState.LOCK_IO_FAILURE: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+        LockRecoveryState.LOCK_IDENTITY_CONFLICT: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+        LockRecoveryState.LOCK_TIMESTAMP_INVALID: (3, CacheRecoveryStatus.RECOVERY_INVALID),
+    }
+    failures = []
+    for subject_rank, observation in ((0, final), (2, lock)):
+        failure = failure_families.get(observation.classification)
+        if failure is not None:
+            failures.append((*failure, subject_rank, 0, observation.reason))
+    for observation in staging:
+        failure = failure_families.get(observation.classification)
+        if failure is not None:
+            failures.append(
+                (*failure, 1, observation.candidate_index, observation.reason)
+            )
+    if failures:
+        _, status, _, _, reason = min(failures, key=lambda item: (item[0], item[2], item[3]))
+        if reason is None:
+            raise ValueError("a classified recovery failure must retain its reason.")
+        return status, reason
+
+    staging_states = {observation.classification for observation in staging}
+    if staging_states <= {StagingRecoveryState.STAGING_ABSENT}:
+        staging_state = "absent"
+    elif StagingRecoveryState.STAGING_INCOMPLETE in staging_states:
+        staging_state = "incomplete"
+    elif StagingRecoveryState.STAGING_COMPLETE_VALID in staging_states:
+        staging_state = "complete"
+    else:
+        raise ValueError("recovery components are not lifecycle-composable.")
+
+    final_present = final.classification is FinalRecoveryState.FINAL_VALID
+    lock_state = lock.classification
+    if lock_state not in {
+        LockRecoveryState.LOCK_ABSENT,
+        LockRecoveryState.LOCK_ACTIVE,
+        LockRecoveryState.LOCK_STALE,
+    } or final.classification not in {
+        FinalRecoveryState.FINAL_ABSENT,
+        FinalRecoveryState.FINAL_VALID,
+    }:
+        raise ValueError("recovery components are not lifecycle-composable.")
+
+    lock_present = lock_state is not LockRecoveryState.LOCK_ABSENT
+    if final_present:
+        if staging_state == "absent":
+            status = (
+                CacheRecoveryStatus.FINAL_PUBLISHED_LOCK_RETAINED
+                if lock_present
+                else CacheRecoveryStatus.FINAL_PUBLISHED
+            )
+        else:
+            status = (
+                CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING_AND_LOCK
+                if lock_present
+                else CacheRecoveryStatus.FINAL_PUBLISHED_WITH_SUPERSEDED_STAGING
+            )
+    elif staging_state == "absent":
+        status = {
+            LockRecoveryState.LOCK_ABSENT: CacheRecoveryStatus.EMPTY,
+            LockRecoveryState.LOCK_ACTIVE: CacheRecoveryStatus.ACTIVE_LOCK_WITHOUT_ENTRY,
+            LockRecoveryState.LOCK_STALE: CacheRecoveryStatus.STALE_LOCK_WITHOUT_ENTRY,
+        }[lock_state]
+    elif staging_state == "complete":
+        status = {
+            LockRecoveryState.LOCK_ABSENT: CacheRecoveryStatus.UNPUBLISHED_COMPLETE_STAGING,
+            LockRecoveryState.LOCK_ACTIVE: CacheRecoveryStatus.COMPLETE_STAGING_WITH_ACTIVE_LOCK,
+            LockRecoveryState.LOCK_STALE: CacheRecoveryStatus.COMPLETE_STAGING_WITH_STALE_LOCK,
+        }[lock_state]
+    else:
+        status = {
+            LockRecoveryState.LOCK_ABSENT: CacheRecoveryStatus.INCOMPLETE_STAGING,
+            LockRecoveryState.LOCK_ACTIVE: CacheRecoveryStatus.INCOMPLETE_STAGING_WITH_ACTIVE_LOCK,
+            LockRecoveryState.LOCK_STALE: CacheRecoveryStatus.INCOMPLETE_STAGING_WITH_STALE_LOCK,
+        }[lock_state]
+    return status, None
 
 
 def _observe_recovery_components(
@@ -762,7 +904,7 @@ def _observe_recovery_components(
     filesystem: RecoveryReadOnlyFilesystem = DEFAULT_RECOVERY_READ_ONLY_FILESYSTEM,
     lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
 ) -> CacheRecoveryObservation:
-    """Privately observe components without composing lifecycle status or diagnostics."""
+    """Privately observe and compose components without diagnostics or public API."""
 
     traversal = _prepare_recovery_inspection(request, filesystem=filesystem)
     if traversal.staging_candidate_paths:
@@ -788,9 +930,12 @@ def _observe_recovery_components(
     lock = _observe_lock_component(
         request, filesystem=filesystem, lock_clock=lock_clock
     )
+    status, reason = _compose_recovery_observation(staging, final, lock)
     return CacheRecoveryObservation(
         traversal.entry_digest,
         staging,
         final,
         lock,
+        status,
+        reason,
     )
