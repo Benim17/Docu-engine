@@ -6,9 +6,15 @@ locking, enumeration, and reconciliation belong to later H1 slices.
 
 from __future__ import annotations
 
+import ctypes
+import errno
+import fcntl
 import os
 import re
-from dataclasses import dataclass
+import secrets
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass, replace as _replace
 from datetime import datetime
 from enum import Enum
 from functools import total_ordering
@@ -987,3 +993,438 @@ def lookup_catalog_record(
         return _lookup_result(CacheCatalogLookupStatus.CATALOG_UNSTABLE, identity, relative)
     except (CacheLookupPermissionError, CacheLookupIOError, CacheLookupFilesystemError, OSError):
         return _lookup_result(CacheCatalogLookupStatus.CATALOG_IO_FAILURE, identity, relative)
+
+
+class CacheCatalogWriteStatus(str, Enum):
+    CATALOG_WRITE_APPLIED = "catalog_write_applied"
+    CATALOG_WRITE_CONFLICT = "catalog_write_conflict"
+    CATALOG_WRITE_UNAVAILABLE = "catalog_write_unavailable"
+    CATALOG_WRITE_CORRUPT = "catalog_write_corrupt"
+    CATALOG_WRITE_UNSUPPORTED = "catalog_write_unsupported"
+    CATALOG_WRITE_UNSAFE = "catalog_write_unsafe"
+    CATALOG_WRITE_UNSTABLE = "catalog_write_unstable"
+    CATALOG_WRITE_IO_FAILURE = "catalog_write_io_failure"
+
+
+@dataclass(frozen=True)
+class CacheCatalogWriteRequest:
+    """Strict internal H1C publication request; H1E will add authority adapters."""
+
+    record: CacheCatalogLiveRecord | CacheCatalogTombstone
+    expected_revision: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, (CacheCatalogLiveRecord, CacheCatalogTombstone)):
+            raise TypeError("record must be one strict catalog record.")
+        if self.expected_revision is not None:
+            _positive_int(
+                self.expected_revision,
+                "expected_revision",
+                maximum=MAX_CATALOG_RECORD_REVISION,
+            )
+
+
+@dataclass(frozen=True)
+class CacheCatalogWriteResult:
+    status: CacheCatalogWriteStatus
+    record_revision: int | None = None
+    diagnostics: tuple[CacheCatalogDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, CacheCatalogWriteStatus):
+            raise TypeError("status must be CacheCatalogWriteStatus.")
+        if self.status is CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED:
+            _positive_int(
+                self.record_revision,
+                "record_revision",
+                maximum=MAX_CATALOG_RECORD_REVISION,
+            )
+        elif self.record_revision is not None:
+            raise ValueError("Only an applied write carries a new revision.")
+        if (
+            not isinstance(self.diagnostics, tuple)
+            or len(self.diagnostics) > MAX_CATALOG_OPERATION_DIAGNOSTICS
+            or any(not isinstance(item, CacheCatalogDiagnostic) for item in self.diagnostics)
+        ):
+            raise ValueError("diagnostics must be bounded catalog diagnostics.")
+
+
+@runtime_checkable
+class CacheCatalogBackend(CacheCatalogReadOnlyBackend, Protocol):
+    """Catalog-owned H1C mutation surface; it cannot address cache namespaces."""
+
+    def initialize_catalog(self) -> None: ...
+
+    def acquire_writer_lock(self): ...
+
+    def ensure_record_parent(self, identity: CacheCatalogIdentity) -> None: ...
+
+    def publish_record_bytes(
+        self,
+        identity: CacheCatalogIdentity,
+        data: bytes,
+        *,
+        create_only: bool,
+        expected_revision: int | None,
+    ) -> None: ...
+
+
+class _CatalogCollisionError(FileExistsError):
+    pass
+
+
+class _CatalogUnsupportedMutationError(RuntimeError):
+    pass
+
+
+class _CatalogPublicationStateError(RuntimeError):
+    def __init__(self, status: CacheCatalogWriteStatus):
+        self.status = status
+
+
+class LocalCacheCatalogBackend(LocalCacheCatalogReadOnlyBackend):
+    """Darwin catalog-only writer with flock and descriptor-anchored publication."""
+
+    @classmethod
+    def from_root(cls, path: str | _Path) -> "LocalCacheCatalogBackend":
+        filesystem = LocalReadOnlyCacheFilesystem()
+        return cls(ValidatedCacheRoot.from_path(path, filesystem=filesystem), filesystem)
+
+    @staticmethod
+    def _directory_flags() -> int:
+        return (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+
+    @staticmethod
+    def _same_directory_object(first: FileIdentity, second: FileIdentity) -> bool:
+        """Compare identity fields unaffected by catalog-owned child creation."""
+
+        return (
+            first.object_type is FilesystemObjectType.DIRECTORY
+            and second.object_type is FilesystemObjectType.DIRECTORY
+            and None not in (first.device_id, first.file_id, second.device_id, second.file_id)
+            and (first.device_id, first.file_id) == (second.device_id, second.file_id)
+        )
+
+    def _open_directory_chain(
+        self,
+        components: tuple[str, ...],
+        *,
+        create: bool,
+    ) -> int:
+        descriptor = os.open(self.cache_root.resolved_path, self._directory_flags())
+        try:
+            root_open = FileIdentity.from_stat(os.fstat(descriptor))
+            root_now = self._filesystem.inspect(self.cache_root.resolved_path)
+            if not root_open.same_stable_object(root_now):
+                raise UnstableFilesystemObjectError("Catalog root changed while opening.")
+            for component in components:
+                if not component or component in {".", ".."} or "/" in component:
+                    raise CacheCatalogContractError("Invalid catalog directory component.")
+                try:
+                    child = os.open(component, self._directory_flags(), dir_fd=descriptor)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    child = os.open(component, self._directory_flags(), dir_fd=descriptor)
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise UnsupportedFilesystemObjectError(
+                            "Catalog component is unsafe."
+                        ) from exc
+                    raise
+                child_identity = FileIdentity.from_stat(os.fstat(child))
+                if child_identity.object_type is not FilesystemObjectType.DIRECTORY:
+                    os.close(child)
+                    raise UnsupportedFilesystemObjectError("Catalog component is not a directory.")
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _refresh_root_identity(self) -> None:
+        refreshed = ValidatedCacheRoot.from_path(
+            self.cache_root.lexical_path, filesystem=self._filesystem
+        )
+        object.__setattr__(self, "cache_root", refreshed)
+
+    def initialize_catalog(self) -> None:
+        descriptor = self._open_directory_chain(("catalog", "v1", "records"), create=True)
+        os.close(descriptor)
+        v1_fd = self._open_directory_chain(("catalog", "v1"), create=False)
+        lock_fd: int | None = None
+        try:
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                lock_fd = os.open("write.lock", flags, 0o600, dir_fd=v1_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                    raise UnsupportedFilesystemObjectError(
+                        "Catalog writer lock is unsafe."
+                    ) from exc
+                raise
+            lock_identity = FileIdentity.from_stat(os.fstat(lock_fd))
+            if lock_identity.object_type is not FilesystemObjectType.REGULAR_FILE:
+                raise UnsupportedFilesystemObjectError("Catalog writer lock is not regular.")
+            os.fsync(lock_fd)
+            os.fsync(v1_fd)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            os.close(v1_fd)
+        self._refresh_root_identity()
+
+    @contextmanager
+    def acquire_writer_lock(self):
+        v1_fd = self._open_directory_chain(("catalog", "v1"), create=False)
+        lock_fd: int | None = None
+        try:
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                lock_fd = os.open("write.lock", flags, dir_fd=v1_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                    raise UnsupportedFilesystemObjectError(
+                        "Catalog writer lock is unsafe."
+                    ) from exc
+                raise
+            identity = FileIdentity.from_stat(os.fstat(lock_fd))
+            if identity.object_type is not FilesystemObjectType.REGULAR_FILE:
+                raise UnsupportedFilesystemObjectError("Catalog writer lock is not regular.")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+            os.close(v1_fd)
+
+    def ensure_record_parent(self, identity: CacheCatalogIdentity) -> None:
+        relative = derive_catalog_record_relative_path(identity)
+        descriptor = self._open_directory_chain(relative.parts[:-1], create=True)
+        os.close(descriptor)
+
+    @staticmethod
+    def _rename_noreplace(
+        directory_fd: int,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        if sys.platform != "darwin":
+            raise _CatalogUnsupportedMutationError("Atomic no-replace publication unavailable.")
+        libc = ctypes.CDLL(None, use_errno=True)
+        operation = libc.renameatx_np
+        operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        operation.restype = ctypes.c_int
+        if operation(
+            directory_fd,
+            os.fsencode(source_name),
+            directory_fd,
+            os.fsencode(destination_name),
+            0x00000004,
+        ) != 0:
+            code = ctypes.get_errno()
+            if code == errno.EEXIST:
+                raise _CatalogCollisionError
+            raise OSError(code, os.strerror(code))
+
+    def publish_record_bytes(
+        self,
+        identity: CacheCatalogIdentity,
+        data: bytes,
+        *,
+        create_only: bool,
+        expected_revision: int | None,
+    ) -> None:
+        if not isinstance(data, bytes) or len(data) > MAX_CATALOG_RECORD_BYTES:
+            raise CacheCatalogContractError("Publication requires bounded canonical bytes.")
+        relative = derive_catalog_record_relative_path(identity)
+        parent_relative = relative.parent
+        parent_before = self.inspect_catalog_relative(parent_relative)
+        leaf_fd = self._open_directory_chain(relative.parts[:-1], create=False)
+        temporary_name = f".catalog-tmp-{secrets.token_hex(16)}"
+        temp_fd: int | None = None
+        try:
+            parent_handle = FileIdentity.from_stat(os.fstat(leaf_fd))
+            if not parent_before.same_stable_object(parent_handle):
+                raise UnstableFilesystemObjectError(
+                    "Catalog leaf changed before publication preparation."
+                )
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            temp_fd = os.open(temporary_name, flags, 0o600, dir_fd=leaf_fd)
+            view = memoryview(data)
+            while view:
+                count = os.write(temp_fd, view)
+                if count <= 0:
+                    raise OSError(errno.EIO, "catalog write made no progress")
+                view = view[count:]
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = None
+            parent_after_write = self.inspect_catalog_relative(parent_relative)
+            if not self._same_directory_object(parent_handle, parent_after_write):
+                raise UnstableFilesystemObjectError(
+                    "Catalog leaf changed during publication preparation."
+                )
+            current = lookup_catalog_record(identity, backend=self)
+            if current.status not in {
+                CacheCatalogLookupStatus.RECORD_FOUND,
+                CacheCatalogLookupStatus.RECORD_ABSENT,
+            }:
+                raise _CatalogPublicationStateError(_map_lookup_to_write(current.status))
+            if _current_revision(current) != expected_revision:
+                raise _CatalogCollisionError
+            destination = relative.name
+            if create_only:
+                self._rename_noreplace(leaf_fd, temporary_name, destination)
+            else:
+                os.replace(
+                    temporary_name,
+                    destination,
+                    src_dir_fd=leaf_fd,
+                    dst_dir_fd=leaf_fd,
+                )
+            os.fsync(leaf_fd)
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            os.close(leaf_fd)
+
+
+def _write_diagnostic(
+    status: CacheCatalogWriteStatus,
+    identity: CacheCatalogIdentity,
+) -> tuple[CacheCatalogDiagnostic, ...]:
+    relative = derive_catalog_record_relative_path(identity)
+    return (
+        CacheCatalogDiagnostic(
+            CacheCatalogSubject.RECORD,
+            identity.sort_key,
+            status.value,
+            relative.as_posix(),
+        ),
+    )
+
+
+def _write_result(
+    status: CacheCatalogWriteStatus,
+    identity: CacheCatalogIdentity,
+    revision: int | None = None,
+) -> CacheCatalogWriteResult:
+    return CacheCatalogWriteResult(
+        status,
+        revision,
+        () if status is CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED else _write_diagnostic(status, identity),
+    )
+
+
+def _current_revision(result: CacheCatalogLookupResult) -> int | None:
+    if result.status is CacheCatalogLookupStatus.RECORD_FOUND:
+        assert result.record is not None
+        return result.record.record_revision
+    if result.status is CacheCatalogLookupStatus.RECORD_ABSENT:
+        return result.tombstone_revision
+    return None
+
+
+def _map_lookup_to_write(status: CacheCatalogLookupStatus) -> CacheCatalogWriteStatus:
+    return {
+        CacheCatalogLookupStatus.CATALOG_UNAVAILABLE: CacheCatalogWriteStatus.CATALOG_WRITE_UNAVAILABLE,
+        CacheCatalogLookupStatus.CATALOG_CORRUPT: CacheCatalogWriteStatus.CATALOG_WRITE_CORRUPT,
+        CacheCatalogLookupStatus.CATALOG_UNSUPPORTED: CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED,
+        CacheCatalogLookupStatus.CATALOG_UNSAFE: CacheCatalogWriteStatus.CATALOG_WRITE_UNSAFE,
+        CacheCatalogLookupStatus.CATALOG_UNSTABLE: CacheCatalogWriteStatus.CATALOG_WRITE_UNSTABLE,
+        CacheCatalogLookupStatus.CATALOG_IO_FAILURE: CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE,
+    }[status]
+
+
+def _write_catalog_record(
+    request: CacheCatalogWriteRequest,
+    *,
+    backend: CacheCatalogBackend,
+) -> CacheCatalogWriteResult:
+    """Private H1C primitive; typed trusted-evidence adapters belong to H1E."""
+
+    if not isinstance(request, CacheCatalogWriteRequest):
+        raise TypeError("request must be CacheCatalogWriteRequest.")
+    if not isinstance(backend, CacheCatalogBackend):
+        raise TypeError("backend must implement CacheCatalogBackend.")
+    identity = request.record.identity
+    try:
+        backend.initialize_catalog()
+        with backend.acquire_writer_lock():
+            root_now = backend.inspect_root()
+            if not backend.cache_root.identity.same_stable_object(root_now):
+                return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSTABLE, identity)
+            backend.ensure_record_parent(identity)
+            current = lookup_catalog_record(identity, backend=backend)
+            if current.status not in {
+                CacheCatalogLookupStatus.RECORD_FOUND,
+                CacheCatalogLookupStatus.RECORD_ABSENT,
+            }:
+                return _write_result(_map_lookup_to_write(current.status), identity)
+            revision = _current_revision(current)
+            if request.expected_revision is None:
+                if revision is not None:
+                    return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, identity)
+                new_revision = 1
+            else:
+                if revision != request.expected_revision:
+                    return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, identity)
+                if revision == MAX_CATALOG_RECORD_REVISION:
+                    return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED, identity)
+                new_revision = revision + 1
+            publication = _replace(request.record, record_revision=new_revision)
+            data = publication.canonical_bytes()
+            gate = lookup_catalog_record(identity, backend=backend)
+            if gate.status not in {
+                CacheCatalogLookupStatus.RECORD_FOUND,
+                CacheCatalogLookupStatus.RECORD_ABSENT,
+            }:
+                return _write_result(_map_lookup_to_write(gate.status), identity)
+            if _current_revision(gate) != revision:
+                return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, identity)
+            backend.publish_record_bytes(
+                identity,
+                data,
+                create_only=request.expected_revision is None,
+                expected_revision=revision,
+            )
+            return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED, identity, new_revision)
+    except _CatalogCollisionError:
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT, identity)
+    except _CatalogUnsupportedMutationError:
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED, identity)
+    except _CatalogPublicationStateError as exc:
+        return _write_result(exc.status, identity)
+    except CacheCatalogUnsupportedVersionError:
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED, identity)
+    except CacheCatalogContractError:
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_CORRUPT, identity)
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSAFE, identity)
+    except UnstableFilesystemObjectError:
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_UNSTABLE, identity)
+    except (CacheLookupFilesystemError, PermissionError, OSError):
+        return _write_result(CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE, identity)

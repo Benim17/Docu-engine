@@ -1,5 +1,7 @@
 import hashlib
 import os
+import threading
+import time
 from pathlib import Path
 from dataclasses import FrozenInstanceError, replace
 
@@ -21,6 +23,7 @@ from engine.storage.cache_catalog import (
     CacheCatalogIdentity,
     CacheCatalogLookupResult,
     CacheCatalogLookupStatus,
+    CacheCatalogBackend,
     CacheCatalogLiveRecord,
     CacheCatalogReadOnlyBackend,
     CacheCatalogRecord,
@@ -30,12 +33,16 @@ from engine.storage.cache_catalog import (
     CacheCatalogTombstone,
     CacheCatalogUnsupportedVersionError,
     CacheCatalogVerificationLevel,
+    CacheCatalogWriteRequest,
+    CacheCatalogWriteStatus,
+    LocalCacheCatalogBackend,
     LocalCacheCatalogReadOnlyBackend,
     catalog_identity_sort_key,
     derive_catalog_record_relative_path,
     lookup_catalog_record,
     parse_cache_catalog_record,
     serialize_cache_catalog_record,
+    _write_catalog_record,
 )
 from engine.storage.cache_keys import CacheKey
 from engine.storage.cache_lookup import CacheLookupPermissionError, CacheLookupReason
@@ -688,4 +695,305 @@ def test_h1b_authority_boundary_and_read_only_protocol_are_explicit(tmp_path):
     assert not hasattr(result, "validated_entry")
     assert isinstance(backend, CacheCatalogReadOnlyBackend)
     forbidden = {"write", "mkdir", "rename", "replace", "unlink", "fsync", "acquire_lock", "publish"}
+    assert forbidden.isdisjoint(dir(backend))
+
+
+def _writer_backend(tmp_path):
+    return LocalCacheCatalogBackend.from_root(tmp_path)
+
+
+def _write(backend, record=None, expected=None):
+    return _write_catalog_record(
+        CacheCatalogWriteRequest(record or live_record(), expected), backend=backend
+    )
+
+
+def test_h1c_initialization_creates_only_catalog_owned_layout(tmp_path):
+    backend = _writer_backend(tmp_path)
+    backend.initialize_catalog()
+    assert (tmp_path / "catalog/v1/records").is_dir()
+    assert (tmp_path / "catalog/v1/write.lock").is_file()
+    assert not (tmp_path / "entries").exists()
+    assert not (tmp_path / "staging").exists()
+    assert not (tmp_path / "locks").exists()
+
+
+def test_h1c_initialization_is_idempotent(tmp_path):
+    backend = _writer_backend(tmp_path)
+    backend.initialize_catalog()
+    before = os.lstat(tmp_path / "catalog/v1/write.lock")
+    backend.initialize_catalog()
+    after = os.lstat(tmp_path / "catalog/v1/write.lock")
+    assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "file"])
+def test_h1c_initialization_rejects_unsafe_catalog_component(tmp_path, unsafe):
+    if unsafe == "symlink":
+        os.symlink(tmp_path / "elsewhere", tmp_path / "catalog")
+    else:
+        (tmp_path / "catalog").write_bytes(b"unsafe")
+    backend = _writer_backend(tmp_path)
+    result = _write(backend)
+    assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_UNSAFE
+
+
+def test_h1c_create_publishes_revision_one_canonically(tmp_path):
+    backend = _writer_backend(tmp_path)
+    result = _write(backend)
+    assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED
+    assert result.record_revision == 1
+    lookup = lookup_catalog_record(identity(), backend=backend)
+    assert lookup.status is CacheCatalogLookupStatus.RECORD_FOUND
+    assert lookup.record.record_revision == 1
+    assert lookup.record.canonical_bytes() == (
+        tmp_path / derive_catalog_record_relative_path(identity())
+    ).read_bytes()
+
+
+def test_h1c_exact_update_increments_revision_and_stale_update_conflicts(tmp_path):
+    backend = _writer_backend(tmp_path)
+    assert _write(backend).record_revision == 1
+    updated = live_record(last_recovery_observation=recovery_summary())
+    applied = _write(backend, updated, 1)
+    assert applied.record_revision == 2
+    stale = _write(backend, live_record(), 1)
+    assert stale.status is CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT
+    assert lookup_catalog_record(identity(), backend=backend).record == replace(
+        updated, record_revision=2
+    )
+
+
+def test_h1c_second_create_only_writer_conflicts_without_overwrite(tmp_path):
+    backend = _writer_backend(tmp_path)
+    first = live_record()
+    second = live_record(last_recovery_observation=recovery_summary())
+    assert _write(backend, first).status is CacheCatalogWriteStatus.CATALOG_WRITE_APPLIED
+    assert _write(backend, second).status is CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT
+    assert lookup_catalog_record(identity(), backend=backend).record == replace(
+        first, record_revision=1
+    )
+
+
+def test_h1c_tombstone_is_atomic_logical_removal_and_resurrection_requires_revision(tmp_path):
+    backend = _writer_backend(tmp_path)
+    cache_truth = tmp_path / "entries/v1/untouched"
+    cache_truth.mkdir(parents=True)
+    cache_truth.joinpath("payload").write_bytes(b"truth")
+    backend = _writer_backend(tmp_path)
+    assert _write(backend).record_revision == 1
+    removed = _write(backend, tombstone(), 1)
+    assert removed.record_revision == 2
+    target = tmp_path / derive_catalog_record_relative_path(identity())
+    assert target.is_file()
+    absent = lookup_catalog_record(identity(), backend=backend)
+    assert absent.status is CacheCatalogLookupStatus.RECORD_ABSENT
+    assert absent.tombstone_revision == 2
+    assert _write(backend, live_record(), 1).status is CacheCatalogWriteStatus.CATALOG_WRITE_CONFLICT
+    assert _write(backend, live_record(), 2).record_revision == 3
+    assert cache_truth.joinpath("payload").read_bytes() == b"truth"
+
+
+def test_h1c_revision_exhaustion_is_unsupported(tmp_path):
+    backend = _writer_backend(tmp_path)
+    backend.initialize_catalog()
+    target = tmp_path / derive_catalog_record_relative_path(identity())
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(
+        replace(live_record(), record_revision=MAX_CATALOG_RECORD_REVISION).canonical_bytes()
+    )
+    backend = _writer_backend(tmp_path)
+    result = _write(backend, live_record(), MAX_CATALOG_RECORD_REVISION)
+    assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED
+
+
+@pytest.mark.parametrize("current", [b"{", b'{"catalog_record_version":2,"record_state":"live"}'])
+def test_h1c_corrupt_or_future_current_record_fails_closed(tmp_path, current):
+    backend, target, _ = _initialized_backend(tmp_path, current)
+    writer = LocalCacheCatalogBackend(backend.cache_root, backend._filesystem)
+    writer.initialize_catalog()
+    result = _write(writer, live_record(), 1)
+    expected = (
+        CacheCatalogWriteStatus.CATALOG_WRITE_CORRUPT
+        if current == b"{"
+        else CacheCatalogWriteStatus.CATALOG_WRITE_UNSUPPORTED
+    )
+    assert result.status is expected
+    assert target.read_bytes() == current
+
+
+def test_h1c_writer_uses_flock_exclusive_and_releases(monkeypatch, tmp_path):
+    backend = _writer_backend(tmp_path)
+    backend.initialize_catalog()
+    calls = []
+    real = __import__("fcntl").flock
+
+    def observed(fd, operation):
+        calls.append(operation)
+        return real(fd, operation)
+
+    monkeypatch.setattr("engine.storage.cache_catalog.fcntl.flock", observed)
+    with backend.acquire_writer_lock():
+        assert calls == [__import__("fcntl").LOCK_EX]
+    assert calls == [__import__("fcntl").LOCK_EX, __import__("fcntl").LOCK_UN]
+
+
+def test_h1c_flock_serializes_cooperating_writers(tmp_path):
+    first = _writer_backend(tmp_path)
+    first.initialize_catalog()
+    second = _writer_backend(tmp_path)
+    entered = threading.Event()
+    released = threading.Event()
+
+    def waiter():
+        with second.acquire_writer_lock():
+            entered.set()
+        released.set()
+
+    with first.acquire_writer_lock():
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.05)
+        assert not entered.is_set()
+    thread.join(timeout=2)
+    assert entered.is_set() and released.is_set()
+
+
+def test_h1c_flock_acquisition_failure_is_io_failure(monkeypatch, tmp_path):
+    backend = _writer_backend(tmp_path)
+    backend.initialize_catalog()
+
+    def fail(fd, operation):
+        if operation == __import__("fcntl").LOCK_EX:
+            raise OSError("flock unavailable")
+
+    monkeypatch.setattr("engine.storage.cache_catalog.fcntl.flock", fail)
+    assert _write(backend).status is CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE
+
+
+def test_h1c_replace_failure_leaves_current_record_and_abandoned_temp(monkeypatch, tmp_path):
+    backend = _writer_backend(tmp_path)
+    original = live_record()
+    assert _write(backend, original).record_revision == 1
+    target = tmp_path / derive_catalog_record_relative_path(identity())
+    original_bytes = target.read_bytes()
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EXDEV, "cross-device forbidden")
+
+    import errno
+    monkeypatch.setattr("engine.storage.cache_catalog.os.replace", fail)
+    result = _write(
+        backend,
+        live_record(last_recovery_observation=recovery_summary()),
+        1,
+    )
+    assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE
+    assert target.read_bytes() == original_bytes
+    assert any(name.startswith(".catalog-tmp-") for name in os.listdir(target.parent))
+    assert lookup_catalog_record(identity(), backend=backend).record == replace(
+        original, record_revision=1
+    )
+
+
+def test_h1c_postpublication_directory_fsync_failure_is_io_without_rollback(monkeypatch, tmp_path):
+    import stat
+
+    backend = _writer_backend(tmp_path)
+    assert _write(backend).record_revision == 1
+    target = tmp_path / derive_catalog_record_relative_path(identity())
+    updated = live_record(last_recovery_observation=recovery_summary())
+    real_fsync = os.fsync
+
+    def fail_after_publication(fd):
+        if target.exists() and stat.S_ISDIR(os.fstat(fd).st_mode):
+            parsed = parse_cache_catalog_record(target.read_bytes())
+            if parsed.record_revision == 2:
+                raise OSError("directory durability uncertain")
+        return real_fsync(fd)
+
+    monkeypatch.setattr("engine.storage.cache_catalog.os.fsync", fail_after_publication)
+    result = _write(backend, updated, 1)
+    assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE
+    assert lookup_catalog_record(identity(), backend=backend).record == replace(
+        updated, record_revision=2
+    )
+
+
+def test_h1c_abandoned_temp_is_ignored_by_exact_lookup(tmp_path):
+    backend = _writer_backend(tmp_path)
+    assert _write(backend).record_revision == 1
+    target = tmp_path / derive_catalog_record_relative_path(identity())
+    target.parent.joinpath(".catalog-tmp-abandoned").write_bytes(b"not json")
+    assert lookup_catalog_record(identity(), backend=backend).status is CacheCatalogLookupStatus.RECORD_FOUND
+
+
+class _FailingCatalogBackend:
+    def __init__(self, delegate, failing_method, failure):
+        self.delegate = delegate
+        self.failing_method = failing_method
+        self.failure = failure
+
+    @property
+    def cache_root(self):
+        return self.delegate.cache_root
+
+    def _invoke(self, name, *args, **kwargs):
+        if name == self.failing_method:
+            raise self.failure
+        return getattr(self.delegate, name)(*args, **kwargs)
+
+    def inspect_root(self):
+        return self._invoke("inspect_root")
+
+    def inspect_catalog_relative(self, relative_path):
+        return self._invoke("inspect_catalog_relative", relative_path)
+
+    def read_record_bounded(self, identity):
+        return self._invoke("read_record_bounded", identity)
+
+    def initialize_catalog(self):
+        return self._invoke("initialize_catalog")
+
+    def acquire_writer_lock(self):
+        return self._invoke("acquire_writer_lock")
+
+    def ensure_record_parent(self, identity):
+        return self._invoke("ensure_record_parent", identity)
+
+    def publish_record_bytes(self, identity, data, *, create_only, expected_revision):
+        return self._invoke(
+            "publish_record_bytes",
+            identity,
+            data,
+            create_only=create_only,
+            expected_revision=expected_revision,
+        )
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["initialize_catalog", "acquire_writer_lock", "ensure_record_parent", "publish_record_bytes"],
+)
+def test_h1c_prepublication_failures_are_structured_and_cache_truth_untouched(tmp_path, method):
+    cache_truth = tmp_path / "entries/v1/value"
+    cache_truth.mkdir(parents=True)
+    cache_truth.joinpath("data").write_bytes(b"authoritative")
+    local = _writer_backend(tmp_path)
+    if method != "initialize_catalog":
+        local.initialize_catalog()
+    backend = _FailingCatalogBackend(local, method, OSError("secret native failure"))
+    result = _write_catalog_record(CacheCatalogWriteRequest(live_record(), None), backend=backend)
+    assert result.status is CacheCatalogWriteStatus.CATALOG_WRITE_IO_FAILURE
+    assert cache_truth.joinpath("data").read_bytes() == b"authoritative"
+    assert "secret" not in repr(result)
+
+
+def test_h1c_writer_backend_has_no_cache_mutation_or_cleanup_surface(tmp_path):
+    backend = _writer_backend(tmp_path)
+    assert isinstance(backend, CacheCatalogBackend)
+    forbidden = {
+        "delete_cache_entry", "write_cache_entry", "promote", "recover", "cleanup",
+        "prune", "unlink", "lock_cache_entry", "mutate_staging",
+    }
     assert forbidden.isdisjoint(dir(backend))
