@@ -255,6 +255,8 @@ The deterministic cases are:
 | Completed Step 5E; different/missing recovery summary | supported live/tombstone | `UPSERT_RECOVERY` conditionally |
 | Exact Step 5E `EMPTY`; supported live | supported live | `TOMBSTONE_EMPTY` conditionally |
 | Exact Step 5E `EMPTY`; tombstone | supported tombstone | `NOOP` |
+| Exact Step 5E `EMPTY`; exact record path absent | initialized catalog, no record | `NOOP` |
+| Exact Step 5E `EMPTY`; catalog uninitialized/unavailable | `CATALOG_UNAVAILABLE` | `NOOP` |
 | Catalog-only identity; Step 5E not exact `EMPTY` | any supported state | preserve or `UPSERT_RECOVERY`; never infer absence |
 | Authoritative observation incomplete/unsafe/unstable | any | `DEFER` or `REPORT_ONLY` |
 | Expected revision changed | supported record/tombstone | conflict and `DEFER` |
@@ -262,7 +264,10 @@ The deterministic cases are:
 When both fresh final and recovery evidence exist, H2 applies at most one record
 mutation per work unit. Selection order is exact:
 
-1. exact `EMPTY` selects `TOMBSTONE_EMPTY` when no Step 5B `HIT` exists;
+1. exact `EMPTY` selects `TOMBSTONE_EMPTY` only when no Step 5B `HIT` exists and
+   the catalog observation is a supported live record with an exact positive
+   revision; exact-record absence, a supported tombstone, and an
+   uninitialized/unavailable catalog instead select `NOOP`;
 2. otherwise a differing/missing fresh final summary selects `UPSERT_FINAL`;
 3. otherwise a differing/missing fresh recovery summary selects `UPSERT_RECOVERY`;
 4. otherwise select `NOOP`.
@@ -273,8 +278,10 @@ unit/pass after the final upsert; H2 does not use the private generic H1 record 
 or perform a hidden second mutation.
 
 `TOMBSTONE_EMPTY` takes precedence over recovery upsert only when Step 5E status is
-exactly `EMPTY` and there is no Step 5B `HIT`. Non-`EMPTY` observations cannot
-authorize tombstoning.
+exactly `EMPTY`, there is no Step 5B `HIT`, and the catalog observation is a
+supported live record. Non-`EMPTY` observations and catalog states without a
+supported live revision cannot authorize tombstoning. Corrupt, unsupported, unsafe,
+unstable, and I/O-failed catalog observations retain the safeguards in section 12.
 
 ## 9. Immutable reconciliation actions
 
@@ -296,6 +303,12 @@ An immutable action contains only:
 - intended typed H1 operation; and
 - deterministic source flags.
 
+`TOMBSTONE_EMPTY` has an additional locked invariant: its expected catalog revision
+is a positive integer captured from the supported live record being logically
+removed. It never carries the `ABSENT` precondition. H2 does not plan a tombstone for
+an exact missing record, a supported tombstone, or an uninitialized/unavailable
+catalog.
+
 Public action projections omit Step 5B/5E paths, raw metadata, full runtime
 fingerprints, diagnostics, filesystem identities, and opaque mutation preconditions.
 An action is a catalog-only proposal and grants no cache mutation authority.
@@ -304,7 +317,12 @@ An action is a catalog-only proposal and grants no cache mutation authority.
 
 Immediately before a supported-record mutation, H1 rechecks the exact expected
 revision under its writer lock. `ABSENT` means no supported live record or tombstone
-revision existed when planned and uses H1 create-only semantics.
+revision existed when planned and uses H1 create-only semantics for typed live-record
+upserts. `ABSENT` is never a tombstone precondition. H2C may execute
+`TOMBSTONE_EMPTY` directly through H1's typed `tombstone_catalog_empty()` because the
+action necessarily retains exact Step 5E `EMPTY` evidence, no Step 5B `HIT`, the
+supported live catalog observation, and its exact positive revision; no reread or
+replanning is permitted.
 
 A conflict produces `CATALOG_REVISION_CONFLICT`, performs no write, and defers the
 identity. The default and maximum automatic retry count is zero. A later run must
@@ -623,7 +641,14 @@ authority, lock authority, retry recommendation, retention decision, or quota in
 ## 24. Tombstones and physical compaction
 
 H2 may publish only H1's logical tombstone from exact same-identity Step 5E `EMPTY`
-evidence. It never unlinks a record file.
+evidence when replacing an existing supported live catalog record at its exact
+positive revision. It never creates a tombstone merely to encode an already absent
+record and never unlinks a record file.
+
+`NOOP` for an absent or uninitialized catalog does not prove that a durable historical
+tombstone exists. It means only that no catalog mutation is needed because no visible
+live catalog record exists. Step 5E `EMPTY` remains authoritative cache/recovery
+evidence, but H2 does not manufacture catalog history solely to encode absence.
 
 H2 v1 does not compact physical tombstones, abandoned catalog temporary files,
 checkpoints, or catalog directories. It does not delete or swap catalog roots.
@@ -720,7 +745,14 @@ begins H3, Source Ingestion, or cache cleanup.
   `DEFER`, and `REPORT_ONLY`;
 - exact summary merge, final absence preserving historical final evidence, and no
   caller-created summary authority;
-- exact `EMPTY` tombstone and every non-`EMPTY` rejection.
+- exact `EMPTY` plus supported live record selects `TOMBSTONE_EMPTY` with a positive
+  revision;
+- exact `EMPTY` plus supported tombstone, missing exact record, or
+  uninitialized/unavailable catalog selects `NOOP`;
+- exact `EMPTY` plus corrupt, unsupported, unsafe, unstable, or I/O-failed catalog
+  state retains its existing safe failure action;
+- no `TOMBSTONE_EMPTY` action carries `ABSENT`/`None`, and every non-`EMPTY`
+  observation is rejected as tombstone authority.
 
 ### Corruption and versions
 
@@ -773,4 +805,4 @@ Status:
 
 Exact next action:
 
-**Implement H2 beginning with H2A.**
+**Resume H2C conditional supported-record reconciliation.**
