@@ -1,10 +1,14 @@
 from dataclasses import FrozenInstanceError, replace
+import hashlib
 from pathlib import Path
 
 import pytest
 
 from engine.storage.cache_catalog import (
     CacheCatalogIdentity,
+    CacheCatalogFinalProvenance,
+    CacheCatalogLookupResult,
+    CacheCatalogLookupStatus,
     CacheCatalogLiveRecord,
     CacheCatalogRecoverySummary,
     CacheCatalogTombstone,
@@ -15,10 +19,23 @@ from engine.storage.cache_catalog import (
 )
 from engine.storage.cache_keys import CacheKey
 from engine.storage.cache_lookup import FilesystemObjectType
+from engine.storage.cache_lookup import (
+    CacheLookupReason,
+    CacheLookupVerificationPolicy,
+    CacheVerificationLevel,
+    LockObservationPolicy,
+    ProducerPayloadExpectation,
+    ReadOnlyCacheLookupResult,
+    ValidatedCacheEntryReference,
+)
 from engine.storage.cache_reconciliation import (
     MAX_RECONCILIATION_DIRECTORY_ENTRIES,
     CacheCatalogReconciliationCursor,
     CacheCatalogReconciliationMode,
+    CacheCatalogReconciliationActionKind,
+    CacheCatalogReconciliationActionReason,
+    CacheCatalogReconciliationObservation,
+    CacheCatalogReconciliationObservationScope,
     CatalogSlotClassification,
     DiscoveredCacheIdentity,
     LocalReconciliationReadOnlyFilesystem,
@@ -27,6 +44,7 @@ from engine.storage.cache_reconciliation import (
     ReconciliationDiscoveryPage,
     ReconciliationDiscoveryPolicy,
     ReconciliationSourceFlags,
+    ReconciliationResolvedExpectations,
     _DiscoveryBudget,
     _merged_identities,
     _validate_relative,
@@ -35,11 +53,20 @@ from engine.storage.cache_reconciliation import (
     iter_catalog_slots,
     iter_final_discovered_identities,
     iter_staging_discovered_identities,
+    compare_reconciliation_observation,
+    compare_reconciliation_observations,
+    observe_and_compare_reconciliation_identity,
 )
 from engine.storage.cache_recovery import (
+    CacheRecoveryObservation,
+    CacheRecoveryReason,
     CacheRecoveryStatus,
+    FinalRecoveryObservation,
     FinalRecoveryState,
+    LockRecoveryObservation,
     LockRecoveryState,
+    StagingRecoveryObservation,
+    StagingRecoveryState,
 )
 from engine.storage.persistent_cache import (
     CacheArtifactMetadata,
@@ -48,6 +75,12 @@ from engine.storage.persistent_cache import (
     CacheNamespace,
     CacheProducerMetadata,
     CacheRuntimeFingerprint,
+    CacheLookupExpectation,
+    CacheLookupStatus,
+    CompletenessMarker,
+    PayloadManifest,
+    PayloadManifestRecord,
+    CACHE_ENTRY_CONTRACT_VERSION,
     canonical_json_bytes,
     derive_entry_digest,
     derive_final_entry_path,
@@ -411,3 +444,202 @@ def test_h2a_models_never_claim_snapshot_or_mutation_authority():
     assert page.is_snapshot is False
     names = set(page.__dataclass_fields__)
     assert not names & {"action", "write", "checkpoint", "dry_run", "cleanup"}
+
+
+def _h2b_evidence(tmp_path):
+    root = tmp_path / "h2b-cache"
+    root.mkdir()
+    key = CacheKey("9" * 64)
+    namespace = CacheNamespace("audio", "producer", 1)
+    manifest = PayloadManifest((PayloadManifestRecord(
+        "artifact.json", 7, "sha256:" + "b" * 64, "application/json", "primary"
+    ),))
+    metadata = CacheEntryMetadata(
+        derive_entry_digest(key), CacheKeyReference.from_cache_key(key), namespace,
+        CacheArtifactMetadata("transcript", "private", 1),
+        CacheProducerMetadata("producer", "1.0.0", 1),
+        CacheRuntimeFingerprint(1, {"model": "test"}), "2026-08-10T00:00:00Z",
+        "sha256:" + hashlib.sha256(manifest.canonical_bytes()).hexdigest(), 1, 7,
+    )
+    marker = CompletenessMarker(
+        metadata.entry_digest,
+        "sha256:" + hashlib.sha256(metadata.canonical_bytes()).hexdigest(),
+        metadata.payload_manifest_digest,
+    )
+    reference = ValidatedCacheEntryReference(
+        root / "entry", metadata.entry_digest, namespace, metadata.cache_key,
+        metadata, manifest, marker, CacheVerificationLevel.FULL_PAYLOAD_SHA256,
+    )
+    lookup = ReadOnlyCacheLookupResult(
+        CacheLookupStatus.HIT, None, reference.entry_path, reference,
+        metadata.entry_digest, namespace, metadata.cache_key, (),
+        CacheVerificationLevel.FULL_PAYLOAD_SHA256, CACHE_ENTRY_CONTRACT_VERSION,
+        True, metadata, manifest, marker,
+    )
+    identity = CacheCatalogIdentity(namespace, metadata.entry_digest, metadata.cache_key)
+    return root, identity, DiscoveredCacheIdentity(identity, ReconciliationSourceFlags.FINAL), lookup
+
+
+def _nonhit(identity, status=CacheLookupStatus.MISS, reason=None):
+    return ReadOnlyCacheLookupResult(
+        status, reason, Path("expected"), None, identity.entry_digest,
+        identity.namespace, identity.cache_key_reference, (), CacheVerificationLevel.NONE,
+        None, False, None, None, None,
+    )
+
+
+def _recovery(identity, status=CacheRecoveryStatus.EMPTY, reason=None):
+    return CacheRecoveryObservation(
+        identity.entry_digest,
+        (StagingRecoveryObservation(0, "staging/v1/item", StagingRecoveryState.STAGING_ABSENT),),
+        FinalRecoveryObservation("entries/v1/item", FinalRecoveryState.FINAL_ABSENT),
+        LockRecoveryObservation("locks/v1/item", LockRecoveryState.LOCK_ABSENT),
+        status, reason,
+    )
+
+
+def _observation(identity, lookup, catalog, recovery=None, sources=ReconciliationSourceFlags.FINAL):
+    return CacheCatalogReconciliationObservation(identity, sources, lookup, recovery, catalog)
+
+
+def test_h2b_absent_hit_upserts_final_and_equal_summary_noops(tmp_path):
+    _, identity, _, lookup = _h2b_evidence(tmp_path)
+    absent = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    upsert = compare_reconciliation_observation(_observation(identity, lookup, absent))
+    assert upsert.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL
+    record = CacheCatalogLiveRecord(
+        identity=identity, record_revision=4,
+        last_validated_final=upsert.final_summary, last_recovery_observation=None,
+    )
+    noop = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, record)
+    ))
+    assert (noop.kind, noop.reason, noop.expected_catalog_revision) == (
+        CacheCatalogReconciliationActionKind.NOOP,
+        CacheCatalogReconciliationActionReason.SUMMARIES_MATCH, 4,
+    )
+
+
+def test_h2b_final_precedes_recovery_and_recovery_can_upsert(tmp_path):
+    _, identity, _, lookup = _h2b_evidence(tmp_path)
+    recovery = _recovery(identity, CacheRecoveryStatus.FINAL_PUBLISHED)
+    absent = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    final = compare_reconciliation_observation(_observation(identity, lookup, absent, recovery))
+    assert final.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL
+    recovery_action = compare_reconciliation_observation(_observation(identity, _nonhit(identity), absent, recovery))
+    assert recovery_action.kind is CacheCatalogReconciliationActionKind.UPSERT_RECOVERY
+    record = CacheCatalogLiveRecord(
+        identity=identity, record_revision=2, last_validated_final=None,
+        last_recovery_observation=recovery_action.recovery_summary,
+    )
+    matched = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_FOUND, record), recovery
+    ))
+    assert matched.kind is CacheCatalogReconciliationActionKind.NOOP
+
+
+def test_h2b_exact_empty_tombstones_or_matches_tombstone(tmp_path):
+    _, identity, _, _ = _h2b_evidence(tmp_path)
+    empty = _recovery(identity)
+    absent = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    action = compare_reconciliation_observation(_observation(identity, _nonhit(identity), absent, empty))
+    assert action.kind is CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY
+    existing = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT, tombstone_revision=7)
+    noop = compare_reconciliation_observation(_observation(identity, _nonhit(identity), existing, empty))
+    assert noop.kind is CacheCatalogReconciliationActionKind.NOOP
+
+
+@pytest.mark.parametrize("status,kind", [
+    (CacheCatalogLookupStatus.CATALOG_CORRUPT, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheCatalogLookupStatus.CATALOG_UNSUPPORTED, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheCatalogLookupStatus.CATALOG_UNSAFE, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheCatalogLookupStatus.CATALOG_UNSTABLE, CacheCatalogReconciliationActionKind.DEFER),
+    (CacheCatalogLookupStatus.CATALOG_IO_FAILURE, CacheCatalogReconciliationActionKind.DEFER),
+])
+def test_h2b_catalog_failure_precedence_never_proposes_mutation(tmp_path, status, kind):
+    _, identity, _, lookup = _h2b_evidence(tmp_path)
+    action = compare_reconciliation_observation(_observation(identity, lookup, CacheCatalogLookupResult(status)))
+    assert action.kind is kind
+    assert action.final_summary is None and action.recovery_summary is None
+
+
+@pytest.mark.parametrize("status,reason,kind", [
+    (CacheLookupStatus.UNSUPPORTED_VERSION, CacheLookupReason.UNSUPPORTED_ENTRY_VERSION, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheLookupStatus.UNSAFE_PATH, CacheLookupReason.UNSAFE_PATH, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheLookupStatus.INVALID_ENTRY, CacheLookupReason.IO_FAILURE, CacheCatalogReconciliationActionKind.DEFER),
+    (CacheLookupStatus.INVALID_ENTRY, CacheLookupReason.MALFORMED_METADATA, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheLookupStatus.LOCKED_OR_IN_PROGRESS, None, CacheCatalogReconciliationActionKind.DEFER),
+])
+def test_h2b_authoritative_failures_are_descriptive(tmp_path, status, reason, kind):
+    _, identity, _, _ = _h2b_evidence(tmp_path)
+    action = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity, status, reason),
+        CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT),
+        None if status is CacheLookupStatus.LOCKED_OR_IN_PROGRESS else _recovery(identity),
+    ))
+    assert action.kind is kind
+
+
+@pytest.mark.parametrize("status,reason,kind", [
+    (CacheRecoveryStatus.RECOVERY_UNSAFE, CacheRecoveryReason.UNSAFE_ROOT, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheRecoveryStatus.RECOVERY_UNSUPPORTED, CacheRecoveryReason.UNSUPPORTED_FINAL, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheRecoveryStatus.RECOVERY_INVALID, CacheRecoveryReason.INVALID_FINAL, CacheCatalogReconciliationActionKind.REPORT_ONLY),
+    (CacheRecoveryStatus.RECOVERY_UNSTABLE, CacheRecoveryReason.UNSTABLE_ROOT, CacheCatalogReconciliationActionKind.DEFER),
+])
+def test_h2b_recovery_failures_never_authorize_actions(tmp_path, status, reason, kind):
+    _, identity, _, _ = _h2b_evidence(tmp_path)
+    action = compare_reconciliation_observation(_observation(
+        identity, _nonhit(identity), CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT),
+        _recovery(identity, status, reason),
+    ))
+    assert action.kind is kind
+    assert action.final_summary is None and action.recovery_summary is None
+
+
+def test_h2b_action_batch_is_canonical_bounded_and_unique(tmp_path):
+    _, identity, _, _ = _h2b_evidence(tmp_path)
+    other = _identity(CacheNamespace("video", "producer", 1), CacheKey("8" * 64))
+    catalog = CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    observations = (
+        _observation(other, _nonhit(other), catalog),
+        _observation(identity, _nonhit(identity), catalog),
+    )
+    actions = compare_reconciliation_observations(observations)
+    assert [item.identity for item in actions] == sorted((identity, other), key=lambda item: item.sort_key)
+    with pytest.raises(ValueError, match="unique"):
+        compare_reconciliation_observations((observations[0], observations[0]))
+
+
+def test_h2b_observer_schedules_each_source_once_and_skips_unneeded_recovery(tmp_path):
+    root, identity, discovered, lookup = _h2b_evidence(tmp_path)
+    resolved = ReconciliationResolvedExpectations(
+        CacheLookupExpectation(identity.namespace, "producer", 1, CacheRuntimeFingerprint(1, {"model": "test"})),
+        None, ProducerPayloadExpectation(), CacheLookupVerificationPolicy(), LockObservationPolicy(60),
+    )
+    class Resolver:
+        def resolve(self, requested): return resolved
+    calls = []
+    common = dict(
+        cache_root=LocalReconciliationReadOnlyFilesystem.from_root(root).cache_root,
+        expectation_resolver=Resolver(), lookup_filesystem=object(), recovery_filesystem=object(), catalog_backend=object(),
+        lookup_operation=lambda request, **kwargs: (calls.append("lookup") or lookup),
+        recovery_operation=lambda request, **kwargs: (calls.append("recovery") or _recovery(identity)),
+        catalog_operation=lambda requested, **kwargs: (calls.append("catalog") or CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)),
+    )
+    action = observe_and_compare_reconciliation_identity(discovered, **common)
+    assert calls == ["lookup", "catalog"] and action.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL
+    calls.clear()
+    staged = replace(discovered, sources=ReconciliationSourceFlags.FINAL | ReconciliationSourceFlags.STAGING)
+    observe_and_compare_reconciliation_identity(staged, **common)
+    assert calls == ["lookup", "recovery", "catalog"]
+
+
+def test_h2b_missing_expectations_defers_without_any_dependency_call(tmp_path):
+    root, _, discovered, _ = _h2b_evidence(tmp_path)
+    class Resolver:
+        def resolve(self, requested): return None
+    action = observe_and_compare_reconciliation_identity(
+        discovered, cache_root=LocalReconciliationReadOnlyFilesystem.from_root(root).cache_root,
+        expectation_resolver=Resolver(), lookup_filesystem=object(), recovery_filesystem=object(), catalog_backend=object(),
+    )
+    assert action.kind is CacheCatalogReconciliationActionKind.DEFER

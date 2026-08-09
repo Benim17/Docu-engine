@@ -9,20 +9,27 @@ import re
 from dataclasses import dataclass
 from enum import Enum, IntFlag
 from pathlib import Path
-from typing import Iterator, Protocol, runtime_checkable
+from typing import Callable, Iterator, Protocol, runtime_checkable
 
 from .cache_catalog import (
     CACHE_CATALOG_LAYOUT_VERSION,
     MAX_CATALOG_RECORD_BYTES,
     CacheCatalogContractError,
     CacheCatalogIdentity,
+    CacheCatalogFinalSummary,
+    CacheCatalogFinalProvenance,
     CacheCatalogLiveRecord,
+    CacheCatalogLookupResult,
     CacheCatalogLookupStatus,
     CacheCatalogReadOnlyBackend,
     CacheCatalogRecord,
+    CacheCatalogRecoverySummary,
     CacheCatalogTombstone,
     CacheCatalogUnsupportedVersionError,
     parse_cache_catalog_record,
+    lookup_catalog_record,
+    _final_summary_from_reference,
+    _recovery_summary_from_observation,
 )
 from .cache_lookup import (
     DEFAULT_MAX_METADATA_BYTES,
@@ -35,8 +42,33 @@ from .cache_lookup import (
     UnstableFilesystemObjectError,
     UnsupportedFilesystemObjectError,
     ValidatedCacheRoot,
+    CacheArtifactExpectation,
+    CacheLookupRequest,
+    CacheLookupReason,
+    CacheLookupVerificationPolicy,
+    LockObservationClock,
+    LockObservationPolicy,
+    ProducerPayloadExpectation,
+    ReadOnlyCacheFilesystem,
+    ReadOnlyCacheLookupResult,
+    SYSTEM_LOCK_OBSERVATION_CLOCK,
+    lookup_cache_entry,
 )
-from .persistent_cache import CacheEntryContractError, CacheEntryMetadata, CacheNamespace
+from .cache_recovery import (
+    CacheRecoveryInspectionRequest,
+    CacheRecoveryObservation,
+    CacheRecoveryStatus,
+    RecoveryInspectionPolicy,
+    RecoveryReadOnlyFilesystem,
+    inspect_cache_recovery_state,
+)
+from .persistent_cache import (
+    CacheEntryContractError,
+    CacheEntryMetadata,
+    CacheLookupExpectation,
+    CacheLookupStatus,
+    CacheNamespace,
+)
 
 
 MAX_RECONCILIATION_IDENTITIES_PER_RUN = 1_024
@@ -931,4 +963,337 @@ def discover_catalog_slots_page(
             policy.digest,
         ),
         emitted,
+    )
+
+
+class CacheCatalogReconciliationObservationScope(str, Enum):
+    FINAL_SUFFICIENT = "final_sufficient"
+    FINAL_AND_RECOVERY = "final_and_recovery"
+
+
+class CacheCatalogReconciliationActionKind(str, Enum):
+    NOOP = "noop"
+    UPSERT_FINAL = "upsert_final"
+    UPSERT_RECOVERY = "upsert_recovery"
+    TOMBSTONE_EMPTY = "tombstone_empty"
+    DEFER = "defer"
+    REPORT_ONLY = "report_only"
+
+
+class CacheCatalogReconciliationActionReason(str, Enum):
+    SUMMARIES_MATCH = "summaries_match"
+    FINAL_SUMMARY_MISSING = "final_summary_missing"
+    FINAL_SUMMARY_STALE = "final_summary_stale"
+    RECOVERY_SUMMARY_MISSING = "recovery_summary_missing"
+    RECOVERY_SUMMARY_STALE = "recovery_summary_stale"
+    EXACT_EMPTY = "exact_empty"
+    TOMBSTONE_MATCHES_EMPTY = "tombstone_matches_empty"
+    EXPECTATIONS_UNAVAILABLE = "expectations_unavailable"
+    AUTHORITATIVE_INCOMPLETE = "authoritative_incomplete"
+    AUTHORITATIVE_UNSUPPORTED = "authoritative_unsupported"
+    AUTHORITATIVE_UNSAFE = "authoritative_unsafe"
+    AUTHORITATIVE_INVALID = "authoritative_invalid"
+    AUTHORITATIVE_UNSTABLE = "authoritative_unstable"
+    AUTHORITATIVE_IO_FAILURE = "authoritative_io_failure"
+    CATALOG_CORRUPT = "catalog_corrupt"
+    CATALOG_UNSUPPORTED = "catalog_unsupported"
+    CATALOG_UNSAFE = "catalog_unsafe"
+    CATALOG_UNSTABLE = "catalog_unstable"
+    CATALOG_IO_FAILURE = "catalog_io_failure"
+
+
+@dataclass(frozen=True)
+class ReconciliationResolvedExpectations:
+    expectation: CacheLookupExpectation
+    artifact_expectation: CacheArtifactExpectation | None
+    payload_expectation: ProducerPayloadExpectation
+    lookup_policy: CacheLookupVerificationPolicy
+    lock_observation_policy: LockObservationPolicy
+    recovery_policy: RecoveryInspectionPolicy = RecoveryInspectionPolicy()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expectation, CacheLookupExpectation):
+            raise TypeError("expectation must be CacheLookupExpectation.")
+        if self.artifact_expectation is not None and not isinstance(
+            self.artifact_expectation, CacheArtifactExpectation
+        ):
+            raise TypeError("artifact_expectation must be CacheArtifactExpectation or None.")
+        if not isinstance(self.payload_expectation, ProducerPayloadExpectation):
+            raise TypeError("payload_expectation must be trusted producer semantics.")
+        if not isinstance(self.lookup_policy, CacheLookupVerificationPolicy):
+            raise TypeError("lookup_policy must be CacheLookupVerificationPolicy.")
+        if not isinstance(self.lock_observation_policy, LockObservationPolicy):
+            raise TypeError("lock_observation_policy must be LockObservationPolicy.")
+        if not isinstance(self.recovery_policy, RecoveryInspectionPolicy):
+            raise TypeError("recovery_policy must be RecoveryInspectionPolicy.")
+
+
+@runtime_checkable
+class CacheCatalogReconciliationExpectationResolver(Protocol):
+    def resolve(
+        self, identity: CacheCatalogIdentity
+    ) -> ReconciliationResolvedExpectations | None: ...
+
+
+@dataclass(frozen=True)
+class CacheCatalogReconciliationObservation:
+    identity: CacheCatalogIdentity
+    sources: ReconciliationSourceFlags
+    lookup: ReadOnlyCacheLookupResult | None
+    recovery: CacheRecoveryObservation | None
+    catalog: CacheCatalogLookupResult | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, CacheCatalogIdentity):
+            raise TypeError("identity must be CacheCatalogIdentity.")
+        if not isinstance(self.sources, ReconciliationSourceFlags) or not self.sources:
+            raise ValueError("sources must contain trusted discovery evidence.")
+        if self.lookup is not None and not isinstance(self.lookup, ReadOnlyCacheLookupResult):
+            raise TypeError("lookup must be a Step 5B result or None.")
+        if self.recovery is not None and not isinstance(self.recovery, CacheRecoveryObservation):
+            raise TypeError("recovery must be a Step 5E observation or None.")
+        if self.catalog is not None and not isinstance(self.catalog, CacheCatalogLookupResult):
+            raise TypeError("catalog must be an H1 lookup result or None.")
+
+
+@dataclass(frozen=True)
+class CacheCatalogReconciliationAction:
+    identity: CacheCatalogIdentity
+    kind: CacheCatalogReconciliationActionKind
+    reason: CacheCatalogReconciliationActionReason
+    sources: ReconciliationSourceFlags
+    expected_catalog_revision: int | None
+    observation: CacheCatalogReconciliationObservation
+    final_summary: CacheCatalogFinalSummary | None = None
+    recovery_summary: CacheCatalogRecoverySummary | None = None
+
+    def __post_init__(self) -> None:
+        if self.identity != self.observation.identity or self.sources != self.observation.sources:
+            raise ValueError("action identity and sources must equal its observation.")
+        if not isinstance(self.kind, CacheCatalogReconciliationActionKind):
+            raise TypeError("kind must be CacheCatalogReconciliationActionKind.")
+        if not isinstance(self.reason, CacheCatalogReconciliationActionReason):
+            raise TypeError("reason must be CacheCatalogReconciliationActionReason.")
+        if self.expected_catalog_revision is not None and (
+            isinstance(self.expected_catalog_revision, bool)
+            or not isinstance(self.expected_catalog_revision, int)
+            or self.expected_catalog_revision <= 0
+        ):
+            raise ValueError("expected_catalog_revision must be positive or None.")
+        if self.kind is CacheCatalogReconciliationActionKind.UPSERT_FINAL:
+            if self.final_summary is None or self.recovery_summary is not None:
+                raise ValueError("UPSERT_FINAL carries only a final summary.")
+        elif self.kind is CacheCatalogReconciliationActionKind.UPSERT_RECOVERY:
+            if self.recovery_summary is None or self.final_summary is not None:
+                raise ValueError("UPSERT_RECOVERY carries only a recovery summary.")
+        elif self.final_summary is not None or self.recovery_summary is not None:
+            raise ValueError("non-upsert actions carry no proposed summary.")
+
+
+def _catalog_revision(result: CacheCatalogLookupResult) -> int | None:
+    if result.status is CacheCatalogLookupStatus.RECORD_FOUND:
+        assert result.record is not None
+        return result.record.record_revision
+    return result.tombstone_revision
+
+
+def _action(observation, kind, reason, *, final_summary=None, recovery_summary=None):
+    return CacheCatalogReconciliationAction(
+        observation.identity,
+        kind,
+        reason,
+        observation.sources,
+        None if observation.catalog is None else _catalog_revision(observation.catalog),
+        observation,
+        final_summary,
+        recovery_summary,
+    )
+
+
+_CATALOG_FAILURE_ACTION = {
+    CacheCatalogLookupStatus.CATALOG_CORRUPT: (CacheCatalogReconciliationActionKind.REPORT_ONLY, CacheCatalogReconciliationActionReason.CATALOG_CORRUPT),
+    CacheCatalogLookupStatus.CATALOG_UNSUPPORTED: (CacheCatalogReconciliationActionKind.REPORT_ONLY, CacheCatalogReconciliationActionReason.CATALOG_UNSUPPORTED),
+    CacheCatalogLookupStatus.CATALOG_UNSAFE: (CacheCatalogReconciliationActionKind.REPORT_ONLY, CacheCatalogReconciliationActionReason.CATALOG_UNSAFE),
+    CacheCatalogLookupStatus.CATALOG_UNSTABLE: (CacheCatalogReconciliationActionKind.DEFER, CacheCatalogReconciliationActionReason.CATALOG_UNSTABLE),
+    CacheCatalogLookupStatus.CATALOG_IO_FAILURE: (CacheCatalogReconciliationActionKind.DEFER, CacheCatalogReconciliationActionReason.CATALOG_IO_FAILURE),
+    CacheCatalogLookupStatus.CATALOG_UNAVAILABLE: (CacheCatalogReconciliationActionKind.DEFER, CacheCatalogReconciliationActionReason.CATALOG_IO_FAILURE),
+}
+
+
+def compare_reconciliation_observation(
+    observation: CacheCatalogReconciliationObservation,
+) -> CacheCatalogReconciliationAction:
+    """Apply the locked H2 matrix without executing the selected action."""
+
+    if not isinstance(observation, CacheCatalogReconciliationObservation):
+        raise TypeError("observation must be CacheCatalogReconciliationObservation.")
+    if observation.lookup is None or observation.catalog is None:
+        return _action(observation, CacheCatalogReconciliationActionKind.DEFER,
+                       CacheCatalogReconciliationActionReason.EXPECTATIONS_UNAVAILABLE)
+    catalog = observation.catalog
+    if catalog.status in _CATALOG_FAILURE_ACTION:
+        return _action(observation, *_CATALOG_FAILURE_ACTION[catalog.status])
+
+    lookup = observation.lookup
+    if lookup.status not in {
+        CacheLookupStatus.HIT,
+        CacheLookupStatus.MISS,
+        CacheLookupStatus.LOCKED_OR_IN_PROGRESS,
+    }:
+        if lookup.status is CacheLookupStatus.UNSUPPORTED_VERSION:
+            kind = CacheCatalogReconciliationActionKind.REPORT_ONLY
+            reason = CacheCatalogReconciliationActionReason.AUTHORITATIVE_UNSUPPORTED
+        elif lookup.status is CacheLookupStatus.UNSAFE_PATH:
+            kind = CacheCatalogReconciliationActionKind.REPORT_ONLY
+            reason = CacheCatalogReconciliationActionReason.AUTHORITATIVE_UNSAFE
+        elif lookup.reason is CacheLookupReason.IO_FAILURE:
+            kind = CacheCatalogReconciliationActionKind.DEFER
+            reason = CacheCatalogReconciliationActionReason.AUTHORITATIVE_IO_FAILURE
+        else:
+            kind = CacheCatalogReconciliationActionKind.REPORT_ONLY
+            reason = CacheCatalogReconciliationActionReason.AUTHORITATIVE_INVALID
+        return _action(observation, kind, reason)
+    final_summary = None
+    if lookup.status is CacheLookupStatus.HIT:
+        assert lookup.validated_entry is not None
+        final_summary = _final_summary_from_reference(
+            lookup.validated_entry, CacheCatalogFinalProvenance.STEP5B_HIT
+        )
+
+    recovery_summary = None
+    recovery = observation.recovery
+    if recovery is not None and recovery.status is not None:
+        if recovery.status is CacheRecoveryStatus.RECOVERY_UNSTABLE:
+            return _action(observation, CacheCatalogReconciliationActionKind.DEFER,
+                           CacheCatalogReconciliationActionReason.AUTHORITATIVE_UNSTABLE)
+        failure_reason = {
+            CacheRecoveryStatus.RECOVERY_UNSAFE: CacheCatalogReconciliationActionReason.AUTHORITATIVE_UNSAFE,
+            CacheRecoveryStatus.RECOVERY_UNSUPPORTED: CacheCatalogReconciliationActionReason.AUTHORITATIVE_UNSUPPORTED,
+            CacheRecoveryStatus.RECOVERY_INVALID: CacheCatalogReconciliationActionReason.AUTHORITATIVE_INVALID,
+        }.get(recovery.status)
+        if failure_reason is not None:
+            return _action(observation, CacheCatalogReconciliationActionKind.REPORT_ONLY,
+                           failure_reason)
+        recovery_summary = _recovery_summary_from_observation(recovery)
+
+    record = catalog.record
+    tombstone = catalog.status is CacheCatalogLookupStatus.RECORD_ABSENT and catalog.tombstone_revision is not None
+    if lookup.status is not CacheLookupStatus.HIT and recovery is not None and recovery.status is CacheRecoveryStatus.EMPTY:
+        if tombstone:
+            return _action(observation, CacheCatalogReconciliationActionKind.NOOP,
+                           CacheCatalogReconciliationActionReason.TOMBSTONE_MATCHES_EMPTY)
+        return _action(observation, CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY,
+                       CacheCatalogReconciliationActionReason.EXACT_EMPTY)
+
+    if final_summary is not None and (
+        record is None or record.last_validated_final != final_summary
+    ):
+        reason = (
+            CacheCatalogReconciliationActionReason.FINAL_SUMMARY_MISSING
+            if record is None or record.last_validated_final is None
+            else CacheCatalogReconciliationActionReason.FINAL_SUMMARY_STALE
+        )
+        return _action(observation, CacheCatalogReconciliationActionKind.UPSERT_FINAL,
+                       reason, final_summary=final_summary)
+
+    if recovery_summary is not None and (
+        record is None or record.last_recovery_observation != recovery_summary
+    ):
+        reason = (
+            CacheCatalogReconciliationActionReason.RECOVERY_SUMMARY_MISSING
+            if record is None or record.last_recovery_observation is None
+            else CacheCatalogReconciliationActionReason.RECOVERY_SUMMARY_STALE
+        )
+        return _action(observation, CacheCatalogReconciliationActionKind.UPSERT_RECOVERY,
+                       reason, recovery_summary=recovery_summary)
+
+    if final_summary is not None or recovery_summary is not None:
+        return _action(observation, CacheCatalogReconciliationActionKind.NOOP,
+                       CacheCatalogReconciliationActionReason.SUMMARIES_MATCH)
+
+    if lookup.status in {CacheLookupStatus.MISS, CacheLookupStatus.LOCKED_OR_IN_PROGRESS}:
+        return _action(observation, CacheCatalogReconciliationActionKind.DEFER,
+                       CacheCatalogReconciliationActionReason.AUTHORITATIVE_INCOMPLETE)
+    return _action(observation, CacheCatalogReconciliationActionKind.REPORT_ONLY,
+                   CacheCatalogReconciliationActionReason.AUTHORITATIVE_INVALID)
+
+
+def compare_reconciliation_observations(
+    observations: tuple[CacheCatalogReconciliationObservation, ...],
+) -> tuple[CacheCatalogReconciliationAction, ...]:
+    """Compare a bounded work set in canonical identity order."""
+
+    if not isinstance(observations, tuple) or any(
+        not isinstance(item, CacheCatalogReconciliationObservation) for item in observations
+    ):
+        raise TypeError("observations must be an immutable tuple of observations.")
+    if len(observations) > MAX_RECONCILIATION_PAGE_ITEMS:
+        raise ValueError("observations exceed the locked H2 page maximum.")
+    ordered = tuple(sorted(observations, key=lambda item: item.identity.sort_key))
+    if len({item.identity for item in ordered}) != len(ordered):
+        raise ValueError("observations must contain unique identities.")
+    return tuple(compare_reconciliation_observation(item) for item in ordered)
+
+
+def observe_and_compare_reconciliation_identity(
+    discovered: DiscoveredCacheIdentity,
+    *,
+    cache_root: ValidatedCacheRoot,
+    expectation_resolver: CacheCatalogReconciliationExpectationResolver,
+    lookup_filesystem: ReadOnlyCacheFilesystem,
+    recovery_filesystem: RecoveryReadOnlyFilesystem,
+    catalog_backend: CacheCatalogReadOnlyBackend,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+    observation_scope: CacheCatalogReconciliationObservationScope = CacheCatalogReconciliationObservationScope.FINAL_SUFFICIENT,
+    lookup_operation: Callable[..., ReadOnlyCacheLookupResult] = lookup_cache_entry,
+    recovery_operation: Callable[..., CacheRecoveryObservation] = inspect_cache_recovery_state,
+    catalog_operation: Callable[..., CacheCatalogLookupResult] = lookup_catalog_record,
+) -> CacheCatalogReconciliationAction:
+    """Observe one trusted identity exactly once per required source and compare it."""
+
+    if not isinstance(discovered, DiscoveredCacheIdentity):
+        raise TypeError("discovered must be DiscoveredCacheIdentity.")
+    if not isinstance(cache_root, ValidatedCacheRoot):
+        raise TypeError("cache_root must be ValidatedCacheRoot.")
+    if not isinstance(expectation_resolver, CacheCatalogReconciliationExpectationResolver):
+        raise TypeError("expectation_resolver must implement the trusted resolver protocol.")
+    if not isinstance(observation_scope, CacheCatalogReconciliationObservationScope):
+        raise TypeError("observation_scope must be CacheCatalogReconciliationObservationScope.")
+    identity = discovered.identity
+    resolved = expectation_resolver.resolve(identity)
+    if resolved is None:
+        return compare_reconciliation_observation(
+            CacheCatalogReconciliationObservation(identity, discovered.sources, None, None, None)
+        )
+    if resolved.expectation.namespace != identity.namespace:
+        raise ValueError("resolved expectation namespace must equal discovered identity.")
+    cache_key = identity.cache_key_reference.to_cache_key()
+    lookup_request = CacheLookupRequest(
+        cache_root, identity.namespace, cache_key, resolved.expectation,
+        resolved.artifact_expectation, resolved.payload_expectation,
+        resolved.lookup_policy, resolved.lock_observation_policy,
+    )
+    lookup = lookup_operation(lookup_request, filesystem=lookup_filesystem, lock_clock=lock_clock)
+    if (lookup.entry_digest != identity.entry_digest or lookup.namespace != identity.namespace
+            or lookup.cache_key_reference != identity.cache_key_reference):
+        raise ValueError("Step 5B result identity does not match discovered identity.")
+    recovery = None
+    needs_recovery = (
+        observation_scope is CacheCatalogReconciliationObservationScope.FINAL_AND_RECOVERY
+        or bool(discovered.sources & ReconciliationSourceFlags.STAGING)
+        or (lookup.status is not CacheLookupStatus.HIT and bool(discovered.sources & ReconciliationSourceFlags.CATALOG))
+    )
+    if needs_recovery:
+        request = CacheRecoveryInspectionRequest(
+            cache_root, identity.namespace, cache_key, resolved.expectation,
+            resolved.artifact_expectation, resolved.payload_expectation,
+            resolved.lookup_policy, resolved.lock_observation_policy,
+            resolved.recovery_policy,
+        )
+        recovery = recovery_operation(request, filesystem=recovery_filesystem, lock_clock=lock_clock)
+        if recovery.entry_digest != identity.entry_digest:
+            raise ValueError("Step 5E result identity does not match discovered identity.")
+    catalog = catalog_operation(identity, backend=catalog_backend)
+    return compare_reconciliation_observation(
+        CacheCatalogReconciliationObservation(identity, discovered.sources, lookup, recovery, catalog)
     )
