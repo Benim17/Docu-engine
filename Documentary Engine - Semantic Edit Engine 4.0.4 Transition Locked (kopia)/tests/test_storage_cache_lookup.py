@@ -1,10 +1,27 @@
 from dataclasses import FrozenInstanceError, fields, replace
+import hashlib
+import json
 import os
 from pathlib import Path
 import socket
 import tempfile
 
 import pytest
+
+from engine.storage.cache_keys import CacheKey
+from engine.storage.persistent_cache import (
+    CacheArtifactMetadata,
+    CacheEntryMetadata,
+    CacheKeyReference,
+    CacheNamespace,
+    CacheProducerMetadata,
+    CacheRuntimeFingerprint,
+    CompletenessMarker,
+    PayloadManifest,
+    PayloadManifestRecord,
+    canonical_json_bytes,
+    derive_entry_digest,
+)
 
 from engine.storage.cache_lookup import (
     DEFAULT_MAX_COMPLETE_BYTES,
@@ -30,7 +47,11 @@ from engine.storage.cache_lookup import (
     UnsupportedFilesystemObjectError,
     ValidatedCacheRoot,
     _FinalEntryStructureClassification,
+    _CacheDocumentClassification,
+    _CacheDocumentName,
     _inspect_final_entry_structure,
+    _read_and_parse_cache_document,
+    _read_and_parse_final_entry_documents,
 )
 
 
@@ -651,3 +672,322 @@ def test_internal_structure_surface_adds_no_public_lookup_or_mutation_api():
         "read_regular_file_bounded",
         "resolve",
     }
+
+
+def _valid_document_models():
+    cache_key = CacheKey("a" * 64)
+    manifest = PayloadManifest(
+        (
+            PayloadManifestRecord(
+                "artifact.json",
+                7,
+                "sha256:" + "b" * 64,
+                "application/json",
+                "primary",
+            ),
+        )
+    )
+    manifest_bytes = manifest.canonical_bytes()
+    metadata = CacheEntryMetadata(
+        derive_entry_digest(cache_key),
+        CacheKeyReference.from_cache_key(cache_key),
+        CacheNamespace("audio", "transcription.whisper", 3),
+        CacheArtifactMetadata("transcript", "episode-001", 1),
+        CacheProducerMetadata("transcription.whisper", "4.2.0", 3),
+        CacheRuntimeFingerprint(1, {"model": "large-v3"}),
+        "2026-07-20T09:00:00Z",
+        "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+        1,
+        7,
+    )
+    metadata_bytes = metadata.canonical_bytes()
+    marker = CompletenessMarker(
+        metadata.entry_digest,
+        "sha256:" + hashlib.sha256(metadata_bytes).hexdigest(),
+        "sha256:" + hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    return marker, metadata, manifest
+
+
+def _write_valid_documents(entry):
+    marker, metadata, manifest = _valid_document_models()
+    documents = {
+        _CacheDocumentName.COMPLETE: marker.canonical_bytes(),
+        _CacheDocumentName.METADATA: metadata.canonical_bytes(),
+        _CacheDocumentName.MANIFEST: manifest.canonical_bytes(),
+    }
+    for name, content in documents.items():
+        (entry / name.value).write_bytes(content)
+    return documents, (marker, metadata, manifest)
+
+
+def _document_dict(name):
+    marker, metadata, manifest = _valid_document_models()
+    return {
+        _CacheDocumentName.COMPLETE: marker.to_dict(),
+        _CacheDocumentName.METADATA: metadata.to_dict(),
+        _CacheDocumentName.MANIFEST: manifest.to_dict(),
+    }[name]
+
+
+@pytest.mark.parametrize(
+    ("name", "model_type"),
+    [
+        (_CacheDocumentName.COMPLETE, CompletenessMarker),
+        (_CacheDocumentName.METADATA, CacheEntryMetadata),
+        (_CacheDocumentName.MANIFEST, PayloadManifest),
+    ],
+)
+def test_internal_document_reader_parses_each_canonical_model_and_preserves_bytes(
+    tmp_path, name, model_type
+):
+    entry = _make_complete_entry(tmp_path / "entry")
+    documents, _ = _write_valid_documents(entry)
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification is _CacheDocumentClassification.VALID
+    assert isinstance(observation.model, model_type)
+    assert observation.stored_bytes == documents[name]
+    assert observation.stable_read
+
+
+def test_internal_document_pipeline_reads_all_three_in_order_and_preserves_models(tmp_path):
+    entry = _make_complete_entry(tmp_path / "entry")
+    documents, models = _write_valid_documents(entry)
+
+    observation = _read_and_parse_final_entry_documents(
+        entry, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification is _CacheDocumentClassification.VALID
+    assert observation.complete.model == models[0]
+    assert observation.metadata.model == models[1]
+    assert observation.manifest.model == models[2]
+    assert observation.complete.stored_bytes == documents[_CacheDocumentName.COMPLETE]
+    assert observation.metadata.stored_bytes == documents[_CacheDocumentName.METADATA]
+    assert observation.manifest.stored_bytes == documents[_CacheDocumentName.MANIFEST]
+
+
+def test_internal_document_pipeline_read_order_never_touches_payload_or_locks(tmp_path):
+    entry = _make_complete_entry(tmp_path / "entry")
+    _write_valid_documents(entry)
+    (entry / "payload" / "must-not-read").write_bytes(b"payload")
+    locks = tmp_path / "locks"
+    locks.mkdir()
+
+    class RecordingFilesystem:
+        def __init__(self):
+            self.read_paths = []
+
+        def inspect(self, path):
+            return FILESYSTEM.inspect(path)
+
+        def resolve(self, path):
+            return FILESYSTEM.resolve(path)
+
+        def list_directory(self, path):
+            raise AssertionError("document reading must not list directories")
+
+        def read_regular_file_bounded(self, path, *, max_bytes):
+            self.read_paths.append(Path(path))
+            return FILESYSTEM.read_regular_file_bounded(path, max_bytes=max_bytes)
+
+    filesystem = RecordingFilesystem()
+    observation = _read_and_parse_final_entry_documents(
+        entry, policy=CacheLookupVerificationPolicy(), filesystem=filesystem
+    )
+
+    assert observation.classification is _CacheDocumentClassification.VALID
+    assert filesystem.read_paths == [
+        entry / "COMPLETE",
+        entry / "metadata.json",
+        entry / "manifest.json",
+    ]
+    assert not any("payload" in path.parts or "locks" in path.parts for path in filesystem.read_paths)
+
+
+def _noncanonical_variant(canonical, variant):
+    if variant == "trailing_newline":
+        return canonical + b"\n"
+    if variant == "surrounding_whitespace":
+        return b" " + canonical + b" "
+    if variant == "pretty_printed":
+        return json.dumps(json.loads(canonical), indent=2, sort_keys=True).encode("utf-8")
+    if variant == "bom":
+        return b"\xef\xbb\xbf" + canonical
+    raise AssertionError(variant)
+
+
+@pytest.mark.parametrize("name", tuple(_CacheDocumentName))
+@pytest.mark.parametrize(
+    "variant", ["trailing_newline", "surrounding_whitespace", "pretty_printed", "bom"]
+)
+def test_internal_document_reader_rejects_noncanonical_variants(tmp_path, name, variant):
+    entry = _make_complete_entry(tmp_path / "entry")
+    documents, _ = _write_valid_documents(entry)
+    (entry / name.value).write_bytes(_noncanonical_variant(documents[name], variant))
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification is {
+        _CacheDocumentName.COMPLETE: _CacheDocumentClassification.MALFORMED_COMPLETE,
+        _CacheDocumentName.METADATA: _CacheDocumentClassification.MALFORMED_METADATA,
+        _CacheDocumentName.MANIFEST: _CacheDocumentClassification.MALFORMED_MANIFEST,
+    }[name]
+
+
+@pytest.mark.parametrize("name", tuple(_CacheDocumentName))
+def test_internal_document_reader_rejects_duplicate_json_keys(tmp_path, name):
+    entry = _make_complete_entry(tmp_path / "entry")
+    documents, _ = _write_valid_documents(entry)
+    duplicate_field = {
+        _CacheDocumentName.COMPLETE: b'"cache_entry_contract_version":1,',
+        _CacheDocumentName.METADATA: b'"cache_entry_contract_version":1,',
+        _CacheDocumentName.MANIFEST: b'"manifest_version":1,',
+    }[name]
+    (entry / name.value).write_bytes(b"{" + duplicate_field + documents[name][1:])
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification.value == f"malformed_{'complete' if name is _CacheDocumentName.COMPLETE else name.value.removesuffix('.json')}"
+
+
+@pytest.mark.parametrize("name", tuple(_CacheDocumentName))
+def test_internal_document_reader_rejects_unknown_fields_for_supported_version(tmp_path, name):
+    entry = _make_complete_entry(tmp_path / "entry")
+    _write_valid_documents(entry)
+    data = _document_dict(name)
+    data["future"] = True
+    (entry / name.value).write_bytes(canonical_json_bytes(data))
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification.value.startswith("malformed_")
+
+
+@pytest.mark.parametrize(
+    ("name", "limit_field"),
+    [
+        (_CacheDocumentName.COMPLETE, "max_complete_bytes"),
+        (_CacheDocumentName.METADATA, "max_metadata_bytes"),
+        (_CacheDocumentName.MANIFEST, "max_manifest_bytes"),
+    ],
+)
+def test_internal_document_reader_classifies_oversized_documents_as_malformed(
+    tmp_path, name, limit_field
+):
+    entry = _make_complete_entry(tmp_path / "entry")
+    documents, _ = _write_valid_documents(entry)
+    policy = replace(
+        CacheLookupVerificationPolicy(), **{limit_field: len(documents[name]) - 1}
+    )
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=policy, filesystem=FILESYSTEM
+    )
+
+    assert observation.classification.value.startswith("malformed_")
+    assert observation.stored_bytes is None
+
+
+@pytest.mark.parametrize(
+    ("name", "field"),
+    [
+        (_CacheDocumentName.COMPLETE, "cache_entry_contract_version"),
+        (_CacheDocumentName.METADATA, "cache_entry_contract_version"),
+        (_CacheDocumentName.MANIFEST, "manifest_version"),
+    ],
+)
+def test_internal_document_reader_classifies_future_top_level_versions(tmp_path, name, field):
+    entry = _make_complete_entry(tmp_path / "entry")
+    _write_valid_documents(entry)
+    data = _document_dict(name)
+    data[field] = 2
+    data["future"] = {"unknown": True}
+    (entry / name.value).write_bytes(canonical_json_bytes(data))
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification is (
+        _CacheDocumentClassification.UNSUPPORTED_MANIFEST_VERSION
+        if name is _CacheDocumentName.MANIFEST
+        else _CacheDocumentClassification.UNSUPPORTED_ENTRY_VERSION
+    )
+
+
+@pytest.mark.parametrize(
+    ("nested", "field", "classification"),
+    [
+        ("cache_key", "canonical_version", _CacheDocumentClassification.UNSUPPORTED_CACHE_KEY_VERSION),
+        (
+            "runtime_fingerprint",
+            "schema_version",
+            _CacheDocumentClassification.UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION,
+        ),
+    ],
+)
+def test_internal_metadata_reader_classifies_future_nested_versions(
+    tmp_path, nested, field, classification
+):
+    entry = _make_complete_entry(tmp_path / "entry")
+    _write_valid_documents(entry)
+    data = _document_dict(_CacheDocumentName.METADATA)
+    data[nested][field] = 2
+    data["future"] = True
+    (entry / "metadata.json").write_bytes(canonical_json_bytes(data))
+
+    observation = _read_and_parse_cache_document(
+        entry,
+        _CacheDocumentName.METADATA,
+        policy=CacheLookupVerificationPolicy(),
+        filesystem=FILESYSTEM,
+    )
+
+    assert observation.classification is classification
+
+
+@pytest.mark.parametrize("malformed", [None, True, "1", 0, -1])
+@pytest.mark.parametrize(
+    ("name", "field"),
+    [
+        (_CacheDocumentName.COMPLETE, "cache_entry_contract_version"),
+        (_CacheDocumentName.METADATA, "cache_entry_contract_version"),
+        (_CacheDocumentName.MANIFEST, "manifest_version"),
+    ],
+)
+def test_internal_document_reader_keeps_malformed_discriminators_malformed(
+    tmp_path, name, field, malformed
+):
+    entry = _make_complete_entry(tmp_path / "entry")
+    _write_valid_documents(entry)
+    data = _document_dict(name)
+    if malformed is None:
+        data.pop(field)
+    else:
+        data[field] = malformed
+    (entry / name.value).write_bytes(canonical_json_bytes(data))
+
+    observation = _read_and_parse_cache_document(
+        entry, name, policy=CacheLookupVerificationPolicy(), filesystem=FILESYSTEM
+    )
+
+    assert observation.classification.value.startswith("malformed_")
+
+
+def test_internal_document_surface_does_not_add_public_lookup_or_hash_payload():
+    import engine.storage.cache_lookup as cache_lookup
+
+    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
+    assert not hasattr(cache_lookup, "hash_payload")

@@ -9,11 +9,23 @@ from __future__ import annotations
 
 import os
 import errno
+import json
 import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+
+from .persistent_cache import (
+    CACHE_ENTRY_CONTRACT_VERSION,
+    CACHE_KEY_CANONICAL_VERSION,
+    PAYLOAD_MANIFEST_VERSION,
+    RUNTIME_FINGERPRINT_SCHEMA_VERSION,
+    CacheEntryContractError,
+    CacheEntryMetadata,
+    CompletenessMarker,
+    PayloadManifest,
+)
 
 
 DEFAULT_MAX_COMPLETE_BYTES = 4 * 1024
@@ -537,4 +549,258 @@ def _inspect_final_entry_structure(
         missing_names=missing_names,
         unexpected_names=unexpected_names,
         unsafe_names=unsafe_names,
+    )
+
+
+class _CacheDocumentName(str, Enum):
+    COMPLETE = "COMPLETE"
+    METADATA = "metadata.json"
+    MANIFEST = "manifest.json"
+
+
+class _CacheDocumentClassification(str, Enum):
+    """Internal 5B2B classifications compatible with locked Step 5B reasons."""
+
+    VALID = "valid"
+    MALFORMED_COMPLETE = "malformed_complete"
+    MALFORMED_METADATA = "malformed_metadata"
+    MALFORMED_MANIFEST = "malformed_manifest"
+    UNSUPPORTED_ENTRY_VERSION = "unsupported_entry_version"
+    UNSUPPORTED_MANIFEST_VERSION = "unsupported_manifest_version"
+    UNSUPPORTED_CACHE_KEY_VERSION = "unsupported_cache_key_version"
+    UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION = (
+        "unsupported_runtime_fingerprint_version"
+    )
+
+
+_CACHE_DOCUMENT_LIMIT_FIELDS = {
+    _CacheDocumentName.COMPLETE: "max_complete_bytes",
+    _CacheDocumentName.METADATA: "max_metadata_bytes",
+    _CacheDocumentName.MANIFEST: "max_manifest_bytes",
+}
+_CACHE_DOCUMENT_MALFORMED_CLASSIFICATIONS = {
+    _CacheDocumentName.COMPLETE: _CacheDocumentClassification.MALFORMED_COMPLETE,
+    _CacheDocumentName.METADATA: _CacheDocumentClassification.MALFORMED_METADATA,
+    _CacheDocumentName.MANIFEST: _CacheDocumentClassification.MALFORMED_MANIFEST,
+}
+_CACHE_DOCUMENT_MODEL_TYPES = {
+    _CacheDocumentName.COMPLETE: CompletenessMarker,
+    _CacheDocumentName.METADATA: CacheEntryMetadata,
+    _CacheDocumentName.MANIFEST: PayloadManifest,
+}
+
+
+@dataclass(frozen=True)
+class _CacheDocumentObservation:
+    name: _CacheDocumentName
+    classification: _CacheDocumentClassification
+    stored_bytes: bytes | None = None
+    model: CompletenessMarker | CacheEntryMetadata | PayloadManifest | None = None
+    observed_versions: tuple[tuple[str, int], ...] = ()
+    stable_read: bool | None = None
+
+
+@dataclass(frozen=True)
+class _FinalEntryDocumentsObservation:
+    classification: _CacheDocumentClassification
+    complete: _CacheDocumentObservation
+    metadata: _CacheDocumentObservation | None = None
+    manifest: _CacheDocumentObservation | None = None
+
+
+class _VersionProbeError(ValueError):
+    """Internal signal for malformed bounded version-discriminator input."""
+
+
+def _duplicate_rejecting_json_object(
+    items: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in items:
+        if key in result:
+            raise _VersionProbeError("Duplicate JSON key in version probe.")
+        result[key] = value
+    return result
+
+
+def _probe_json_object(stored_bytes: bytes) -> dict[str, object]:
+    if stored_bytes.startswith(b"\xef\xbb\xbf"):
+        raise _VersionProbeError("Version probe rejects a BOM.")
+    try:
+        text = stored_bytes.decode("utf-8")
+        value = json.loads(
+            text,
+            object_pairs_hook=_duplicate_rejecting_json_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                _VersionProbeError("Version probe rejects non-finite values.")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise _VersionProbeError("Version probe requires bounded strict JSON.") from exc
+    if type(value) is not dict:
+        raise _VersionProbeError("Versioned document must be a JSON object.")
+    return value
+
+
+def _version_discriminator(
+    container: object, field_name: str, diagnostic_name: str
+) -> tuple[str, int]:
+    if type(container) is not dict or field_name not in container:
+        raise _VersionProbeError(f"Missing {diagnostic_name} discriminator.")
+    value = container[field_name]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _VersionProbeError(f"Malformed {diagnostic_name} discriminator.")
+    return diagnostic_name, value
+
+
+def _probe_cache_document_versions(
+    name: _CacheDocumentName, stored_bytes: bytes
+) -> tuple[tuple[tuple[str, int], ...], _CacheDocumentClassification | None]:
+    data = _probe_json_object(stored_bytes)
+
+    if name is _CacheDocumentName.MANIFEST:
+        observed = _version_discriminator(data, "manifest_version", "manifest")
+        unsupported = (
+            _CacheDocumentClassification.UNSUPPORTED_MANIFEST_VERSION
+            if observed[1] != PAYLOAD_MANIFEST_VERSION
+            else None
+        )
+        return (observed,), unsupported
+
+    entry = _version_discriminator(
+        data, "cache_entry_contract_version", "entry"
+    )
+    if entry[1] != CACHE_ENTRY_CONTRACT_VERSION:
+        return (entry,), _CacheDocumentClassification.UNSUPPORTED_ENTRY_VERSION
+    if name is _CacheDocumentName.COMPLETE:
+        return (entry,), None
+
+    cache_key = _version_discriminator(
+        data.get("cache_key"), "canonical_version", "cache_key"
+    )
+    if cache_key[1] != CACHE_KEY_CANONICAL_VERSION:
+        return (
+            entry,
+            cache_key,
+        ), _CacheDocumentClassification.UNSUPPORTED_CACHE_KEY_VERSION
+
+    runtime = _version_discriminator(
+        data.get("runtime_fingerprint"), "schema_version", "runtime_fingerprint"
+    )
+    if runtime[1] != RUNTIME_FINGERPRINT_SCHEMA_VERSION:
+        return (
+            entry,
+            cache_key,
+            runtime,
+        ), _CacheDocumentClassification.UNSUPPORTED_RUNTIME_FINGERPRINT_VERSION
+    return (entry, cache_key, runtime), None
+
+
+def _read_and_parse_cache_document(
+    entry_path: str | Path,
+    name: _CacheDocumentName,
+    *,
+    policy: CacheLookupVerificationPolicy,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> _CacheDocumentObservation:
+    """Bounded-read, probe, and strictly parse one contract document."""
+
+    if not isinstance(name, _CacheDocumentName):
+        raise TypeError("name must be a _CacheDocumentName.")
+    if not isinstance(policy, CacheLookupVerificationPolicy):
+        raise TypeError("policy must be a CacheLookupVerificationPolicy.")
+    if not isinstance(filesystem, ReadOnlyCacheFilesystem):
+        raise TypeError("filesystem must implement ReadOnlyCacheFilesystem.")
+
+    read = filesystem.read_regular_file_bounded(
+        Path(entry_path) / name.value,
+        max_bytes=getattr(policy, _CACHE_DOCUMENT_LIMIT_FIELDS[name]),
+    )
+    malformed = _CACHE_DOCUMENT_MALFORMED_CLASSIFICATIONS[name]
+    if read.limit_exceeded:
+        return _CacheDocumentObservation(
+            name,
+            malformed,
+            stable_read=read.stable_read,
+        )
+    assert read.data is not None
+
+    try:
+        observed_versions, unsupported = _probe_cache_document_versions(name, read.data)
+    except _VersionProbeError:
+        return _CacheDocumentObservation(
+            name,
+            malformed,
+            stored_bytes=read.data,
+            stable_read=read.stable_read,
+        )
+    if unsupported is not None:
+        return _CacheDocumentObservation(
+            name,
+            unsupported,
+            stored_bytes=read.data,
+            observed_versions=observed_versions,
+            stable_read=read.stable_read,
+        )
+
+    model_type = _CACHE_DOCUMENT_MODEL_TYPES[name]
+    try:
+        model = model_type.from_json(read.data)
+    except CacheEntryContractError:
+        return _CacheDocumentObservation(
+            name,
+            malformed,
+            stored_bytes=read.data,
+            observed_versions=observed_versions,
+            stable_read=read.stable_read,
+        )
+    return _CacheDocumentObservation(
+        name,
+        _CacheDocumentClassification.VALID,
+        stored_bytes=read.data,
+        model=model,
+        observed_versions=observed_versions,
+        stable_read=read.stable_read,
+    )
+
+
+def _read_and_parse_final_entry_documents(
+    entry_path: str | Path,
+    *,
+    policy: CacheLookupVerificationPolicy,
+    filesystem: ReadOnlyCacheFilesystem = DEFAULT_READ_ONLY_FILESYSTEM,
+) -> _FinalEntryDocumentsObservation:
+    """Process COMPLETE, metadata, then manifest; stop at the first rejection."""
+
+    complete = _read_and_parse_cache_document(
+        entry_path,
+        _CacheDocumentName.COMPLETE,
+        policy=policy,
+        filesystem=filesystem,
+    )
+    if complete.classification is not _CacheDocumentClassification.VALID:
+        return _FinalEntryDocumentsObservation(complete.classification, complete)
+
+    metadata = _read_and_parse_cache_document(
+        entry_path,
+        _CacheDocumentName.METADATA,
+        policy=policy,
+        filesystem=filesystem,
+    )
+    if metadata.classification is not _CacheDocumentClassification.VALID:
+        return _FinalEntryDocumentsObservation(
+            metadata.classification, complete, metadata
+        )
+
+    manifest = _read_and_parse_cache_document(
+        entry_path,
+        _CacheDocumentName.MANIFEST,
+        policy=policy,
+        filesystem=filesystem,
+    )
+    return _FinalEntryDocumentsObservation(
+        manifest.classification,
+        complete,
+        metadata,
+        manifest,
     )
