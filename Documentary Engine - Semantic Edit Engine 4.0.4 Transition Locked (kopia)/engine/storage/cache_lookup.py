@@ -615,6 +615,58 @@ class _CacheVerificationLevel(str, Enum):
     FULL_PAYLOAD_SHA256 = "full_payload_sha256"
 
 
+class PayloadCardinalityExpectation(str, Enum):
+    NON_EMPTY_REQUIRED = "non_empty_required"
+    EMPTY_ALLOWED = "empty_allowed"
+
+
+@dataclass(frozen=True, init=False)
+class ProducerPayloadExpectation:
+    """Trusted Step 5B producer semantics, not serialized cache metadata."""
+
+    cardinality: PayloadCardinalityExpectation
+
+    def __init__(self) -> None:
+        object.__setattr__(
+            self,
+            "cardinality",
+            PayloadCardinalityExpectation.NON_EMPTY_REQUIRED,
+        )
+
+
+def _trusted_producer_payload_expectation(
+    cardinality: PayloadCardinalityExpectation,
+) -> ProducerPayloadExpectation:
+    """Internal adapter/registry boundary for explicit producer semantics."""
+
+    if not isinstance(cardinality, PayloadCardinalityExpectation):
+        raise TypeError("cardinality must be a PayloadCardinalityExpectation.")
+    expectation = ProducerPayloadExpectation()
+    object.__setattr__(expectation, "cardinality", cardinality)
+    return expectation
+
+
+def _payload_cardinality_is_valid(
+    expectation: ProducerPayloadExpectation,
+    *,
+    payload_file_count: int,
+    payload_total_bytes: int,
+    manifest: PayloadManifest,
+) -> bool:
+    """Apply trusted producer cardinality after Step 5A summary validation."""
+
+    if not isinstance(expectation, ProducerPayloadExpectation):
+        raise TypeError("expectation must be a ProducerPayloadExpectation.")
+    _validate_payload_summary(
+        payload_file_count,
+        payload_total_bytes,
+        manifest,
+    )
+    return bool(manifest.files) or (
+        expectation.cardinality is PayloadCardinalityExpectation.EMPTY_ALLOWED
+    )
+
+
 @dataclass(frozen=True)
 class _CacheArtifactExpectation:
     artifact_kind: str

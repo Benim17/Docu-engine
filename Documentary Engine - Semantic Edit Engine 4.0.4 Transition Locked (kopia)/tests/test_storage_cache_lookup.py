@@ -44,6 +44,8 @@ from engine.storage.cache_lookup import (
     FileIdentity,
     FilesystemObjectType,
     LocalReadOnlyCacheFilesystem,
+    PayloadCardinalityExpectation,
+    ProducerPayloadExpectation,
     ReadOnlyCacheFilesystem,
     SymlinkRejectedError,
     UnstableFilesystemObjectError,
@@ -58,9 +60,11 @@ from engine.storage.cache_lookup import (
     _ObservedCacheEntryMetadataV1,
     _inspect_final_entry_structure,
     _parse_observed_cache_entry_metadata_v1,
+    _payload_cardinality_is_valid,
     _read_and_parse_cache_document,
     _read_and_parse_final_entry_documents,
     _validate_final_entry_document_integrity,
+    _trusted_producer_payload_expectation,
 )
 
 
@@ -1314,6 +1318,125 @@ def test_step5b2c_never_accesses_payload_locks_or_public_lookup(tmp_path):
     assert result.classification is _CacheDocumentIntegrityClassification.VALID
     assert before == after
     assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert not hasattr(cache_lookup, "HIT")
+    assert not hasattr(cache_lookup, "MISS")
+    assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
+
+
+def test_payload_cardinality_expectation_has_exact_locked_members():
+    assert tuple(PayloadCardinalityExpectation) == (
+        PayloadCardinalityExpectation.NON_EMPTY_REQUIRED,
+        PayloadCardinalityExpectation.EMPTY_ALLOWED,
+    )
+    assert {item.name for item in fields(ProducerPayloadExpectation)} == {
+        "cardinality"
+    }
+
+
+def test_default_producer_payload_expectation_is_immutable_non_empty_required():
+    expectation = ProducerPayloadExpectation()
+
+    assert (
+        expectation.cardinality
+        is PayloadCardinalityExpectation.NON_EMPTY_REQUIRED
+    )
+    with pytest.raises(FrozenInstanceError):
+        expectation.cardinality = PayloadCardinalityExpectation.EMPTY_ALLOWED
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [PayloadCardinalityExpectation.EMPTY_ALLOWED, "empty_allowed", None, True],
+)
+def test_generic_producer_payload_expectation_cannot_select_cardinality(invalid):
+    with pytest.raises(TypeError):
+        ProducerPayloadExpectation(invalid)
+
+
+@pytest.mark.parametrize("invalid", ["empty_allowed", None, True, 1])
+def test_trusted_payload_expectation_factory_rejects_wrong_cardinality_type(invalid):
+    with pytest.raises(TypeError, match="PayloadCardinalityExpectation"):
+        _trusted_producer_payload_expectation(invalid)
+
+
+def test_private_trusted_producer_boundary_can_explicitly_allow_empty_payload():
+    expectation = _trusted_producer_payload_expectation(
+        PayloadCardinalityExpectation.EMPTY_ALLOWED
+    )
+
+    assert expectation == _trusted_producer_payload_expectation(
+        PayloadCardinalityExpectation.EMPTY_ALLOWED
+    )
+    assert expectation.cardinality is PayloadCardinalityExpectation.EMPTY_ALLOWED
+
+
+def test_payload_expectation_has_no_serialized_metadata_construction_path():
+    assert not hasattr(ProducerPayloadExpectation, "from_dict")
+    assert not hasattr(ProducerPayloadExpectation, "from_json")
+    assert not hasattr(ProducerPayloadExpectation, "parse")
+
+
+def test_non_empty_required_rejects_empty_and_accepts_non_empty_document_state():
+    expectation = ProducerPayloadExpectation()
+    empty_manifest = PayloadManifest(())
+    non_empty_manifest = _valid_document_models()[2]
+
+    assert not _payload_cardinality_is_valid(
+        expectation,
+        payload_file_count=0,
+        payload_total_bytes=0,
+        manifest=empty_manifest,
+    )
+    assert _payload_cardinality_is_valid(
+        expectation,
+        payload_file_count=1,
+        payload_total_bytes=7,
+        manifest=non_empty_manifest,
+    )
+
+
+def test_empty_allowed_accepts_only_summary_consistent_empty_document_state():
+    expectation = _trusted_producer_payload_expectation(
+        PayloadCardinalityExpectation.EMPTY_ALLOWED
+    )
+    empty_manifest = PayloadManifest(())
+
+    assert _payload_cardinality_is_valid(
+        expectation,
+        payload_file_count=0,
+        payload_total_bytes=0,
+        manifest=empty_manifest,
+    )
+    with pytest.raises(CacheEntryContractError, match="byte total"):
+        _payload_cardinality_is_valid(
+            expectation,
+            payload_file_count=0,
+            payload_total_bytes=1,
+            manifest=empty_manifest,
+        )
+
+
+def test_empty_allowed_does_not_bypass_other_document_summary_integrity():
+    expectation = _trusted_producer_payload_expectation(
+        PayloadCardinalityExpectation.EMPTY_ALLOWED
+    )
+    manifest = _valid_document_models()[2]
+
+    with pytest.raises(CacheEntryContractError, match="count"):
+        _payload_cardinality_is_valid(
+            expectation,
+            payload_file_count=0,
+            payload_total_bytes=7,
+            manifest=manifest,
+        )
+
+
+def test_payload_cardinality_prerequisite_adds_no_step5b3_io_or_public_lookup():
+    import engine.storage.cache_lookup as cache_lookup
+
+    assert not hasattr(cache_lookup, "lookup_cache_entry")
+    assert not hasattr(cache_lookup, "hash_payload")
+    assert not hasattr(cache_lookup, "observe_lock")
     assert not hasattr(cache_lookup, "HIT")
     assert not hasattr(cache_lookup, "MISS")
     assert not hasattr(cache_lookup, "LOCKED_OR_IN_PROGRESS")
