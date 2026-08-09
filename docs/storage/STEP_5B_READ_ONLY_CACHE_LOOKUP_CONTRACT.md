@@ -1,9 +1,16 @@
 # Step 5B — Read-Only Persistent Cache Lookup Contract
 
-Status: **DESIGN PROPOSAL — not approved for implementation**
+Status: **RECONCILED DESIGN — BLOCKED ON LOCK-LIFECYCLE CONTRACT**
 Branch: `feature/cache-storage-foundation`
 Baseline: `0c6974a7cf64c761b55f9d944ce4b1de2b9bf755`
 Scope: **Read-only validation of one expected final cache entry; no production implementation in this document**
+
+Authority: `STEP_5_VERSIONED_PERSISTENT_CACHE_ENTRY_CONTRACT.md` is the
+higher-level locked normative contract. This document refines it without
+overriding its observable behavior. Step 5B1 is implemented at `fb5c72a`.
+Structure and document validation helpers are the next implementation unit
+after the lock-lifecycle dependency identified in section 21.1 is approved;
+they must remain internal and must not expose contract-complete `MISS` results.
 
 ## 1. Purpose and scope
 
@@ -21,7 +28,10 @@ A lookup:
 8. returns a structured `CacheLookupResult` for expected cache states; and
 9. never mutates filesystem or process state.
 
-Step 5B never scans sibling digests, shards, namespaces, staging areas, lock areas, or unrelated roots. `logical_id` is informational metadata and never participates in path selection.
+Step 5B never scans sibling digests, shards, namespaces, staging areas, unrelated
+locks, or unrelated roots. When the expected final entry is absent, it may inspect
+only the matching lock derived from the validated namespace and cache key.
+`logical_id` is informational metadata and never participates in path selection.
 
 ## 2. Explicit non-goals
 
@@ -29,7 +39,8 @@ Step 5B does not implement or authorize:
 
 - cache writes or directory creation;
 - staging or promotion;
-- lock acquisition, lock refresh, lock-file creation, or lock recovery;
+- lock acquisition, lock refresh, lock-file creation, lock release, lock breaking,
+  lock deletion, or lock recovery;
 - repair, deletion, cleanup, eviction, or quota enforcement;
 - quarantine or migration;
 - a persistent cache index;
@@ -213,7 +224,7 @@ Step 5B preserves the locked Step 5A status enum exactly. Each `CacheLookupReaso
 | Precedence | `CacheLookupReason` | `CacheLookupStatus` | Meaning |
 |---:|---|---|---|
 | 1 | `UNSAFE_PATH` | `UNSAFE_PATH` | Root or expected path containment cannot be proven. |
-| 2 | `UNSAFE_OBJECT` | `UNSAFE_PATH` | Symlink, FIFO, socket, device, unsupported object, or detectable hardlink is present. |
+| 2 | `UNSAFE_OBJECT` | `UNSAFE_PATH` | Symlink, FIFO, socket, device, or unsupported special object is present. |
 | 3 | `UNSUPPORTED_ENTRY_VERSION` | `UNSUPPORTED_VERSION` | Recognizable entry version is not supported. |
 | 4 | `UNSUPPORTED_MANIFEST_VERSION` | `UNSUPPORTED_VERSION` | Recognizable manifest version is not supported. |
 | 5 | `UNSUPPORTED_CACHE_KEY_VERSION` | `UNSUPPORTED_VERSION` | Cache-key canonical version is recognizable but unsupported. |
@@ -233,17 +244,26 @@ Step 5B preserves the locked Step 5A status enum exactly. Each `CacheLookupReaso
 | 19 | `PAYLOAD_MISSING` | `INTEGRITY_FAILURE` | A manifest-declared payload path is absent. |
 | 20 | `PAYLOAD_SIZE_MISMATCH` | `INTEGRITY_FAILURE` | Observed size differs from the manifest. |
 | 21 | `PAYLOAD_DIGEST_MISMATCH` | `INTEGRITY_FAILURE` | SHA-256 differs from the manifest. |
-| 22 | `NAMESPACE_PRODUCER_CONFLICT` | `PRODUCER_MISMATCH` | Metadata namespace and producer identity disagree. |
-| 23 | `PRODUCER_MISMATCH` | `PRODUCER_MISMATCH` | Observed producer ID differs from the expected producer. |
-| 24 | `SCHEMA_MISMATCH` | `SCHEMA_MISMATCH` | Observed producer schema differs from the expected schema. |
-| 25 | `ARTIFACT_MISMATCH` | `SCHEMA_MISMATCH` | Expected artifact kind/version, or explicitly expected logical ID, differs. |
-| 26 | `RUNTIME_FINGERPRINT_MISMATCH` | `RUNTIME_FINGERPRINT_MISMATCH` | Exact runtime fingerprint equality fails. |
+| 22 | `PAYLOAD_HARDLINK_DETECTED` | `INTEGRITY_FAILURE` | A payload regular file has a detectable link count greater than one. |
+| 23 | `NAMESPACE_PRODUCER_CONFLICT` | `PRODUCER_MISMATCH` | Metadata namespace and producer identity disagree. |
+| 24 | `PRODUCER_MISMATCH` | `PRODUCER_MISMATCH` | Observed producer ID differs from the expected producer. |
+| 25 | `SCHEMA_MISMATCH` | `SCHEMA_MISMATCH` | Observed producer schema differs from the expected schema. |
+| 26 | `ARTIFACT_MISMATCH` | `SCHEMA_MISMATCH` | Expected artifact kind/version, or explicitly expected logical ID, differs. |
+| 27 | `RUNTIME_FINGERPRINT_MISMATCH` | `RUNTIME_FINGERPRINT_MISMATCH` | Exact runtime fingerprint equality fails. |
 
-`HIT` and `MISS` use `reason=None`. The existing `LOCKED_OR_IN_PROGRESS` status remains reserved and is never emitted by Step 5B. The family order preserves locked Step 5 section 23.9: unsafe, unsupported, invalid, integrity, producer, schema, runtime, lock, miss, hit.
+`HIT`, `MISS`, and `LOCKED_OR_IN_PROGRESS` use `reason=None`.
+`LOCKED_OR_IN_PROGRESS` is emitted only when the expected final entry is absent
+and the single matching lock is active under the approved lock-lifecycle contract.
+The family order preserves locked Step 5 section 23.9: unsafe, unsupported,
+invalid, integrity, producer, schema, runtime, lock, miss, hit.
 
 ### 5.2 Absence is narrow
 
-Only absence of the expected final-entry path is `MISS`. Missing descendants are `INCOMPLETE_ENTRY`; unreadable, malformed, incompatible, or corrupt entries never become a miss.
+`MISS` means the expected final-entry path is absent and the single matching lock
+is not active under the approved lock-lifecycle contract. Missing descendants are
+`INCOMPLETE_ENTRY`; unreadable, malformed, incompatible, or corrupt entries never
+become a miss. Until active-lock semantics are approved and implemented, no partial
+implementation may expose this contract-complete public `MISS` behavior.
 
 ## 6. Filesystem object policy
 
@@ -260,13 +280,19 @@ A valid final entry contains exactly:
 
 Policy:
 
-- Absent expected entry: `MISS`.
+- Absent expected entry: inspect only the matching lock read-only; return
+  `LOCKED_OR_IN_PROGRESS` when it is active, otherwise `MISS`.
 - Entry path is a regular file or other non-directory: `UNSAFE_OBJECT`.
 - Symlink at entry, any ancestor below the validated root, any contract document, `payload/`, or any payload path: `UNSAFE_OBJECT`; never follow it.
 - Metadata, manifest, or marker that is a directory or special object: `UNSAFE_OBJECT`.
 - FIFO, socket, block device, character device, or unknown file type anywhere inspected: `UNSAFE_OBJECT`; never open it.
 - Nested payload directories: `UNEXPECTED_PAYLOAD_OBJECT`. Contract v1 represents slash-containing manifest paths but the locked top-level text also says nested payloads may exist. Step 5B resolves this by permitting intermediate directories only when they are required prefixes of declared manifest paths, contain no undeclared descendants, are not symlinks, and pass stability checks. All other directories are rejected.
-- Detectable link count greater than one for a payload regular file: `UNSAFE_OBJECT`, implementing the locked hardlink policy. Contract documents with link count greater than one are also rejected conservatively.
+- Detectable link count greater than one for a payload regular file:
+  `status=INTEGRITY_FAILURE`, `reason=PAYLOAD_HARDLINK_DETECTED`.
+- Inability to determine a payload link count is a deterministic diagnostic and
+  platform-capability limitation; it is not automatic corruption.
+- Contract documents are not subject to a separate hardlink classification in
+  contract v1; their type, bounded-read, digest, and stability rules still apply.
 - Unknown top-level regular file or directory: `status=INVALID_ENTRY`, `reason=UNEXPECTED_TOP_LEVEL_OBJECT`.
 - Unknown top-level symlink, FIFO, socket, device, or other unsafe object: `status=UNSAFE_PATH`, `reason=UNSAFE_OBJECT`. Unsafe-object precedence wins even though diagnostics also include `entry.unexpected_top_level_object`.
 - Regular payload file not declared by the manifest: `UNEXPECTED_PAYLOAD_OBJECT`.
@@ -302,22 +328,26 @@ The required order is:
 2. Revalidate cache-root directory identity.
 3. Derive the single expected entry path and digest.
 4. Inspect root-to-entry components without following symlinks.
-5. If the entry is absent, return `MISS`; otherwise require a directory.
-6. Capture entry-directory pre-read identity and enumerate its top-level names once.
-7. Inspect every enumerated top-level name without following symlinks, including unknown names, so unsafe-object precedence is established before generic unexpected-name classification.
-8. Enforce exactly `COMPLETE`, `metadata.json`, `manifest.json`, and `payload`, and enforce their required object types.
-9. Read bounded `COMPLETE`, then metadata, then manifest using no-follow regular-file handles.
-10. Parse recognizable version fields cautiously, then parse all three with strict Step 5A canonical parsers.
-11. Validate expected identity, cross-document identity, namespace/producer consistency, runtime expectation, and optional artifact expectation.
-12. Hash the exact stored metadata and manifest bytes and validate every document digest.
-13. Validate metadata count/byte totals against the manifest through Step 5A `CacheEntryContract`.
-14. Safely enumerate the payload tree in deterministic ordinal relative-path order.
-15. Compare the exact observed regular-file set with the manifest path set.
-16. Inspect types, detectable link counts, and sizes.
-17. Hash every payload file in manifest order.
-18. Recheck each file identity after hashing.
-19. Re-enumerate payload and top-level names and recheck directory/root identities.
-20. Return the highest-precedence deterministic result.
+5. If the entry is absent, derive and inspect only the matching lock read-only;
+   return `LOCKED_OR_IN_PROGRESS` if it is active under the approved lock-lifecycle
+   contract, otherwise return `MISS`.
+6. If the entry exists, require a directory; do not inspect a lock or allow lock
+   state to hide or override any valid or invalid entry result.
+7. Capture entry-directory pre-read identity and enumerate its top-level names once.
+8. Inspect every enumerated top-level name without following symlinks, including unknown names, so unsafe-object precedence is established before generic unexpected-name classification.
+9. Enforce exactly `COMPLETE`, `metadata.json`, `manifest.json`, and `payload`, and enforce their required object types.
+10. Read bounded `COMPLETE`, then metadata, then manifest using no-follow regular-file handles.
+11. Parse recognizable version fields cautiously, then parse all three with strict Step 5A canonical parsers.
+12. Validate expected identity, cross-document identity, namespace/producer consistency, runtime expectation, and optional artifact expectation.
+13. Hash the exact stored metadata and manifest bytes and validate every document digest.
+14. Validate metadata count/byte totals against the manifest through Step 5A `CacheEntryContract`.
+15. Safely enumerate the payload tree in deterministic ordinal relative-path order.
+16. Compare the exact observed regular-file set with the manifest path set.
+17. Inspect types, detectable link counts, and sizes.
+18. Hash every payload file in manifest order.
+19. Recheck each file identity after hashing.
+20. Re-enumerate payload and top-level names and recheck directory/root identities.
+21. Return the highest-precedence deterministic result.
 
 Reading `COMPLETE` first cheaply establishes intended completeness and version while conveying no trust. Documents precede payload traversal so hostile or oversized manifests cannot trigger arbitrary enumeration. Stored document digests are checked before expensive payload hashing. Post-read checks prevent a changing snapshot from being accepted silently.
 
@@ -541,7 +571,13 @@ Step 5B implementation is not approved until tests cover:
 - valid empty entry only with trusted producer-derived `EMPTY_ALLOWED` cardinality;
 - empty entry rejected under the default `NON_EMPTY_REQUIRED` cardinality;
 - proof that ordinary UI or generic configuration cannot construct or override `EMPTY_ALLOWED`;
-- absent expected entry;
+- absent expected entry plus an active matching lock returns `LOCKED_OR_IN_PROGRESS`;
+- absent expected entry plus no lock returns `MISS`;
+- absent expected entry plus a non-active or stale matching lock returns `MISS`,
+  once those terms are defined by the approved lock-lifecycle contract;
+- valid final entry plus any matching lock still returns `HIT`;
+- invalid final entry plus any matching lock returns the entry validation failure;
+- unrelated locks are never scanned or used;
 - proof that siblings and unrelated namespaces are never scanned.
 
 ### 18.2 Structure and object safety
@@ -555,7 +591,9 @@ Step 5B implementation is not approved until tests cover:
 - undeclared payload file;
 - nested required directory and unexpected nested directory;
 - FIFO, socket, device, and unknown object where the platform permits;
-- detectable hardlink ambiguity;
+- detectable payload hardlink classified as `INTEGRITY_FAILURE` /
+  `PAYLOAD_HARDLINK_DETECTED`;
+- unavailable hardlink evidence handled deterministically as a platform limitation;
 - no-follow adapter behavior.
 
 ### 18.3 Documents and versions
@@ -603,7 +641,8 @@ Step 5B implementation is not approved until tests cover:
 - deterministic diagnostic sorting, deduplication, sanitization, and truncation;
 - observer success and failure do not alter results;
 - no filesystem mutation;
-- no calls to write, create, rename, delete, chmod, lock, repair, or cleanup APIs;
+- no calls to write, create, rename, delete, chmod, acquire, refresh, release,
+  break, repair, or cleanup APIs; read-only matching-lock inspection is allowed;
 - inventory remains separate and unchanged;
 - all Step 5A and previous storage tests remain passing;
 - full project regression remains passing.
@@ -616,7 +655,6 @@ Reserved for separately approved later work:
 - staging directory creation;
 - promotion and atomic rename;
 - lock ownership, heartbeat, and release;
-- lock-aware miss classification;
 - interrupted-write recovery and stale-lock handling;
 - repair, quarantine, migration, deletion, cleanup, and eviction;
 - persistent cache index;
@@ -626,7 +664,7 @@ Step 5B results never authorize any of these actions.
 
 ## 20. Proposed implementation decomposition
 
-This is a future plan only:
+Step 5B1 is implemented. The remaining units are a gated implementation plan:
 
 ### Step 5B1 — Read-only adapter and limits
 
@@ -655,21 +693,42 @@ This is a future plan only:
 - directory re-enumeration;
 - deterministic broad statuses, detailed reasons, and sanitized diagnostics;
 - observability isolation.
+- internal read-only observation of only the matching lock, dependent on an
+  approved lock-lifecycle contract defining active, stale, malformed, and I/O cases.
 
-### Step 5B5 — Regression and integration hardening
+### Step 5B5 — Public lookup orchestration and regression/integration hardening
 
+- compose entry validation and matching-lock observation into the public lookup;
+- expose `LOCKED_OR_IN_PROGRESS` and contract-complete `MISS` only here;
 - adversarial filesystem tests;
 - platform-specific no-follow tests;
 - Step 5A/storage/full regression;
 - public export review only after behavior is locked.
 
-No unit introduces writing, locking, repair, cleanup, indexing, producer execution, or rendering integration.
+No unit acquires or mutates locks or introduces writing, repair, cleanup, indexing,
+producer execution, or rendering integration. Before Step 5B5, lower-level helpers
+remain internal and must not claim final public `MISS` semantics.
 
 ## 21. Ambiguities and conservative resolutions
 
 ### 21.1 Lock-aware absence
 
-The locked Step 5 contract describes `LOCKED_OR_IN_PROGRESS` when the final entry is absent and a matching active lock exists. This Step 5B brief limits inspection to the expected final entry and required descendants and makes lock handling a non-goal. Step 5B therefore returns `MISS` for an absent final entry and never inspects the lock path. `LOCKED_OR_IN_PROGRESS` remains reserved for a later lock-aware layer.
+The locked Step 5 contract requires `LOCKED_OR_IN_PROGRESS` when the final entry is
+absent and the matching lock is active. Step 5B therefore includes narrowly scoped,
+read-only observation of only the lock derived by Step 5A `derive_lock_path()` for the
+validated namespace and cache key. It never scans lock siblings. A present final
+entry is validated without consulting or being overridden by lock state.
+
+The repository does not yet contain sufficient normative semantics to decide whether
+a matching lock is active. Section 11 of the locked parent contract recommends fields
+and lists conditions for recovery eligibility, but it does not lock a schema/parser,
+freshness threshold and source, clock behavior, active/stale predicate, or malformed,
+unsupported, permission, and I/O classifications. Pure lock-path derivation alone is
+insufficient. The smallest next design task is a locked, read-only lock-lifecycle
+observation contract covering those points. Step 5B4 lock observation and Step 5B5
+public orchestration remain blocked on that dependency. Step 5B2 and Step 5B3 may be
+implemented only as internal helpers after explicit approval; they may not expose a
+public result that treats bare entry absence as a contract-complete `MISS`.
 
 ### 21.2 Nested payload directories
 
@@ -704,5 +763,6 @@ The Step 5B design is ready for implementation review only when reviewers agree 
 - resource use is explicitly bounded;
 - unstable reads cannot become hits;
 - diagnostics are deterministic and sanitized;
-- inventory, locking, recovery, mutation, indexing, producers, and rendering remain outside Step 5B; and
+- inventory, lock mutation/management, recovery, mutation, indexing, producers,
+  and rendering remain outside Step 5B; read-only matching-lock observation is included; and
 - this document adds no production behavior.
