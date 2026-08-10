@@ -169,6 +169,21 @@ from .cache_catalog import (
     upsert_catalog_from_promotion,
     upsert_catalog_from_recovery,
 )
+from .cache_reconciliation import (
+    CacheCatalogReconciliationActionProjection as CacheCatalogReconciliationAction,
+    CacheCatalogReconciliationActionKind,
+    CacheCatalogReconciliationCursor,
+    CacheCatalogReconciliationExpectationResolver,
+    CacheCatalogReconciliationMode,
+    CacheCatalogReconciliationObservationScope,
+    CacheCatalogReconciliationPolicy,
+    CacheCatalogReconciliationProgress,
+    CacheCatalogReconciliationRequest,
+    CacheCatalogReconciliationResult,
+    CacheCatalogReconciliationStatus,
+    ReconciliationReadOnlyFilesystem,
+    reconcile_cache_catalog,
+)
 
 __all__ = [
     "ARTIFACT_CONTRACT_VERSION",
@@ -322,4 +337,17 @@ __all__ = [
     "upsert_catalog_from_lookup",
     "upsert_catalog_from_promotion",
     "upsert_catalog_from_recovery",
+    "CacheCatalogReconciliationAction",
+    "CacheCatalogReconciliationActionKind",
+    "CacheCatalogReconciliationCursor",
+    "CacheCatalogReconciliationExpectationResolver",
+    "CacheCatalogReconciliationMode",
+    "CacheCatalogReconciliationObservationScope",
+    "CacheCatalogReconciliationPolicy",
+    "CacheCatalogReconciliationProgress",
+    "CacheCatalogReconciliationRequest",
+    "CacheCatalogReconciliationResult",
+    "CacheCatalogReconciliationStatus",
+    "ReconciliationReadOnlyFilesystem",
+    "reconcile_cache_catalog",
 ]

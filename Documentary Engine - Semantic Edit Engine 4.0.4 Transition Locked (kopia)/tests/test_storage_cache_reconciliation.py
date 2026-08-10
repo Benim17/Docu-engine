@@ -3,6 +3,8 @@ import hashlib
 from pathlib import Path
 
 import pytest
+import engine.storage.cache_reconciliation as reconciliation_module
+import engine.storage as storage_package
 
 from engine.storage.cache_catalog import (
     CacheCatalogIdentity,
@@ -40,6 +42,8 @@ from engine.storage.cache_reconciliation import (
     CacheCatalogReconciliationActionReason,
     CacheCatalogReconciliationObservation,
     CacheCatalogReconciliationObservationScope,
+    CacheCatalogReconciliationRequest,
+    CacheCatalogReconciliationStatus,
     CatalogSlotClassification,
     DiscoveredCacheIdentity,
     LocalReconciliationReadOnlyFilesystem,
@@ -50,6 +54,7 @@ from engine.storage.cache_reconciliation import (
     ReconciliationSourceFlags,
     ReconciliationResolvedExpectations,
     ReconciliationActionExecutionStatus,
+    ReconciliationActionExecutionResult,
     ReconciliationCheckpoint,
     ReconciliationCheckpointConflictError,
     ReconciliationCheckpointCounters,
@@ -75,6 +80,7 @@ from engine.storage.cache_reconciliation import (
     parse_reconciliation_checkpoint,
     read_reconciliation_checkpoint,
     resume_reconciliation_checkpoint,
+    reconcile_cache_catalog,
 )
 from engine.storage.cache_recovery import (
     CacheRecoveryInspectionRequest,
@@ -1033,3 +1039,209 @@ def test_h2d_local_checkpoint_is_durable_and_never_deleted(tmp_path):
     assert path.read_bytes() == active.canonical_bytes()
     complete = complete_reconciliation_checkpoint(active, backend=backend)
     assert path.exists() and parse_reconciliation_checkpoint(path.read_bytes()) == complete
+
+
+def _install_h2e_no_write_unit(monkeypatch, observed):
+    def observe(discovered, **kwargs):
+        observed.append(discovered.identity)
+        return compare_reconciliation_observation(
+            CacheCatalogReconciliationObservation(
+                discovered.identity, discovered.sources, None, None, None
+            )
+        )
+    def execute(action, **kwargs):
+        return ReconciliationActionExecutionResult(
+            action, ReconciliationActionExecutionStatus.DEFERRED
+        )
+    monkeypatch.setattr(reconciliation_module, "observe_and_compare_reconciliation_identity", observe)
+    monkeypatch.setattr(reconciliation_module, "execute_reconciliation_action", execute)
+
+
+def _h2e_dependencies(tmp_path):
+    root = tmp_path / "orchestration-cache"
+    root.mkdir()
+    for relative in ("entries/v1", "staging/v1", "catalog/v1/records"):
+        (root / relative).mkdir(parents=True)
+    discovery = LocalReconciliationReadOnlyFilesystem.from_root(root)
+    catalog = LocalCacheCatalogBackend.from_root(root)
+    checkpoint = _MemoryCheckpointBackend(discovery.cache_root)
+    return root, discovery, catalog, checkpoint
+
+
+def test_h2e_full_empty_set_completes_and_retain_complete_checkpoint(tmp_path):
+    _, discovery, catalog, checkpoint_backend = _h2e_dependencies(tmp_path)
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.FULL_IN_PLACE
+    )
+    result = reconcile_cache_catalog(
+        request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(),
+        recovery_filesystem=object(), checkpoint_backend=checkpoint_backend,
+    )
+    assert result.status is CacheCatalogReconciliationStatus.COMPLETE
+    assert result.actions == () and result.progress.identities_completed == 0
+    stored = parse_reconciliation_checkpoint(checkpoint_backend.data)
+    assert stored.state is ReconciliationCheckpointState.COMPLETE
+
+
+def test_h2e_repeated_bounded_incremental_runs_are_ordered_and_complete(monkeypatch, tmp_path):
+    _, discovery, catalog, checkpoint_backend = _h2e_dependencies(tmp_path)
+    namespace = CacheNamespace("audio", "producer", 1)
+    identities = tuple(
+        _identity(namespace, CacheKey(f"{value:064x}")) for value in (3, 1, 2)
+    )
+    policy = ReconciliationDiscoveryPolicy(max_identities_per_run=3, page_size=1)
+    observed = []
+    _install_h2e_no_write_unit(monkeypatch, observed)
+    first_request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        policy, False, identities,
+    )
+    first = reconcile_cache_catalog(
+        first_request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    assert first.status is CacheCatalogReconciliationStatus.BUDGET_EXHAUSTED
+    second = reconcile_cache_catalog(
+        replace(first_request, resume_run_id=first.run_id),
+        discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    third = reconcile_cache_catalog(
+        replace(first_request, resume_run_id=first.run_id),
+        discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    assert second.status is CacheCatalogReconciliationStatus.BUDGET_EXHAUSTED
+    assert third.status is CacheCatalogReconciliationStatus.COMPLETE
+    assert observed == sorted(identities, key=lambda item: item.sort_key)
+    assert third.progress.identities_completed == 3
+    assert third.checkpoint_revision == 5
+
+
+@pytest.mark.parametrize("count,page_size", [(1, 1), (2, 2), (2, 3)])
+def test_h2e_exact_and_larger_bounds_complete(monkeypatch, tmp_path, count, page_size):
+    _, discovery, catalog, checkpoint_backend = _h2e_dependencies(tmp_path)
+    namespace = CacheNamespace("audio", "producer", 1)
+    identities = tuple(_identity(namespace, CacheKey(f"{value:064x}")) for value in range(1, count + 1))
+    observed = []
+    _install_h2e_no_write_unit(monkeypatch, observed)
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        ReconciliationDiscoveryPolicy(max_identities_per_run=page_size, page_size=page_size),
+        False, identities,
+    )
+    result = reconcile_cache_catalog(
+        request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    assert result.status is CacheCatalogReconciliationStatus.COMPLETE
+    assert len(result.actions) == count
+
+
+def test_h2e_complete_resume_is_idempotent_and_does_no_work(monkeypatch, tmp_path):
+    _, discovery, catalog, checkpoint_backend = _h2e_dependencies(tmp_path)
+    namespace = CacheNamespace("audio", "producer", 1)
+    identity = _identity(namespace, CacheKey("1" * 64))
+    observed = []
+    _install_h2e_no_write_unit(monkeypatch, observed)
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        ReconciliationDiscoveryPolicy(page_size=1), False, (identity,),
+    )
+    complete = reconcile_cache_catalog(
+        request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    observed.clear()
+    repeated = reconcile_cache_catalog(
+        replace(request, resume_run_id=complete.run_id),
+        discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    assert repeated.status is CacheCatalogReconciliationStatus.COMPLETE
+    assert repeated.actions == () and observed == []
+    assert repeated.checkpoint_revision == complete.checkpoint_revision
+
+
+def test_h2e_run_and_policy_mismatch_return_checkpoint_conflict(monkeypatch, tmp_path):
+    _, discovery, catalog, checkpoint_backend = _h2e_dependencies(tmp_path)
+    identity = _identity(CacheNamespace("audio", "producer", 1), CacheKey("1" * 64))
+    observed = []
+    _install_h2e_no_write_unit(monkeypatch, observed)
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        ReconciliationDiscoveryPolicy(page_size=1), False, (identity,),
+    )
+    first = reconcile_cache_catalog(
+        request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    wrong_run = reconcile_cache_catalog(
+        replace(request, resume_run_id="f" * 32),
+        discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    wrong_policy = reconcile_cache_catalog(
+        replace(request, resume_run_id=first.run_id, policy=ReconciliationDiscoveryPolicy(page_size=2)),
+        discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint_backend,
+    )
+    assert wrong_run.status is CacheCatalogReconciliationStatus.CHECKPOINT_CONFLICT
+    assert wrong_policy.status is CacheCatalogReconciliationStatus.CHECKPOINT_CONFLICT
+
+
+def test_h2e_interruption_does_not_overstate_durable_progress(monkeypatch, tmp_path):
+    _, discovery, catalog, checkpoint_backend = _h2e_dependencies(tmp_path)
+    namespace = CacheNamespace("audio", "producer", 1)
+    identities = tuple(_identity(namespace, CacheKey(f"{value:064x}")) for value in (1, 2))
+    ordered = sorted(identities, key=lambda item: item.sort_key)
+    calls = []
+    def observe(discovered, **kwargs):
+        calls.append(discovered.identity)
+        if discovered.identity == ordered[1]:
+            raise RuntimeError("interrupted unit")
+        return compare_reconciliation_observation(
+            CacheCatalogReconciliationObservation(discovered.identity, discovered.sources, None, None, None)
+        )
+    monkeypatch.setattr(reconciliation_module, "observe_and_compare_reconciliation_identity", observe)
+    monkeypatch.setattr(
+        reconciliation_module, "execute_reconciliation_action",
+        lambda action, **kwargs: ReconciliationActionExecutionResult(
+            action, ReconciliationActionExecutionStatus.DEFERRED
+        ),
+    )
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        ReconciliationDiscoveryPolicy(page_size=2), False, identities,
+    )
+    with pytest.raises(RuntimeError, match="interrupted unit"):
+        reconcile_cache_catalog(
+            request, discovery_filesystem=discovery, catalog_backend=catalog,
+            expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+            checkpoint_backend=checkpoint_backend,
+        )
+    durable = parse_reconciliation_checkpoint(checkpoint_backend.data)
+    assert durable.counters.identities_completed == 1
+    assert durable.last_completed_identity == ordered[0]
+
+
+def test_h2e_package_exports_only_sanitized_action_projection(tmp_path):
+    _, identity, _, lookup = _h2b_evidence(tmp_path)
+    internal = compare_reconciliation_observation(_observation(
+        identity, lookup, CacheCatalogLookupResult(CacheCatalogLookupStatus.RECORD_ABSENT)
+    ))
+    public = storage_package.CacheCatalogReconciliationAction.from_action(internal)
+    assert public.identity == identity
+    assert not hasattr(public, "observation")
+    assert not hasattr(public, "expected_catalog_revision")
+    assert storage_package.reconcile_cache_catalog is reconcile_cache_catalog

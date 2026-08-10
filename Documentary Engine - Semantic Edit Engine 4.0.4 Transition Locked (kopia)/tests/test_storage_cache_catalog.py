@@ -1749,7 +1749,7 @@ def test_h1e_public_exports_exclude_native_and_raw_mutation_helpers():
     result_fields = set(CacheCatalogLookupResult.__dataclass_fields__)
     assert "validated_entry" not in result_fields
     assert all(term not in " ".join(storage.__all__).lower() for term in (
-        "cleanup", "retention", "quota", "pruning", "reconcile", "rebuild"
+        "cleanup", "retention", "quota", "pruning", "rebuild"
     ))
 
 

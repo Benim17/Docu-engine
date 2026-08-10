@@ -196,6 +196,9 @@ class ReconciliationDiscoveryPolicy:
         return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
+CacheCatalogReconciliationPolicy = ReconciliationDiscoveryPolicy
+
+
 @dataclass(frozen=True)
 class CacheCatalogReconciliationCursor:
     mode: CacheCatalogReconciliationMode
@@ -1530,15 +1533,18 @@ class ReconciliationCheckpointCounters:
     catalog_mutations: int = 0
 
     def __post_init__(self) -> None:
-        limits = (
-            (self.identities_completed, 1_024, "identities_completed"),
-            (self.lookup_validations, 1_024, "lookup_validations"),
-            (self.recovery_inspections, 512, "recovery_inspections"),
-            (self.catalog_mutations, 256, "catalog_mutations"),
-        )
-        for value, maximum, name in limits:
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
-                raise ValueError(f"{name} must be an integer from 0 through {maximum}.")
+        for value, name in (
+            (self.identities_completed, "identities_completed"),
+            (self.lookup_validations, "lookup_validations"),
+            (self.recovery_inspections, "recovery_inspections"),
+            (self.catalog_mutations, "catalog_mutations"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 9_223_372_036_854_775_807
+            ):
+                raise ValueError(f"{name} must be a bounded non-negative integer.")
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -1988,3 +1994,325 @@ def complete_reconciliation_checkpoint(
         completed.canonical_bytes(), expected_revision=checkpoint.checkpoint_revision
     )
     return completed
+
+
+class CacheCatalogReconciliationStatus(str, Enum):
+    COMPLETE = "complete"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CHECKPOINT_CONFLICT = "checkpoint_conflict"
+    ROOT_FAILURE = "root_failure"
+    DEPENDENCY_FAILURE = "dependency_failure"
+
+
+@dataclass(frozen=True)
+class CacheCatalogReconciliationRequest:
+    cache_root: ValidatedCacheRoot
+    mode: CacheCatalogReconciliationMode
+    policy: ReconciliationDiscoveryPolicy = ReconciliationDiscoveryPolicy()
+    dry_run: bool = False
+    incremental_identities: tuple[CacheCatalogIdentity, ...] = ()
+    observation_scope: CacheCatalogReconciliationObservationScope = (
+        CacheCatalogReconciliationObservationScope.FINAL_SUFFICIENT
+    )
+    resume_run_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cache_root, ValidatedCacheRoot):
+            raise TypeError("cache_root must be ValidatedCacheRoot.")
+        if not isinstance(self.mode, CacheCatalogReconciliationMode):
+            raise TypeError("mode must be CacheCatalogReconciliationMode.")
+        if not isinstance(self.policy, ReconciliationDiscoveryPolicy):
+            raise TypeError("policy must be ReconciliationDiscoveryPolicy.")
+        if not isinstance(self.dry_run, bool):
+            raise TypeError("dry_run must be bool.")
+        if not isinstance(self.incremental_identities, tuple) or any(
+            not isinstance(item, CacheCatalogIdentity) for item in self.incremental_identities
+        ):
+            raise TypeError("incremental_identities must be an immutable identity tuple.")
+        if len(set(self.incremental_identities)) != len(self.incremental_identities):
+            raise ValueError("incremental identities must be unique.")
+        if len(self.incremental_identities) > MAX_RECONCILIATION_IDENTITIES_PER_RUN:
+            raise ValueError("incremental identities exceed the locked run maximum.")
+        if not isinstance(self.observation_scope, CacheCatalogReconciliationObservationScope):
+            raise TypeError("observation_scope must be CacheCatalogReconciliationObservationScope.")
+        if self.mode is CacheCatalogReconciliationMode.FULL_IN_PLACE:
+            if self.incremental_identities:
+                raise ValueError("full mode does not accept incremental identities.")
+            if self.observation_scope is not CacheCatalogReconciliationObservationScope.FINAL_SUFFICIENT:
+                raise ValueError("full mode requires FINAL_SUFFICIENT observation scope.")
+        elif not self.incremental_identities:
+            raise ValueError("incremental mode requires at least one trusted identity.")
+        if self.resume_run_id is not None and (
+            not isinstance(self.resume_run_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", self.resume_run_id) is None
+        ):
+            raise ValueError("resume_run_id must be an opaque H2 run ID or None.")
+        if self.dry_run and self.resume_run_id is not None:
+            raise ValueError("dry-run uses an in-memory cursor, not a durable run ID.")
+
+
+@dataclass(frozen=True)
+class CacheCatalogReconciliationProgress:
+    identities_completed: int
+    lookup_validations: int
+    recovery_inspections: int
+    catalog_mutations: int
+
+    def __post_init__(self) -> None:
+        ReconciliationCheckpointCounters(
+            self.identities_completed,
+            self.lookup_validations,
+            self.recovery_inspections,
+            self.catalog_mutations,
+        )
+
+
+@dataclass(frozen=True)
+class CacheCatalogReconciliationActionProjection:
+    identity: CacheCatalogIdentity
+    kind: CacheCatalogReconciliationActionKind
+    reason: CacheCatalogReconciliationActionReason
+    sources: ReconciliationSourceFlags
+
+    @classmethod
+    def from_action(cls, action: CacheCatalogReconciliationAction):
+        return cls(action.identity, action.kind, action.reason, action.sources)
+
+
+@dataclass(frozen=True)
+class CacheCatalogReconciliationResult:
+    status: CacheCatalogReconciliationStatus
+    actions: tuple[CacheCatalogReconciliationActionProjection, ...]
+    execution_statuses: tuple[ReconciliationActionExecutionStatus, ...]
+    progress: CacheCatalogReconciliationProgress
+    run_id: str | None = None
+    next_cursor: CacheCatalogReconciliationCursor | None = None
+    checkpoint_revision: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, CacheCatalogReconciliationStatus):
+            raise TypeError("status must be CacheCatalogReconciliationStatus.")
+        if (
+            not isinstance(self.actions, tuple)
+            or not isinstance(self.execution_statuses, tuple)
+            or len(self.actions) != len(self.execution_statuses)
+            or len(self.actions) > MAX_RECONCILIATION_PAGE_ITEMS
+            or any(not isinstance(item, CacheCatalogReconciliationActionProjection) for item in self.actions)
+            or any(not isinstance(item, ReconciliationActionExecutionStatus) for item in self.execution_statuses)
+        ):
+            raise ValueError("actions and execution statuses must be equal and bounded.")
+        if not isinstance(self.progress, CacheCatalogReconciliationProgress):
+            raise TypeError("progress must be CacheCatalogReconciliationProgress.")
+        if self.run_id is not None and re.fullmatch(r"[0-9a-f]{32}", self.run_id) is None:
+            raise ValueError("run_id must be an opaque H2 run ID or None.")
+        if self.next_cursor is not None and not isinstance(
+            self.next_cursor, CacheCatalogReconciliationCursor
+        ):
+            raise TypeError("next_cursor must be a reconciliation cursor or None.")
+        if self.checkpoint_revision is not None and (
+            isinstance(self.checkpoint_revision, bool)
+            or not isinstance(self.checkpoint_revision, int)
+            or self.checkpoint_revision <= 0
+        ):
+            raise ValueError("checkpoint_revision must be positive or None.")
+
+
+def _work_cursor(
+    request: CacheCatalogReconciliationRequest,
+    identity: CacheCatalogIdentity,
+) -> CacheCatalogReconciliationCursor:
+    return CacheCatalogReconciliationCursor(
+        request.mode,
+        identity.namespace,
+        identity.entry_digest,
+        request.policy.digest,
+    )
+
+
+def _incremental_work(
+    request: CacheCatalogReconciliationRequest,
+    cursor: CacheCatalogReconciliationCursor | None,
+) -> tuple[DiscoveredCacheIdentity, ...]:
+    last_key = None if cursor is None else cursor.sort_key
+    ordered = sorted(request.incremental_identities, key=lambda item: item.sort_key)
+    return tuple(
+        DiscoveredCacheIdentity(item, ReconciliationSourceFlags.CATALOG)
+        for item in ordered
+        if last_key is None or item.sort_key > last_key
+    )
+
+
+@dataclass(frozen=True)
+class _ReconciliationCatalogReadFacade:
+    backend: CacheCatalogReadOnlyBackend
+
+    @property
+    def cache_root(self):
+        return self.backend.cache_root
+
+    def inspect_root(self):
+        return self.backend.inspect_root()
+
+    def inspect_catalog_relative(self, relative_path):
+        return self.backend.inspect_catalog_relative(relative_path)
+
+    def list_catalog_relative(self, relative_path):
+        return self.backend.list_catalog_relative(relative_path)
+
+    def read_discovered_record(self, namespace, entry_digest):
+        return self.backend.read_discovered_record(namespace, entry_digest)
+
+    def read_record_bounded(self, identity):
+        return self.backend.read_record_bounded(identity)
+
+
+def reconcile_cache_catalog(
+    request: CacheCatalogReconciliationRequest,
+    *,
+    discovery_filesystem: ReconciliationReadOnlyFilesystem,
+    catalog_backend: CacheCatalogBackend,
+    expectation_resolver: CacheCatalogReconciliationExpectationResolver,
+    lookup_filesystem: ReadOnlyCacheFilesystem,
+    recovery_filesystem: RecoveryReadOnlyFilesystem,
+    checkpoint_backend: ReconciliationCheckpointBackend | None = None,
+    lock_clock: LockObservationClock = SYSTEM_LOCK_OBSERVATION_CLOCK,
+) -> CacheCatalogReconciliationResult:
+    """Run one bounded, deterministic H2 page using H2A-H2D primitives."""
+
+    if not isinstance(request, CacheCatalogReconciliationRequest):
+        raise TypeError("request must be CacheCatalogReconciliationRequest.")
+    if not isinstance(discovery_filesystem, ReconciliationReadOnlyFilesystem):
+        raise TypeError("discovery_filesystem must implement ReconciliationReadOnlyFilesystem.")
+    if not isinstance(catalog_backend, CacheCatalogBackend):
+        raise TypeError("catalog_backend must implement CacheCatalogBackend.")
+    if not request.cache_root.identity.same_stable_object(discovery_filesystem.cache_root.identity):
+        return CacheCatalogReconciliationResult(
+            CacheCatalogReconciliationStatus.ROOT_FAILURE, (), (),
+            CacheCatalogReconciliationProgress(0, 0, 0, 0),
+        )
+    if not request.cache_root.identity.same_stable_object(catalog_backend.cache_root.identity):
+        return CacheCatalogReconciliationResult(
+            CacheCatalogReconciliationStatus.ROOT_FAILURE, (), (),
+            CacheCatalogReconciliationProgress(0, 0, 0, 0),
+        )
+
+    checkpoint = None
+    cursor = None
+    if not request.dry_run:
+        if checkpoint_backend is None:
+            raise TypeError("mutation mode requires ReconciliationCheckpointBackend.")
+        try:
+            if request.resume_run_id is None:
+                checkpoint = begin_reconciliation_checkpoint(
+                    request.mode, request.policy.digest, backend=checkpoint_backend
+                )
+            else:
+                checkpoint = resume_reconciliation_checkpoint(
+                    request.resume_run_id, request.policy.digest, backend=checkpoint_backend
+                )
+        except ReconciliationCheckpointConflictError:
+            return CacheCatalogReconciliationResult(
+                CacheCatalogReconciliationStatus.CHECKPOINT_CONFLICT, (), (),
+                CacheCatalogReconciliationProgress(0, 0, 0, 0),
+                request.resume_run_id,
+            )
+        if checkpoint.state is ReconciliationCheckpointState.COMPLETE:
+            counters = checkpoint.counters
+            return CacheCatalogReconciliationResult(
+                CacheCatalogReconciliationStatus.COMPLETE, (), (),
+                CacheCatalogReconciliationProgress(
+                    counters.identities_completed, counters.lookup_validations,
+                    counters.recovery_inspections, counters.catalog_mutations,
+                ),
+                checkpoint.run_id, None, checkpoint.checkpoint_revision,
+            )
+        cursor = checkpoint.discovery_cursor
+
+    if request.mode is CacheCatalogReconciliationMode.FULL_IN_PLACE:
+        page = discover_reconciliation_identities(
+            discovery_filesystem,
+            catalog_backend=_ReconciliationCatalogReadFacade(catalog_backend),
+            policy=request.policy,
+            cursor=cursor,
+        )
+        work = page.identities
+        source_has_more = page.next_cursor is not None
+    else:
+        remaining = _incremental_work(request, cursor)
+        work = remaining[: request.policy.page_size]
+        source_has_more = len(remaining) > len(work)
+
+    actions = []
+    executions = []
+    base = ReconciliationCheckpointCounters() if checkpoint is None else checkpoint.counters
+    identities = base.identities_completed
+    lookups = base.lookup_validations
+    recoveries = base.recovery_inspections
+    mutations = base.catalog_mutations
+    call_identities = 0
+    call_mutations = 0
+    last_cursor = cursor
+    budget_exhausted = False
+    for discovered in work:
+        if call_identities >= request.policy.max_identities_per_run:
+            budget_exhausted = True
+            break
+        action = observe_and_compare_reconciliation_identity(
+            discovered,
+            cache_root=request.cache_root,
+            expectation_resolver=expectation_resolver,
+            lookup_filesystem=lookup_filesystem,
+            recovery_filesystem=recovery_filesystem,
+            catalog_backend=catalog_backend,
+            lock_clock=lock_clock,
+            observation_scope=request.observation_scope,
+        )
+        will_mutate = action.kind in {
+            CacheCatalogReconciliationActionKind.UPSERT_FINAL,
+            CacheCatalogReconciliationActionKind.UPSERT_RECOVERY,
+            CacheCatalogReconciliationActionKind.TOMBSTONE_EMPTY,
+        }
+        if will_mutate and call_mutations >= 256:
+            budget_exhausted = True
+            break
+        execution = execute_reconciliation_action(
+            action, backend=catalog_backend, dry_run=request.dry_run
+        )
+        actions.append(action)
+        executions.append(execution)
+        identities += 1
+        call_identities += 1
+        lookups += 1
+        if action.observation.recovery is not None:
+            recoveries += 1
+        if execution.status is ReconciliationActionExecutionStatus.APPLIED:
+            mutations += 1
+            call_mutations += 1
+        last_cursor = _work_cursor(request, discovered.identity)
+        if checkpoint is not None:
+            checkpoint = advance_reconciliation_checkpoint(
+                checkpoint,
+                cursor=last_cursor,
+                last_completed_identity=discovered.identity,
+                counters=ReconciliationCheckpointCounters(
+                    identities, lookups, recoveries, mutations
+                ),
+                backend=checkpoint_backend,
+            )
+
+    unfinished = budget_exhausted or source_has_more or len(work) > len(actions)
+    status = (
+        CacheCatalogReconciliationStatus.BUDGET_EXHAUSTED
+        if unfinished else CacheCatalogReconciliationStatus.COMPLETE
+    )
+    if checkpoint is not None and status is CacheCatalogReconciliationStatus.COMPLETE:
+        checkpoint = complete_reconciliation_checkpoint(checkpoint, backend=checkpoint_backend)
+    return CacheCatalogReconciliationResult(
+        status,
+        tuple(CacheCatalogReconciliationActionProjection.from_action(item) for item in actions),
+        tuple(item.status for item in executions),
+        CacheCatalogReconciliationProgress(identities, lookups, recoveries, mutations),
+        None if checkpoint is None else checkpoint.run_id,
+        last_cursor if status is CacheCatalogReconciliationStatus.BUDGET_EXHAUSTED else None,
+        None if checkpoint is None else checkpoint.checkpoint_revision,
+    )
