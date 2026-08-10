@@ -803,6 +803,11 @@ Status:
 
 **DESIGN LOCKED — APPROVED FOR H2 IMPLEMENTATION**
 
-Exact next action:
+Implementation status:
 
-**Resume H2C conditional supported-record reconciliation.**
+**H2 COMPLETE**
+
+Exact next action after H2 closure:
+
+**Make a separate planning/design decision. This contract does not authorize H3,
+H4–H7, Source Ingestion, or any further implementation phase.**

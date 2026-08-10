@@ -37,12 +37,16 @@ from engine.storage.cache_lookup import (
 from engine.storage.cache_reconciliation import (
     MAX_RECONCILIATION_DIRECTORY_ENTRIES,
     CacheCatalogReconciliationCursor,
+    CacheCatalogReconciliationDiagnostic,
+    CacheCatalogReconciliationDiagnosticCode,
     CacheCatalogReconciliationMode,
     CacheCatalogReconciliationActionKind,
     CacheCatalogReconciliationActionReason,
     CacheCatalogReconciliationObservation,
     CacheCatalogReconciliationObservationScope,
+    CacheCatalogReconciliationPolicy,
     CacheCatalogReconciliationRequest,
+    CacheCatalogReconciliationResult,
     CacheCatalogReconciliationStatus,
     CatalogSlotClassification,
     DiscoveredCacheIdentity,
@@ -63,6 +67,7 @@ from engine.storage.cache_reconciliation import (
     ReconciliationCheckpointUnsupportedError,
     LocalReconciliationCheckpointBackend,
     _DiscoveryBudget,
+    _DiagnosticCollector,
     _merged_identities,
     _validate_relative,
     discover_catalog_slots_page,
@@ -1090,7 +1095,7 @@ def test_h2e_repeated_bounded_incremental_runs_are_ordered_and_complete(monkeypa
     identities = tuple(
         _identity(namespace, CacheKey(f"{value:064x}")) for value in (3, 1, 2)
     )
-    policy = ReconciliationDiscoveryPolicy(max_identities_per_run=3, page_size=1)
+    policy = CacheCatalogReconciliationPolicy(max_identities_per_run=3, page_size=1)
     observed = []
     _install_h2e_no_write_unit(monkeypatch, observed)
     first_request = CacheCatalogReconciliationRequest(
@@ -1131,7 +1136,7 @@ def test_h2e_exact_and_larger_bounds_complete(monkeypatch, tmp_path, count, page
     _install_h2e_no_write_unit(monkeypatch, observed)
     request = CacheCatalogReconciliationRequest(
         discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
-        ReconciliationDiscoveryPolicy(max_identities_per_run=page_size, page_size=page_size),
+        CacheCatalogReconciliationPolicy(max_identities_per_run=page_size, page_size=page_size),
         False, identities,
     )
     result = reconcile_cache_catalog(
@@ -1151,7 +1156,7 @@ def test_h2e_complete_resume_is_idempotent_and_does_no_work(monkeypatch, tmp_pat
     _install_h2e_no_write_unit(monkeypatch, observed)
     request = CacheCatalogReconciliationRequest(
         discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
-        ReconciliationDiscoveryPolicy(page_size=1), False, (identity,),
+        CacheCatalogReconciliationPolicy(page_size=1), False, (identity,),
     )
     complete = reconcile_cache_catalog(
         request, discovery_filesystem=discovery, catalog_backend=catalog,
@@ -1177,7 +1182,7 @@ def test_h2e_run_and_policy_mismatch_return_checkpoint_conflict(monkeypatch, tmp
     _install_h2e_no_write_unit(monkeypatch, observed)
     request = CacheCatalogReconciliationRequest(
         discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
-        ReconciliationDiscoveryPolicy(page_size=1), False, (identity,),
+        CacheCatalogReconciliationPolicy(page_size=1), False, (identity,),
     )
     first = reconcile_cache_catalog(
         request, discovery_filesystem=discovery, catalog_backend=catalog,
@@ -1191,7 +1196,7 @@ def test_h2e_run_and_policy_mismatch_return_checkpoint_conflict(monkeypatch, tmp
         checkpoint_backend=checkpoint_backend,
     )
     wrong_policy = reconcile_cache_catalog(
-        replace(request, resume_run_id=first.run_id, policy=ReconciliationDiscoveryPolicy(page_size=2)),
+        replace(request, resume_run_id=first.run_id, policy=CacheCatalogReconciliationPolicy(page_size=2)),
         discovery_filesystem=discovery, catalog_backend=catalog,
         expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
         checkpoint_backend=checkpoint_backend,
@@ -1222,7 +1227,7 @@ def test_h2e_interruption_does_not_overstate_durable_progress(monkeypatch, tmp_p
     )
     request = CacheCatalogReconciliationRequest(
         discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
-        ReconciliationDiscoveryPolicy(page_size=2), False, identities,
+        CacheCatalogReconciliationPolicy(page_size=2), False, identities,
     )
     with pytest.raises(RuntimeError, match="interrupted unit"):
         reconcile_cache_catalog(
@@ -1245,3 +1250,139 @@ def test_h2e_package_exports_only_sanitized_action_projection(tmp_path):
     assert not hasattr(public, "observation")
     assert not hasattr(public, "expected_catalog_revision")
     assert storage_package.reconcile_cache_catalog is reconcile_cache_catalog
+
+
+@pytest.mark.parametrize("field,maximum", [
+    ("max_identities_per_run", 1024),
+    ("max_lookup_validations_per_run", 1024),
+    ("max_recovery_inspections_per_run", 512),
+    ("max_catalog_mutations_per_run", 256),
+    ("max_directory_listings", 4096),
+    ("max_entries_per_directory", 4096),
+    ("page_size", 256),
+    ("max_diagnostics_per_run", 256),
+    ("max_relative_path_utf8_bytes", 1024),
+    ("max_traversal_depth", 64),
+])
+def test_h2e_policy_locks_each_v1_maximum_and_rejects_one_over(field, maximum):
+    policy = CacheCatalogReconciliationPolicy(**{field: maximum})
+    assert getattr(policy, field) == maximum
+    with pytest.raises(ValueError):
+        CacheCatalogReconciliationPolicy(**{field: maximum + 1})
+
+
+def test_h2e_policy_is_independent_immutable_and_digest_covers_work_budgets():
+    policy = CacheCatalogReconciliationPolicy(max_lookup_validations_per_run=3)
+    assert type(policy) is CacheCatalogReconciliationPolicy
+    assert policy.digest != replace(policy, max_lookup_validations_per_run=2).digest
+    with pytest.raises(FrozenInstanceError):
+        policy.page_size = 1
+
+
+def test_h2e_diagnostic_codes_are_stable_and_publicly_exported():
+    assert {item.name for item in CacheCatalogReconciliationDiagnosticCode} == {
+        "IDENTITY_DISCOVERED", "IDENTITY_RECONCILED", "IDENTITY_NOOP",
+        "IDENTITY_SKIPPED", "CATALOG_REVISION_CONFLICT", "AUTHORITATIVE_UNSTABLE",
+        "AUTHORITATIVE_UNSAFE", "AUTHORITATIVE_CORRUPT", "CATALOG_FAILURE",
+        "BUDGET_EXHAUSTED", "CHECKPOINT_PUBLISHED", "CHECKPOINT_RESUMED",
+        "DIAGNOSTICS_TRUNCATED",
+    }
+    assert storage_package.CacheCatalogReconciliationDiagnostic is CacheCatalogReconciliationDiagnostic
+    assert storage_package.CacheCatalogReconciliationDiagnosticCode is CacheCatalogReconciliationDiagnosticCode
+
+
+def test_h2e_diagnostics_deduplicate_order_and_truncate_deterministically(tmp_path):
+    _, identity, _, _ = _h2b_evidence(tmp_path)
+    collector = _DiagnosticCollector(3)
+    collector.add("identity", identity, CacheCatalogReconciliationDiagnosticCode.IDENTITY_DISCOVERED, "final")
+    collector.add("identity", identity, CacheCatalogReconciliationDiagnosticCode.IDENTITY_DISCOVERED, "final")
+    collector.add("identity", identity, CacheCatalogReconciliationDiagnosticCode.IDENTITY_NOOP, "catalog")
+    collector.add("run", None, CacheCatalogReconciliationDiagnosticCode.BUDGET_EXHAUSTED, "h2")
+    collector.add("checkpoint", None, CacheCatalogReconciliationDiagnosticCode.CHECKPOINT_PUBLISHED, "checkpoint")
+    result = collector.result()
+    assert [item.ordinal for item in result] == [1, 2, 3]
+    assert result[-1].code is CacheCatalogReconciliationDiagnosticCode.DIAGNOSTICS_TRUNCATED
+    assert result == collector.result()
+
+
+def test_h2e_diagnostic_projection_contains_only_locked_fields_and_no_private_text(tmp_path):
+    _, identity, _, _ = _h2b_evidence(tmp_path)
+    diagnostic = CacheCatalogReconciliationDiagnostic(
+        "identity", identity, CacheCatalogReconciliationDiagnosticCode.IDENTITY_SKIPPED,
+        "combined", 1,
+    )
+    assert set(diagnostic.__dataclass_fields__) == {"subject", "identity", "code", "source_kind", "ordinal"}
+    text = repr(diagnostic)
+    for forbidden in (str(tmp_path), "writer_token", "owner_token", "host_id", "pid", "inode", "errno", "raw_json", "https://"):
+        assert forbidden not in text
+
+
+def test_h2e_lowered_identity_budget_stops_before_next_action_with_resume(monkeypatch, tmp_path):
+    _, discovery, catalog, _ = _h2e_dependencies(tmp_path)
+    namespace = CacheNamespace("audio", "producer", 1)
+    identities = tuple(_identity(namespace, CacheKey(f"{value:064x}")) for value in (1, 2))
+    observed = []
+    _install_h2e_no_write_unit(monkeypatch, observed)
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        CacheCatalogReconciliationPolicy(max_identities_per_run=1, page_size=1),
+        True, identities,
+    )
+    result = reconcile_cache_catalog(
+        request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+    )
+    assert result.status is CacheCatalogReconciliationStatus.BUDGET_EXHAUSTED
+    assert len(result.actions) == len(observed) == 1
+    assert result.next_cursor is not None
+    assert any(item.code is CacheCatalogReconciliationDiagnosticCode.BUDGET_EXHAUSTED for item in result.diagnostics)
+
+
+def test_h2e_result_diagnostics_are_bounded_and_ordinal():
+    diagnostics = tuple(
+        CacheCatalogReconciliationDiagnostic(
+            "run", None, CacheCatalogReconciliationDiagnosticCode.IDENTITY_SKIPPED, "h2", index
+        ) for index in range(1, 257)
+    )
+    with pytest.raises(ValueError, match="bounded"):
+        CacheCatalogReconciliationResult(
+            CacheCatalogReconciliationStatus.COMPLETE, (), (),
+            reconciliation_module.CacheCatalogReconciliationProgress(0, 0, 0, 0),
+            diagnostics=diagnostics + diagnostics[:1],
+        )
+
+
+def test_h2e_dependency_contract_violation_fails_run_without_retry(monkeypatch, tmp_path):
+    _, discovery, catalog, _ = _h2e_dependencies(tmp_path)
+    identity = _identity(CacheNamespace("audio", "producer", 1), CacheKey("1" * 64))
+    calls = []
+    def violating(*args, **kwargs):
+        calls.append(1)
+        raise ValueError("private dependency detail")
+    monkeypatch.setattr(reconciliation_module, "observe_and_compare_reconciliation_identity", violating)
+    request = CacheCatalogReconciliationRequest(
+        discovery.cache_root, CacheCatalogReconciliationMode.INCREMENTAL_IDENTITIES,
+        CacheCatalogReconciliationPolicy(page_size=1), True, (identity,),
+    )
+    result = reconcile_cache_catalog(
+        request, discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+    )
+    assert result.status is CacheCatalogReconciliationStatus.DEPENDENCY_FAILURE
+    assert len(calls) == 1 and "private dependency detail" not in repr(result)
+
+
+def test_h2e_fatal_discovery_failure_returns_root_failure(monkeypatch, tmp_path):
+    _, discovery, catalog, checkpoint = _h2e_dependencies(tmp_path)
+    monkeypatch.setattr(
+        reconciliation_module, "discover_reconciliation_identities",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ReconciliationDiscoveryError("private path")),
+    )
+    result = reconcile_cache_catalog(
+        CacheCatalogReconciliationRequest(discovery.cache_root, CacheCatalogReconciliationMode.FULL_IN_PLACE),
+        discovery_filesystem=discovery, catalog_backend=catalog,
+        expectation_resolver=object(), lookup_filesystem=object(), recovery_filesystem=object(),
+        checkpoint_backend=checkpoint,
+    )
+    assert result.status is CacheCatalogReconciliationStatus.ROOT_FAILURE
+    assert "private path" not in repr(result)

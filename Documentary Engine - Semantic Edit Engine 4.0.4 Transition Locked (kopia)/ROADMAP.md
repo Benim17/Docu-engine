@@ -35,14 +35,15 @@ The current major workstream is the **Cache and Storage Manager**, within the
 Cache & Storage / Housekeeping Foundation phase.
 
 - **Current phase:** Cache & Storage / Housekeeping Foundation
-- **Current task:** H2 — Catalog Rebuild / Reconciliation design
-- **Status:** DESIGN PHASE — IMPLEMENTATION NOT YET APPROVED
-- **Next task:** Define and lock H2 Catalog Rebuild / Reconciliation contract
+- **Current task:** Post-H2 planning/design decision
+- **Status:** PLANNING GATE — NO FURTHER IMPLEMENTATION APPROVED
+- **Next task:** Select and lock either the H3 contract or the Source Ingestion transition
 - **Current branch:** `feature/cache-storage-foundation`
 
-The persistent-cache construction sequence is complete through Step 5E, and H1 —
-Persistent Cache Catalog / Index is complete. H2 remains a design and contract phase;
-no H2 implementation is approved.
+The persistent-cache construction sequence is complete through Step 5E, H1 —
+Persistent Cache Catalog / Index is complete, and H2 — Catalog Rebuild /
+Reconciliation is contract-complete. H3–H7 and Source Ingestion remain unapproved
+until a separate planning/design decision is reviewed and locked.
 
 ## Cache & Storage / Housekeeping Foundation
 
@@ -88,7 +89,7 @@ status here records sequence and progress; it does not replace a locked contract
 ### Housekeeping
 
 - [x] H1 — Persistent Cache Catalog / Index
-- [ ] H2 — Catalog Rebuild / Reconciliation — future, implementation not approved
+- [x] H2 — Catalog Rebuild / Reconciliation
 - [ ] H3 — Retention & Cleanup Policy — future, implementation not approved
 - [ ] H4 — Immutable Cleanup Planning — future, implementation not approved
 - [ ] H5 — Identity-Safe Cleanup Mutation — future, implementation not approved
