@@ -31,19 +31,24 @@ must:
 
 ## Current
 
-The current major workstream is the **Cache and Storage Manager**, within the
-Cache & Storage / Housekeeping Foundation phase.
+The current major workstream is the **Source Ingestion & Understanding
+Foundation**. The post-H2 planning gate selected the Source Ingestion transition.
 
-- **Current phase:** Cache & Storage / Housekeeping Foundation
-- **Current task:** Post-H2 planning/design decision
-- **Status:** PLANNING GATE — NO FURTHER IMPLEMENTATION APPROVED
-- **Next task:** Select and lock either the H3 contract or the Source Ingestion transition
-- **Current branch:** `feature/cache-storage-foundation`
+- **Current phase:** Source Ingestion & Understanding Foundation
+- **Current task:** Pure SI-01–SI-04 + Knowledge foundation implementation
+- **Status:** IMPLEMENTATION APPROVED — PURE FOUNDATION ONLY
+- **Next architectural task:** Source Ingestion Producer and Operation Foundation Contract
+- **Planned implementation branch:** `feature/source-understanding-foundation`
+- **Documentation transition branch:** `docs/source-understanding-transition`
 
-The persistent-cache construction sequence is complete through Step 5E, H1 —
-Persistent Cache Catalog / Index is complete, and H2 — Catalog Rebuild /
-Reconciliation is contract-complete. H3–H7 and Source Ingestion remain unapproved
-until a separate planning/design decision is reviewed and locked.
+The documentation transition must be reviewed and merged before the planned
+implementation branch is created from updated `main`. Approval is limited to the
+pure, in-memory domain slice defined below. It does not approve operational Source
+Ingestion or Knowledge extraction.
+
+The persistent-cache construction sequence remains complete through Step 5E, H1 —
+Persistent Cache Catalog / Index remains complete, and H2 — Catalog Rebuild /
+Reconciliation remains contract-complete. H3–H7 remain future and unapproved.
 
 ## Cache & Storage / Housekeeping Foundation
 
@@ -148,6 +153,82 @@ Finished Documentary
 
 This milestone remains future product direction until its contracts and implementation
 steps are separately reviewed and approved.
+
+### Source Understanding architecture completed
+
+The following representation contracts are complete and **DESIGN LOCKED**:
+
+- [x] Core Architecture — implementation not approved by that contract alone
+- [x] SI-01 — Source Identity
+- [x] SI-02 — Source Evidence Models
+- [x] SI-03 — Transcript Foundation
+- [x] SI-04 — Normalized Source Document
+- [x] Knowledge — Knowledge Foundation
+
+These contracts define the pure representation chain:
+
+```text
+External Source
+  ↓
+SI-01 Identity
+  ↓
+SI-02 Evidence
+  ↓
+SI-03 Transcript
+  ↓
+SI-04 Normalized Source Document
+  ↓
+Knowledge
+```
+
+They do not make production Source Ingestion operational and do not approve a
+Knowledge extraction Producer.
+
+### Approved implementation slice: pure foundation only
+
+Implementation approval is limited to the following in-memory, pure-domain work:
+
+- **SI-01:** immutable models, canonical serialization/parsing, identity derivation,
+  and zero-network YouTube identity canonicalization;
+- **SI-02:** immutable Evidence models, deterministic provenance validation,
+  canonical serialization/parsing, and pure candidate normalization;
+- **SI-03:** immutable Transcript models, canonical serialization/parsing, Artifact
+  identity, intrinsic validation, pure SI-02 association validation, and
+  deterministic transcript projection;
+- **SI-04:** immutable normalized-document models, canonical serialization/parsing,
+  exact metadata/transcript projections, intrinsic validation, and pure SI-02/SI-03
+  association validation; and
+- **Knowledge:** immutable representation models, canonical serialization/parsing,
+  support/claim/disagreement/Artifact identities, deterministic ordering, intrinsic
+  validation, and pure SI-04 association validation.
+
+The approved slice must remain:
+
+- in-memory and pure-domain only;
+- zero network;
+- zero filesystem or workspace access;
+- zero model invocation;
+- zero persistent cache or storage publication; and
+- zero Director, pipeline, or renderer integration.
+
+### Explicitly unapproved
+
+The following remain unapproved and require separate architecture, lock review, and
+implementation approval where applicable:
+
+- live acquisition and production YouTube acquisition;
+- network clients, redirects, authentication, credentials, and rate limiting;
+- provider transcript selection or parsing;
+- `LocalTranscriptProvider`, `SpeechToTextBackend`, local STT, and model inference;
+- temporary workspace and media lifecycle;
+- Knowledge semantic extraction Producer and model-assisted factual extraction;
+- Source Ingestion operation/orchestration envelopes;
+- retries, cancellation, deadlines, budgets, and multi-source orchestration;
+- storage/cache integration and new `ArtifactType` or `CacheNamespace` mappings;
+- H3–H7;
+- Narrative, Presentation, and Render;
+- Director, pipeline, and renderer integration; and
+- package-level export changes unless separately approved.
 
 ## Roadmap maintenance
 
