@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from enum import Enum, IntFlag
 from pathlib import Path
@@ -19,6 +21,7 @@ from .cache_catalog import (
     CacheCatalogFinalSummary,
     CacheCatalogFinalProvenance,
     CacheCatalogLiveRecord,
+    LocalCacheCatalogBackend,
     CacheCatalogLookupResult,
     CacheCatalogLookupStatus,
     CacheCatalogReadOnlyBackend,
@@ -71,9 +74,11 @@ from .cache_recovery import (
 from .persistent_cache import (
     CacheEntryContractError,
     CacheEntryMetadata,
+    CacheKeyReference,
     CacheLookupExpectation,
     CacheLookupStatus,
     CacheNamespace,
+    canonical_json_bytes,
 )
 
 
@@ -84,6 +89,8 @@ MAX_RECONCILIATION_PAGE_ITEMS = 256
 MAX_RECONCILIATION_RELATIVE_PATH_UTF8_BYTES = 1_024
 MAX_RECONCILIATION_TRAVERSAL_DEPTH = 64
 RECONCILIATION_CURSOR_VERSION = 1
+RECONCILIATION_CHECKPOINT_VERSION = 1
+MAX_RECONCILIATION_CHECKPOINT_BYTES = 65_536
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SHARD = re.compile(r"^[0-9a-f]{2}$")
@@ -98,6 +105,10 @@ class ReconciliationDiscoveryError(RuntimeError):
 
 class ReconciliationDiscoveryLimitError(ReconciliationDiscoveryError):
     """A locked H2A discovery limit was exceeded."""
+
+
+class ReconciliationCheckpointUnsupportedError(ReconciliationDiscoveryError):
+    """A recognizable future checkpoint version cannot be resumed."""
 
 
 class CacheCatalogReconciliationMode(str, Enum):
@@ -1504,3 +1515,476 @@ def execute_reconciliation_action(
             backend=backend,
         )
     return _execution_from_write(action, write)
+
+
+class ReconciliationCheckpointState(str, Enum):
+    ACTIVE = "active"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True)
+class ReconciliationCheckpointCounters:
+    identities_completed: int = 0
+    lookup_validations: int = 0
+    recovery_inspections: int = 0
+    catalog_mutations: int = 0
+
+    def __post_init__(self) -> None:
+        limits = (
+            (self.identities_completed, 1_024, "identities_completed"),
+            (self.lookup_validations, 1_024, "lookup_validations"),
+            (self.recovery_inspections, 512, "recovery_inspections"),
+            (self.catalog_mutations, 256, "catalog_mutations"),
+        )
+        for value, maximum, name in limits:
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                raise ValueError(f"{name} must be an integer from 0 through {maximum}.")
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "catalog_mutations": self.catalog_mutations,
+            "identities_completed": self.identities_completed,
+            "lookup_validations": self.lookup_validations,
+            "recovery_inspections": self.recovery_inspections,
+        }
+
+
+def _checkpoint_identity_dict(identity: CacheCatalogIdentity | None):
+    if identity is None:
+        return None
+    return {
+        "cache_key_reference": identity.cache_key_reference.to_dict(),
+        "entry_digest": identity.entry_digest,
+        "namespace": identity.namespace.to_dict(),
+    }
+
+
+def _checkpoint_cursor_dict(cursor: CacheCatalogReconciliationCursor | None):
+    if cursor is None:
+        return None
+    return {
+        "catalog_complete": cursor.catalog_complete,
+        "cursor_version": cursor.cursor_version,
+        "final_complete": cursor.final_complete,
+        "last_entry_digest": cursor.last_entry_digest,
+        "last_namespace": cursor.last_namespace.to_dict(),
+        "mode": cursor.mode.value,
+        "policy_digest": cursor.policy_digest,
+        "staging_complete": cursor.staging_complete,
+    }
+
+
+@dataclass(frozen=True)
+class ReconciliationCheckpoint:
+    run_id: str
+    mode: CacheCatalogReconciliationMode
+    policy_digest: str
+    checkpoint_revision: int
+    state: ReconciliationCheckpointState
+    discovery_cursor: CacheCatalogReconciliationCursor | None = None
+    last_completed_identity: CacheCatalogIdentity | None = None
+    counters: ReconciliationCheckpointCounters = ReconciliationCheckpointCounters()
+    dry_run: bool = False
+    checkpoint_version: int = RECONCILIATION_CHECKPOINT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_version != RECONCILIATION_CHECKPOINT_VERSION:
+            raise ValueError("unsupported reconciliation checkpoint version.")
+        if not isinstance(self.run_id, str) or re.fullmatch(r"[0-9a-f]{32}", self.run_id) is None:
+            raise ValueError("run_id must be an opaque 128-bit lowercase hexadecimal value.")
+        if not isinstance(self.mode, CacheCatalogReconciliationMode):
+            raise TypeError("mode must be CacheCatalogReconciliationMode.")
+        if not isinstance(self.policy_digest, str) or _DIGEST.fullmatch(self.policy_digest) is None:
+            raise ValueError("policy_digest must be 64 lowercase hex.")
+        if (
+            isinstance(self.checkpoint_revision, bool)
+            or not isinstance(self.checkpoint_revision, int)
+            or self.checkpoint_revision <= 0
+        ):
+            raise ValueError("checkpoint_revision must be positive.")
+        if not isinstance(self.state, ReconciliationCheckpointState):
+            raise TypeError("state must be ReconciliationCheckpointState.")
+        if self.discovery_cursor is not None:
+            if not isinstance(self.discovery_cursor, CacheCatalogReconciliationCursor):
+                raise TypeError("discovery_cursor must be a reconciliation cursor or None.")
+            if (
+                self.discovery_cursor.mode is not self.mode
+                or self.discovery_cursor.policy_digest != self.policy_digest
+            ):
+                raise ValueError("checkpoint cursor scope does not match run scope.")
+        if self.last_completed_identity is not None and not isinstance(
+            self.last_completed_identity, CacheCatalogIdentity
+        ):
+            raise TypeError("last_completed_identity must be CacheCatalogIdentity or None.")
+        if not isinstance(self.counters, ReconciliationCheckpointCounters):
+            raise TypeError("counters must be ReconciliationCheckpointCounters.")
+        if self.dry_run is not False:
+            raise ValueError("durable checkpoints require dry_run=false.")
+        if (self.counters.identities_completed == 0) != (self.last_completed_identity is None):
+            raise ValueError("completed identity evidence must match the identity counter.")
+        if self.discovery_cursor is not None and self.last_completed_identity is not None:
+            if self.discovery_cursor.sort_key != self.last_completed_identity.sort_key:
+                raise ValueError("cursor and last completed identity must agree.")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "checkpoint_revision": self.checkpoint_revision,
+            "checkpoint_version": self.checkpoint_version,
+            "counters": self.counters.to_dict(),
+            "discovery_cursor": _checkpoint_cursor_dict(self.discovery_cursor),
+            "dry_run": self.dry_run,
+            "last_completed_identity": _checkpoint_identity_dict(self.last_completed_identity),
+            "mode": self.mode.value,
+            "policy_digest": self.policy_digest,
+            "run_id": self.run_id,
+            "state": self.state.value,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        data = canonical_json_bytes(self.to_dict())
+        if len(data) > MAX_RECONCILIATION_CHECKPOINT_BYTES:
+            raise ValueError("reconciliation checkpoint exceeds its locked byte limit.")
+        return data
+
+
+def _strict_checkpoint_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate reconciliation checkpoint field.")
+        result[key] = value
+    return result
+
+
+def _exact_fields(value, fields, name):
+    if type(value) is not dict or set(value) != set(fields):
+        raise ValueError(f"{name} fields are not canonical.")
+    return value
+
+
+def parse_reconciliation_checkpoint(data: bytes) -> ReconciliationCheckpoint:
+    if not isinstance(data, bytes) or not data or len(data) > MAX_RECONCILIATION_CHECKPOINT_BYTES:
+        raise ValueError("checkpoint bytes must be non-empty and bounded.")
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_strict_checkpoint_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("checkpoint is malformed JSON.") from exc
+    fields = {
+        "checkpoint_revision", "checkpoint_version", "counters", "discovery_cursor",
+        "dry_run", "last_completed_identity", "mode", "policy_digest", "run_id", "state",
+    }
+    value = _exact_fields(value, fields, "checkpoint")
+    version = value["checkpoint_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise ValueError("checkpoint_version must be positive.")
+    if version != RECONCILIATION_CHECKPOINT_VERSION:
+        raise ReconciliationCheckpointUnsupportedError("checkpoint version is unsupported.")
+    counters_data = _exact_fields(
+        value["counters"],
+        {"catalog_mutations", "identities_completed", "lookup_validations", "recovery_inspections"},
+        "checkpoint counters",
+    )
+    counters = ReconciliationCheckpointCounters(**counters_data)
+    cursor_data = value["discovery_cursor"]
+    cursor = None
+    if cursor_data is not None:
+        cursor_data = _exact_fields(
+            cursor_data,
+            {"catalog_complete", "cursor_version", "final_complete", "last_entry_digest",
+             "last_namespace", "mode", "policy_digest", "staging_complete"},
+            "checkpoint cursor",
+        )
+        cursor = CacheCatalogReconciliationCursor(
+            CacheCatalogReconciliationMode(cursor_data["mode"]),
+            CacheNamespace.from_dict(cursor_data["last_namespace"]),
+            cursor_data["last_entry_digest"],
+            cursor_data["policy_digest"],
+            cursor_data["final_complete"],
+            cursor_data["staging_complete"],
+            cursor_data["catalog_complete"],
+            cursor_data["cursor_version"],
+        )
+    identity_data = value["last_completed_identity"]
+    identity = None
+    if identity_data is not None:
+        identity_data = _exact_fields(
+            identity_data,
+            {"cache_key_reference", "entry_digest", "namespace"},
+            "last completed identity",
+        )
+        namespace = CacheNamespace.from_dict(identity_data["namespace"])
+        if cursor is None:
+            raise ValueError("completed identity requires a discovery cursor.")
+        identity = CacheCatalogIdentity(
+            namespace,
+            identity_data["entry_digest"],
+            CacheKeyReference.from_dict(identity_data["cache_key_reference"]),
+        )
+    checkpoint = ReconciliationCheckpoint(
+        value["run_id"], CacheCatalogReconciliationMode(value["mode"]),
+        value["policy_digest"], value["checkpoint_revision"],
+        ReconciliationCheckpointState(value["state"]), cursor, identity, counters,
+        value["dry_run"], version,
+    )
+    if checkpoint.canonical_bytes() != data:
+        raise ValueError("checkpoint JSON is not canonical.")
+    return checkpoint
+
+
+class ReconciliationCheckpointLookupStatus(str, Enum):
+    FOUND = "found"
+    ABSENT = "absent"
+    CORRUPT = "corrupt"
+    UNSUPPORTED = "unsupported"
+    UNSAFE = "unsafe"
+    UNSTABLE = "unstable"
+    IO_FAILURE = "io_failure"
+
+
+@dataclass(frozen=True)
+class ReconciliationCheckpointLookupResult:
+    status: ReconciliationCheckpointLookupStatus
+    checkpoint: ReconciliationCheckpoint | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, ReconciliationCheckpointLookupStatus):
+            raise TypeError("status must be ReconciliationCheckpointLookupStatus.")
+        if (self.status is ReconciliationCheckpointLookupStatus.FOUND) != isinstance(
+            self.checkpoint, ReconciliationCheckpoint
+        ):
+            raise ValueError("only FOUND carries a checkpoint.")
+
+
+@runtime_checkable
+class ReconciliationCheckpointBackend(Protocol):
+    @property
+    def cache_root(self) -> ValidatedCacheRoot: ...
+
+    def read_checkpoint_bounded(self) -> BoundedFileRead: ...
+
+    def publish_checkpoint_bytes(
+        self, data: bytes, *, expected_revision: int | None
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class LocalReconciliationCheckpointBackend:
+    """H2-owned checkpoint persistence sharing H1's writer lock and durability."""
+
+    catalog_backend: LocalCacheCatalogBackend
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.catalog_backend, LocalCacheCatalogBackend):
+            raise TypeError("catalog_backend must be LocalCacheCatalogBackend.")
+
+    @classmethod
+    def from_root(cls, path: str | Path) -> "LocalReconciliationCheckpointBackend":
+        return cls(LocalCacheCatalogBackend.from_root(path))
+
+    @property
+    def cache_root(self) -> ValidatedCacheRoot:
+        return self.catalog_backend.cache_root
+
+    @property
+    def _relative(self) -> Path:
+        return Path("catalog/v1/reconciliation/checkpoint.json")
+
+    def read_checkpoint_bounded(self) -> BoundedFileRead:
+        return self.catalog_backend._filesystem.read_regular_file_bounded(
+            self.catalog_backend._catalog_path(self._relative),
+            max_bytes=MAX_RECONCILIATION_CHECKPOINT_BYTES,
+        )
+
+    def publish_checkpoint_bytes(
+        self, data: bytes, *, expected_revision: int | None
+    ) -> None:
+        candidate = parse_reconciliation_checkpoint(data)
+        expected_new_revision = 1 if expected_revision is None else expected_revision + 1
+        if candidate.checkpoint_revision != expected_new_revision:
+            raise ValueError("published checkpoint revision must increment exactly once.")
+        self.catalog_backend.initialize_catalog()
+        with self.catalog_backend.acquire_writer_lock():
+            directory_fd = self.catalog_backend._open_directory_chain(
+                ("catalog", "v1", "reconciliation"), create=True
+            )
+            temporary_name = f".checkpoint-tmp-{secrets.token_hex(16)}"
+            temporary_fd = None
+            try:
+                current = read_reconciliation_checkpoint(self)
+                if current.status is ReconciliationCheckpointLookupStatus.FOUND:
+                    assert current.checkpoint is not None
+                    current_revision = current.checkpoint.checkpoint_revision
+                elif current.status is ReconciliationCheckpointLookupStatus.ABSENT:
+                    current_revision = None
+                elif current.status is ReconciliationCheckpointLookupStatus.UNSUPPORTED:
+                    raise ReconciliationCheckpointUnsupportedError(
+                        "unsupported checkpoint cannot be overwritten."
+                    )
+                else:
+                    raise ReconciliationDiscoveryError(
+                        f"checkpoint cannot be safely replaced: {current.status.value}."
+                    )
+                if current_revision != expected_revision:
+                    raise ReconciliationCheckpointConflictError(
+                        "checkpoint revision changed before publication."
+                    )
+                flags = (
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                )
+                temporary_fd = os.open(
+                    temporary_name, flags, 0o600, dir_fd=directory_fd
+                )
+                view = memoryview(data)
+                while view:
+                    written = os.write(temporary_fd, view)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "checkpoint write made no progress")
+                    view = view[written:]
+                os.fsync(temporary_fd)
+                os.close(temporary_fd)
+                temporary_fd = None
+                if expected_revision is None:
+                    self.catalog_backend._rename_noreplace(
+                        directory_fd, temporary_name, "checkpoint.json"
+                    )
+                else:
+                    os.replace(
+                        temporary_name, "checkpoint.json",
+                        src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                    )
+                os.fsync(directory_fd)
+            finally:
+                if temporary_fd is not None:
+                    os.close(temporary_fd)
+                os.close(directory_fd)
+
+
+def read_reconciliation_checkpoint(
+    backend: ReconciliationCheckpointBackend,
+) -> ReconciliationCheckpointLookupResult:
+    if not isinstance(backend, ReconciliationCheckpointBackend):
+        raise TypeError("backend must implement ReconciliationCheckpointBackend.")
+    try:
+        read = backend.read_checkpoint_bounded()
+        if read.limit_exceeded or read.data is None:
+            return ReconciliationCheckpointLookupResult(
+                ReconciliationCheckpointLookupStatus.CORRUPT
+            )
+        if not read.stable_read:
+            return ReconciliationCheckpointLookupResult(
+                ReconciliationCheckpointLookupStatus.UNSTABLE
+            )
+        checkpoint = parse_reconciliation_checkpoint(read.data)
+        return ReconciliationCheckpointLookupResult(
+            ReconciliationCheckpointLookupStatus.FOUND, checkpoint
+        )
+    except FileNotFoundError:
+        return ReconciliationCheckpointLookupResult(ReconciliationCheckpointLookupStatus.ABSENT)
+    except ReconciliationCheckpointUnsupportedError:
+        return ReconciliationCheckpointLookupResult(
+            ReconciliationCheckpointLookupStatus.UNSUPPORTED
+        )
+    except (SymlinkRejectedError, UnsupportedFilesystemObjectError):
+        return ReconciliationCheckpointLookupResult(ReconciliationCheckpointLookupStatus.UNSAFE)
+    except UnstableFilesystemObjectError:
+        return ReconciliationCheckpointLookupResult(ReconciliationCheckpointLookupStatus.UNSTABLE)
+    except ValueError:
+        return ReconciliationCheckpointLookupResult(ReconciliationCheckpointLookupStatus.CORRUPT)
+    except (CacheLookupFilesystemError, PermissionError, OSError):
+        return ReconciliationCheckpointLookupResult(ReconciliationCheckpointLookupStatus.IO_FAILURE)
+
+
+class ReconciliationCheckpointConflictError(RuntimeError):
+    """Another run or checkpoint revision owns durable H2 progress."""
+
+
+def begin_reconciliation_checkpoint(
+    mode: CacheCatalogReconciliationMode,
+    policy_digest: str,
+    *,
+    backend: ReconciliationCheckpointBackend,
+    run_id_factory: Callable[[], str] = lambda: secrets.token_hex(16),
+) -> ReconciliationCheckpoint:
+    current = read_reconciliation_checkpoint(backend)
+    expected_revision = None
+    if current.status is ReconciliationCheckpointLookupStatus.FOUND:
+        assert current.checkpoint is not None
+        if current.checkpoint.state is ReconciliationCheckpointState.ACTIVE:
+            raise ReconciliationCheckpointConflictError("an active reconciliation run exists.")
+        expected_revision = current.checkpoint.checkpoint_revision
+    elif current.status is not ReconciliationCheckpointLookupStatus.ABSENT:
+        raise ReconciliationDiscoveryError(
+            f"checkpoint cannot start from {current.status.value}."
+        )
+    checkpoint = ReconciliationCheckpoint(
+        run_id_factory(), mode, policy_digest,
+        1 if expected_revision is None else expected_revision + 1,
+        ReconciliationCheckpointState.ACTIVE,
+    )
+    backend.publish_checkpoint_bytes(checkpoint.canonical_bytes(), expected_revision=expected_revision)
+    return checkpoint
+
+
+def resume_reconciliation_checkpoint(
+    run_id: str,
+    policy_digest: str,
+    *,
+    backend: ReconciliationCheckpointBackend,
+) -> ReconciliationCheckpoint:
+    current = read_reconciliation_checkpoint(backend)
+    if current.status is not ReconciliationCheckpointLookupStatus.FOUND:
+        raise ReconciliationDiscoveryError(
+            f"checkpoint cannot resume from {current.status.value}."
+        )
+    assert current.checkpoint is not None
+    checkpoint = current.checkpoint
+    if checkpoint.run_id != run_id or checkpoint.policy_digest != policy_digest:
+        raise ReconciliationCheckpointConflictError("checkpoint run or policy mismatch.")
+    return checkpoint
+
+
+def advance_reconciliation_checkpoint(
+    checkpoint: ReconciliationCheckpoint,
+    *,
+    cursor: CacheCatalogReconciliationCursor,
+    last_completed_identity: CacheCatalogIdentity,
+    counters: ReconciliationCheckpointCounters,
+    backend: ReconciliationCheckpointBackend,
+) -> ReconciliationCheckpoint:
+    if checkpoint.state is not ReconciliationCheckpointState.ACTIVE:
+        raise ValueError("only an active checkpoint may advance.")
+    if counters.identities_completed <= checkpoint.counters.identities_completed:
+        raise ValueError("checkpoint progress must advance monotonically.")
+    if (
+        checkpoint.last_completed_identity is not None
+        and last_completed_identity.sort_key <= checkpoint.last_completed_identity.sort_key
+    ):
+        raise ValueError("checkpoint identity order must advance monotonically.")
+    updated = ReconciliationCheckpoint(
+        checkpoint.run_id, checkpoint.mode, checkpoint.policy_digest,
+        checkpoint.checkpoint_revision + 1, ReconciliationCheckpointState.ACTIVE,
+        cursor, last_completed_identity, counters,
+    )
+    backend.publish_checkpoint_bytes(
+        updated.canonical_bytes(), expected_revision=checkpoint.checkpoint_revision
+    )
+    return updated
+
+
+def complete_reconciliation_checkpoint(
+    checkpoint: ReconciliationCheckpoint,
+    *,
+    backend: ReconciliationCheckpointBackend,
+) -> ReconciliationCheckpoint:
+    if checkpoint.state is ReconciliationCheckpointState.COMPLETE:
+        return checkpoint
+    completed = ReconciliationCheckpoint(
+        checkpoint.run_id, checkpoint.mode, checkpoint.policy_digest,
+        checkpoint.checkpoint_revision + 1, ReconciliationCheckpointState.COMPLETE,
+        checkpoint.discovery_cursor, checkpoint.last_completed_identity, checkpoint.counters,
+    )
+    backend.publish_checkpoint_bytes(
+        completed.canonical_bytes(), expected_revision=checkpoint.checkpoint_revision
+    )
+    return completed

@@ -21,8 +21,9 @@ from engine.storage.cache_catalog import (
     lookup_catalog_record,
 )
 from engine.storage.cache_keys import CacheKey
-from engine.storage.cache_lookup import FilesystemObjectType
+from engine.storage.cache_lookup import FileIdentity, FilesystemObjectType
 from engine.storage.cache_lookup import (
+    BoundedFileRead,
     CacheLookupReason,
     CacheLookupVerificationPolicy,
     CacheVerificationLevel,
@@ -49,6 +50,13 @@ from engine.storage.cache_reconciliation import (
     ReconciliationSourceFlags,
     ReconciliationResolvedExpectations,
     ReconciliationActionExecutionStatus,
+    ReconciliationCheckpoint,
+    ReconciliationCheckpointConflictError,
+    ReconciliationCheckpointCounters,
+    ReconciliationCheckpointLookupStatus,
+    ReconciliationCheckpointState,
+    ReconciliationCheckpointUnsupportedError,
+    LocalReconciliationCheckpointBackend,
     _DiscoveryBudget,
     _merged_identities,
     _validate_relative,
@@ -61,6 +69,12 @@ from engine.storage.cache_reconciliation import (
     compare_reconciliation_observations,
     observe_and_compare_reconciliation_identity,
     execute_reconciliation_action,
+    advance_reconciliation_checkpoint,
+    begin_reconciliation_checkpoint,
+    complete_reconciliation_checkpoint,
+    parse_reconciliation_checkpoint,
+    read_reconciliation_checkpoint,
+    resume_reconciliation_checkpoint,
 )
 from engine.storage.cache_recovery import (
     CacheRecoveryInspectionRequest,
@@ -861,3 +875,161 @@ def test_h2c_final_precedence_executes_exactly_one_mutation(tmp_path):
     )
     assert result.status is ReconciliationActionExecutionStatus.APPLIED
     assert calls == ["final"]
+
+
+class _MemoryCheckpointBackend:
+    def __init__(self, cache_root):
+        self.cache_root = cache_root
+        self.data = None
+        self.publications = 0
+        self.fail_publication = False
+
+    def read_checkpoint_bounded(self):
+        if self.data is None:
+            raise FileNotFoundError
+        identity = FileIdentity(FilesystemObjectType.REGULAR_FILE, 1, 1, len(self.data), 1, 1, 1)
+        return BoundedFileRead(self.data, False, identity, identity, identity, True)
+
+    def publish_checkpoint_bytes(self, data, *, expected_revision):
+        self.publications += 1
+        if self.fail_publication:
+            raise OSError("interrupted before checkpoint publication")
+        current = None if self.data is None else parse_reconciliation_checkpoint(self.data)
+        assert (None if current is None else current.checkpoint_revision) == expected_revision
+        self.data = data
+
+
+def _checkpoint_scope(tmp_path):
+    root, identity, _, _ = _h2b_evidence(tmp_path)
+    validated = LocalReconciliationReadOnlyFilesystem.from_root(root).cache_root
+    policy = ReconciliationDiscoveryPolicy()
+    cursor = CacheCatalogReconciliationCursor(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE,
+        identity.namespace,
+        identity.entry_digest,
+        policy.digest,
+    )
+    return validated, policy, cursor, identity
+
+
+def test_h2d_checkpoint_canonical_round_trip_and_privacy(tmp_path):
+    _, policy, cursor, identity = _checkpoint_scope(tmp_path)
+    checkpoint = ReconciliationCheckpoint(
+        "a" * 32, CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest, 2,
+        ReconciliationCheckpointState.ACTIVE, cursor, identity,
+        ReconciliationCheckpointCounters(1, 1, 1, 1),
+    )
+    data = checkpoint.canonical_bytes()
+    assert parse_reconciliation_checkpoint(data) == checkpoint
+    text = data.decode()
+    assert str(tmp_path) not in text
+    assert not any(name in text for name in ("writer_token", "metadata", "diagnostics", "filesystem_id"))
+
+
+@pytest.mark.parametrize("mutation,error", [
+    (lambda data: b"[" + data[1:], ValueError),
+    (lambda data: data.replace(b'"run_id"', b'"unknown"', 1), ValueError),
+    (lambda data: data.replace(b'"checkpoint_version":1', b'"checkpoint_version":2'), ReconciliationCheckpointUnsupportedError),
+    (lambda data: data.replace(b'"run_id":', b'"run_id":"x","run_id":', 1), ValueError),
+])
+def test_h2d_checkpoint_rejects_malformed_unknown_unsupported_and_duplicate(tmp_path, mutation, error):
+    _, policy, _, _ = _checkpoint_scope(tmp_path)
+    checkpoint = ReconciliationCheckpoint(
+        "a" * 32, CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest, 1,
+        ReconciliationCheckpointState.ACTIVE,
+    )
+    with pytest.raises(error):
+        parse_reconciliation_checkpoint(mutation(checkpoint.canonical_bytes()))
+
+
+def test_h2d_fresh_create_resume_advance_complete_and_replace(tmp_path):
+    validated, policy, cursor, identity = _checkpoint_scope(tmp_path)
+    backend = _MemoryCheckpointBackend(validated)
+    assert read_reconciliation_checkpoint(backend).status is ReconciliationCheckpointLookupStatus.ABSENT
+    active = begin_reconciliation_checkpoint(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+        backend=backend, run_id_factory=lambda: "a" * 32,
+    )
+    assert active.checkpoint_revision == 1 and backend.publications == 1
+    assert resume_reconciliation_checkpoint("a" * 32, policy.digest, backend=backend) == active
+    advanced = advance_reconciliation_checkpoint(
+        active, cursor=cursor, last_completed_identity=identity,
+        counters=ReconciliationCheckpointCounters(1, 1, 1, 1), backend=backend,
+    )
+    assert advanced.checkpoint_revision == 2
+    resumed = resume_reconciliation_checkpoint("a" * 32, policy.digest, backend=backend)
+    assert resumed.last_completed_identity == identity and resumed.discovery_cursor == cursor
+    complete = complete_reconciliation_checkpoint(resumed, backend=backend)
+    assert complete.state is ReconciliationCheckpointState.COMPLETE
+    assert complete_reconciliation_checkpoint(complete, backend=backend) is complete
+    replacement = begin_reconciliation_checkpoint(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+        backend=backend, run_id_factory=lambda: "b" * 32,
+    )
+    assert replacement.checkpoint_revision == 4 and replacement.run_id == "b" * 32
+
+
+def test_h2d_active_run_and_resume_mismatch_conflict(tmp_path):
+    validated, policy, _, _ = _checkpoint_scope(tmp_path)
+    backend = _MemoryCheckpointBackend(validated)
+    begin_reconciliation_checkpoint(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+        backend=backend, run_id_factory=lambda: "a" * 32,
+    )
+    with pytest.raises(ReconciliationCheckpointConflictError):
+        begin_reconciliation_checkpoint(
+            CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+            backend=backend, run_id_factory=lambda: "b" * 32,
+        )
+    with pytest.raises(ReconciliationCheckpointConflictError):
+        resume_reconciliation_checkpoint("b" * 32, policy.digest, backend=backend)
+    with pytest.raises(ReconciliationCheckpointConflictError):
+        resume_reconciliation_checkpoint("a" * 32, "f" * 64, backend=backend)
+
+
+def test_h2d_interruption_before_publish_keeps_prior_progress(tmp_path):
+    validated, policy, cursor, identity = _checkpoint_scope(tmp_path)
+    backend = _MemoryCheckpointBackend(validated)
+    active = begin_reconciliation_checkpoint(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+        backend=backend, run_id_factory=lambda: "a" * 32,
+    )
+    backend.fail_publication = True
+    with pytest.raises(OSError, match="interrupted"):
+        advance_reconciliation_checkpoint(
+            active, cursor=cursor, last_completed_identity=identity,
+            counters=ReconciliationCheckpointCounters(1, 1, 0, 0), backend=backend,
+        )
+    assert resume_reconciliation_checkpoint("a" * 32, policy.digest, backend=backend) == active
+
+
+def test_h2d_monotonic_resume_prevents_completed_identity_rewind(tmp_path):
+    validated, policy, cursor, identity = _checkpoint_scope(tmp_path)
+    backend = _MemoryCheckpointBackend(validated)
+    active = begin_reconciliation_checkpoint(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+        backend=backend, run_id_factory=lambda: "a" * 32,
+    )
+    advanced = advance_reconciliation_checkpoint(
+        active, cursor=cursor, last_completed_identity=identity,
+        counters=ReconciliationCheckpointCounters(1, 1, 0, 0), backend=backend,
+    )
+    with pytest.raises(ValueError, match="progress"):
+        advance_reconciliation_checkpoint(
+            advanced, cursor=cursor, last_completed_identity=identity,
+            counters=advanced.counters, backend=backend,
+        )
+
+
+def test_h2d_local_checkpoint_is_durable_and_never_deleted(tmp_path):
+    root, _, _, _ = _h2b_evidence(tmp_path)
+    policy = ReconciliationDiscoveryPolicy()
+    backend = LocalReconciliationCheckpointBackend.from_root(root)
+    active = begin_reconciliation_checkpoint(
+        CacheCatalogReconciliationMode.FULL_IN_PLACE, policy.digest,
+        backend=backend, run_id_factory=lambda: "c" * 32,
+    )
+    path = root / "catalog/v1/reconciliation/checkpoint.json"
+    assert path.read_bytes() == active.canonical_bytes()
+    complete = complete_reconciliation_checkpoint(active, backend=backend)
+    assert path.exists() and parse_reconciliation_checkpoint(path.read_bytes()) == complete
